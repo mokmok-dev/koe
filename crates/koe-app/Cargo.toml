@@ -1,0 +1,17 @@
+[package]
+name = "koe-app"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+koe-core.workspace = true
+koe-recording.workspace = true
+serde.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true
+tempfile.workspace = true
+
+[lints]
+workspace = true

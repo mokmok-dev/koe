@@ -44,7 +44,12 @@ artifact の暗号学的検証方法は公開資料だけでは確定できな�
 
 ## 現在の repository
 
-現在は `members = []` の virtual Cargo workspace で、実装 crate は存在しない。
+現在は Milestone 1 の基盤として `koe-core`、`koe-audio`、`koe-recording`、
+`koe-app`、`koe-cli` が存在する。domain state machine、bounded callback handoff、
+segmented WAV と crash recovery、単一所有 coordinator、および capability/doctor
+CLI を実装済みである。CPAL microphone capture adapter は接続済みで、利用可能な
+input device を capability として実行時に報告する。system audio capture は未接続の
+ため `unsupported` capability として機械可読に報告する。
 `unsafe_code`、panic、unwrap、unused などを deny する strict lint は維持する。
 Nix の対象は `x86_64-linux`、`aarch64-linux`、`aarch64-darwin` であり、
 Windows と Intel macOS は CI で補完する。
