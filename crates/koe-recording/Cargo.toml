@@ -1,0 +1,20 @@
+[package]
+name = "koe-recording"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+cap-std.workspace = true
+hound.workspace = true
+koe-core.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+thiserror.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[lints]
+workspace = true

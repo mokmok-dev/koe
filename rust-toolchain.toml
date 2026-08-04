@@ -9,3 +9,6 @@ components = [
   "rustfmt",
 ]
 profile = "minimal"
+targets = [
+  "x86_64-pc-windows-gnu",
+]

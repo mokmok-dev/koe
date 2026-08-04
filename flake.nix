@@ -34,7 +34,34 @@
           config,
           ...
         }:
+        let
+          windowsTarget = "x86_64-pc-windows-gnu";
+          windowsCross = pkgs.pkgsCross.mingwW64;
+          windowsCommonArgs = {
+            pname = "koe-windows-gnu";
+            version = "0.0.0";
+            src = config.rust-project.src;
+            strictDeps = true;
+            CARGO_BUILD_TARGET = windowsTarget;
+            CARGO_TARGET_X86_64_PC_WINDOWS_GNU_LINKER = "${windowsCross.stdenv.cc}/bin/${windowsCross.stdenv.cc.targetPrefix}cc";
+            buildInputs = [ windowsCross.windows.pthreads ];
+            nativeBuildInputs = [ windowsCross.stdenv.cc ];
+            cargoExtraArgs = "--workspace";
+          };
+          windowsCargoArtifacts = config.rust-project.crane-lib.buildDepsOnly windowsCommonArgs;
+          windowsPackage = config.rust-project.crane-lib.buildPackage (
+            windowsCommonArgs
+            // {
+              cargoArtifacts = windowsCargoArtifacts;
+              doCheck = false;
+            }
+          );
+        in
         {
+          checks = pkgs.lib.optionalAttrs pkgs.stdenv.isLinux {
+            windows-gnu = windowsPackage;
+          };
+
           devShells = {
             default = pkgs.mkShellNoCC {
               inputsFrom = [ self'.devShells.rust ];
@@ -50,6 +77,7 @@
 
           rust-project = {
             toolchain = pkgs.rust-bin.fromRustupToolchainFile ./rust-toolchain.toml;
+            defaults.perCrate.crane.args.buildInputs = pkgs.lib.optionals pkgs.stdenv.isLinux [ pkgs.alsa-lib ];
           };
 
           treefmt = {

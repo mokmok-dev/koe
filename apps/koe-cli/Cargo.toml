@@ -1,0 +1,25 @@
+[package]
+name = "koe-cli"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "koe"
+path = "src/main.rs"
+
+[dependencies]
+clap.workspace = true
+ctrlc.workspace = true
+koe-app.workspace = true
+koe-audio.workspace = true
+koe-core.workspace = true
+koe-recording.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[lints]
+workspace = true

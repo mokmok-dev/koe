@@ -1,0 +1,14 @@
+[package]
+name = "koe-audio"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+cpal.workspace = true
+koe-core.workspace = true
+serde.workspace = true
+thiserror.workspace = true
+thingbuf.workspace = true
+
+[lints]
+workspace = true
