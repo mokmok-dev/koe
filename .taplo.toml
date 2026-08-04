@@ -1,0 +1,6 @@
+exclude = [".direnv/**", ".git/**", "target/**"]
+include = ["**/*.toml"]
+
+[formatting]
+reorder_arrays = true
+reorder_keys = true
