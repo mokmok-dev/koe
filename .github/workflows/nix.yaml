@@ -1,9 +1,6 @@
 name: nix
 on:
   pull_request:
-    paths:
-      - "flake.lock"
-      - "flake.nix"
   push:
     branches:
       - "main"
