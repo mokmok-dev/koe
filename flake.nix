@@ -50,6 +50,7 @@
 
           rust-project = {
             toolchain = pkgs.rust-bin.fromRustupToolchainFile ./rust-toolchain.toml;
+            defaults.perCrate.crane.args.buildInputs = pkgs.lib.optionals pkgs.stdenv.isLinux [ pkgs.alsa-lib ];
           };
 
           treefmt = {
