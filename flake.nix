@@ -56,6 +56,17 @@
               doCheck = false;
             }
           );
+          cargoVendorDir = config.rust-project.crane-lib.vendorCargoDeps {
+            src = ./.;
+            overrideVendorCargoPackage =
+              package: drv:
+              if package.name == "libspa-sys" && package.version == "0.10.0" then
+                drv.overrideAttrs {
+                  patches = [ ./nix/patches/libspa-sys-bindgen-out-dir.patch ];
+                }
+              else
+                drv;
+          };
         in
         {
           checks = pkgs.lib.optionalAttrs pkgs.stdenv.isLinux {
@@ -80,6 +91,7 @@
             defaults.perCrate.crane.args = {
               BINDGEN_EXTRA_CLANG_ARGS = pkgs.lib.optionalString pkgs.stdenv.isLinux "-isystem ${pkgs.llvmPackages_18.clang-unwrapped.lib}/lib/clang/18/include";
               LIBCLANG_PATH = "${pkgs.llvmPackages_18.libclang.lib}/lib";
+              inherit cargoVendorDir;
               buildInputs = pkgs.lib.optionals pkgs.stdenv.isLinux [
                 pkgs.alsa-lib
                 pkgs.libpulseaudio
