@@ -1,3 +1,6 @@
+mod config;
+mod sessions;
+
 use std::{
     collections::VecDeque,
     io,
@@ -183,7 +186,11 @@ enum Command {
         command: PermissionCommand,
     },
     /// Run local configuration checks without network access.
-    Doctor,
+    Doctor {
+        /// App-owned data root to inspect. Defaults to the current directory.
+        #[arg(long)]
+        data_root: Option<PathBuf>,
+    },
     /// Inspect and manage locally installed ASR models.
     Models {
         /// App-owned data root shared with `record --output`.
@@ -191,6 +198,22 @@ enum Command {
         data_root: PathBuf,
         #[command(subcommand)]
         command: ModelsCommand,
+    },
+    /// Manage recorded sessions.
+    Sessions {
+        /// App-owned data root that contains `sessions/`.
+        #[arg(long)]
+        data_root: PathBuf,
+        #[command(subcommand)]
+        command: SessionsCommand,
+    },
+    /// Manage configuration and retention.
+    Config {
+        /// App-owned data root that contains `config.json`.
+        #[arg(long)]
+        data_root: PathBuf,
+        #[command(subcommand)]
+        command: ConfigCommand,
     },
     /// Record microphone PCM until Ctrl-C.
     Record {
@@ -262,12 +285,48 @@ enum PermissionCommand {
     Status,
 }
 
+#[derive(Debug, Subcommand)]
+enum SessionsCommand {
+    /// List recorded sessions.
+    List,
+    /// Show one session manifest and transcript status.
+    Show { session_id: String },
+    /// Export a session to a directory.
+    Export {
+        session_id: String,
+        /// Destination directory. Export is created as `<id>-export` below it.
+        #[arg(long)]
+        destination: PathBuf,
+    },
+    /// Delete a session. Active sessions are refused.
+    Delete { session_id: String },
+}
+
+#[derive(Debug, Subcommand)]
+enum ConfigCommand {
+    /// Show current configuration.
+    Show,
+    /// Set retention policy. Omit `--days` to keep forever.
+    SetRetention {
+        #[arg(long)]
+        days: Option<u32>,
+    },
+    /// Apply retention policy now and return deleted session IDs.
+    ApplyRetention,
+}
+
 #[derive(Debug, Serialize)]
-struct DoctorReport<'a> {
+struct DoctorReport {
     schema_version: u32,
     platform: &'static str,
     network_accessed: bool,
-    audio_backend: &'a str,
+    audio_backend: String,
+    microphone_state: String,
+    system_audio_state: String,
+    data_root_writable: bool,
+    config_valid: bool,
+    session_count: usize,
+    active_session_count: usize,
     status: &'static str,
 }
 
@@ -317,33 +376,17 @@ fn execute(
             let devices = backend.enumerate((*source).into())?;
             render_devices(&devices, cli.output_format, output)?;
         },
-        Command::Doctor => {
-            let capabilities = backend.capabilities()?;
-            let microphone = capabilities
-                .iter()
-                .find(|capability| capability.source == SourceKind::Microphone);
-            let status = if microphone
-                .is_some_and(|capability| capability.state == CapabilityState::Supported)
-            {
-                "ok"
-            } else {
-                "degraded"
-            };
-            let audio_backend =
-                microphone.map_or("unknown", |capability| capability.backend.as_str());
-            let report = DoctorReport {
-                schema_version: 1,
-                platform: std::env::consts::OS,
-                network_accessed: false,
-                audio_backend,
-                status,
-            };
-            render(&report, cli.output_format, output, || {
-                format!("status: {status}\naudio backend: {audio_backend}\nnetwork accessed: no")
-            })?;
+        Command::Doctor { data_root } => {
+            run_doctor_command(backend, data_root.as_deref(), cli.output_format, output)?;
         },
         Command::Models { data_root, command } => {
             run_models_command(data_root, command, cli.output_format, output)?;
+        },
+        Command::Sessions { data_root, command } => {
+            run_sessions_command(data_root, command, cli.output_format, output)?;
+        },
+        Command::Config { data_root, command } => {
+            run_config_command(data_root, command, cli.output_format, output)?;
         },
         Command::Record {
             mic,
@@ -555,6 +598,233 @@ fn run_models_command(
             })
         },
     }
+}
+
+fn run_doctor_command(
+    backend: &impl AudioBackend,
+    data_root: Option<&Path>,
+    format: OutputFormat,
+    output: &mut impl io::Write,
+) -> Result<(), CliError> {
+    let capabilities = backend.capabilities()?;
+    let microphone = capabilities
+        .iter()
+        .find(|capability| capability.source == SourceKind::Microphone);
+    let system_audio = capabilities
+        .iter()
+        .find(|capability| capability.source == SourceKind::System);
+    let microphone_state = microphone.map_or_else(
+        || "unknown".to_owned(),
+        |capability| format!("{:?}", capability.state),
+    );
+    let system_audio_state = system_audio.map_or_else(
+        || "unknown".to_owned(),
+        |capability| format!("{:?}", capability.state),
+    );
+    let status =
+        if microphone.is_some_and(|capability| capability.state == CapabilityState::Supported) {
+            "ok"
+        } else {
+            "degraded"
+        };
+    let audio_backend = microphone
+        .map_or("unknown", |capability| capability.backend.as_str())
+        .to_owned();
+
+    let data_root = match data_root {
+        Some(path) => path.to_path_buf(),
+        None => std::env::current_dir().map_err(CliError::Io)?,
+    };
+    let (data_root_writable, config_valid, session_count, active_session_count) =
+        if data_root.exists() {
+            let writable = data_root
+                .metadata()
+                .is_ok_and(|metadata| !metadata.permissions().readonly());
+            let config_valid = config::load_or_migrate(&data_root).is_ok();
+            let sessions = sessions::list_sessions(&data_root).unwrap_or_default();
+            let active = sessions
+                .iter()
+                .filter(|summary| {
+                    !matches!(
+                        summary.state.as_str(),
+                        "completed" | "cancelled" | "failed" | "recovered_partial"
+                    )
+                })
+                .count();
+            (writable, config_valid, sessions.len(), active)
+        } else {
+            (false, false, 0, 0)
+        };
+
+    let report = DoctorReport {
+        schema_version: 1,
+        platform: std::env::consts::OS,
+        network_accessed: false,
+        audio_backend,
+        microphone_state,
+        system_audio_state,
+        data_root_writable,
+        config_valid,
+        session_count,
+        active_session_count,
+        status,
+    };
+    render(&report, format, output, || human_doctor_report(&report))
+}
+
+fn human_doctor_report(report: &DoctorReport) -> String {
+    format!(
+        "status: {}\naudio backend: {}\nmicrophone: {}\nsystem audio: {}\ndata root writable: {}\nconfig valid: {}\nsessions: {} ({} active)\nnetwork accessed: no",
+        report.status,
+        report.audio_backend,
+        report.microphone_state,
+        report.system_audio_state,
+        report.data_root_writable,
+        report.config_valid,
+        report.session_count,
+        report.active_session_count,
+    )
+}
+
+fn run_sessions_command(
+    data_root: &Path,
+    command: &SessionsCommand,
+    format: OutputFormat,
+    output: &mut impl io::Write,
+) -> Result<(), CliError> {
+    match command {
+        SessionsCommand::List => {
+            let summaries = sessions::list_sessions(data_root)?;
+            render_collection(&summaries, format, output, || {
+                if summaries.is_empty() {
+                    "No sessions.".to_owned()
+                } else {
+                    summaries
+                        .iter()
+                        .map(|summary| {
+                            format!(
+                                "{}\t{}\t{}\t{}ms\t{} files\ttranscript={}",
+                                summary.session_id,
+                                summary.state,
+                                summary.started_at_ms,
+                                summary.duration_ms,
+                                summary.audio_files,
+                                summary.has_transcript,
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                        .join("\n")
+                }
+            })
+        },
+        SessionsCommand::Show { session_id } => {
+            let detail = sessions::show_session(data_root, session_id)?;
+            render(&detail, format, output, || human_session_detail(&detail))
+        },
+        SessionsCommand::Export {
+            session_id,
+            destination,
+        } => {
+            let path = sessions::export_session(data_root, session_id, destination)?;
+            render(&path, format, output, || {
+                format!("exported to {}", path.display())
+            })
+        },
+        SessionsCommand::Delete { session_id } => {
+            sessions::delete_session(data_root, session_id)?;
+            render(&session_id, format, output, || {
+                format!("deleted session {session_id}")
+            })
+        },
+    }
+}
+
+fn human_session_detail(detail: &sessions::SessionDetail) -> String {
+    let manifest = &detail.manifest;
+    let transcript = detail.transcript.as_ref().map_or_else(
+        || "none".to_owned(),
+        |summary| {
+            format!(
+                "{} segment(s), {} words, final_json={} final_txt={}",
+                summary.segment_count,
+                summary.final_text_word_count,
+                summary.has_final_json,
+                summary.has_final_txt,
+            )
+        },
+    );
+    let duration_ms = manifest.ended_unix_ms.map_or(0, |ended| {
+        u64::try_from(ended.saturating_sub(manifest.started_unix_ms)).unwrap_or(u64::MAX)
+    });
+    format!(
+        "session: {}\nstate: {}\nstarted: {}\nended: {}\nduration: {}ms\nsource: {}\naudio files: {}\ntranscript: {}\n",
+        detail.session_id,
+        format!("{:?}", manifest.state).to_lowercase(),
+        manifest.started_unix_ms,
+        manifest
+            .ended_unix_ms
+            .map_or_else(|| "n/a".to_owned(), |ms| ms.to_string()),
+        duration_ms,
+        &manifest.source_device_id,
+        manifest.audio_files.len(),
+        transcript,
+    )
+}
+
+fn run_config_command(
+    data_root: &Path,
+    command: &ConfigCommand,
+    format: OutputFormat,
+    output: &mut impl io::Write,
+) -> Result<(), CliError> {
+    match command {
+        ConfigCommand::Show => {
+            let config = config::load_or_migrate(data_root)?;
+            render(&config, format, output, || human_config(&config))
+        },
+        ConfigCommand::SetRetention { days } => {
+            let mut config = config::load_or_migrate(data_root)?;
+            config.retention = days.map_or(config::RetentionPolicy::Forever, |days| {
+                config::RetentionPolicy::Days(days)
+            });
+            config::save(data_root, &config)?;
+            render(&config, format, output, || human_config(&config))
+        },
+        ConfigCommand::ApplyRetention => {
+            let config = config::load_or_migrate(data_root)?;
+            let deleted = config::apply_retention(data_root, &config)?;
+            render_collection(&deleted, format, output, || {
+                if deleted.is_empty() {
+                    "No sessions deleted by retention policy.".to_owned()
+                } else {
+                    format!(
+                        "deleted {} session(s): {}",
+                        deleted.len(),
+                        deleted
+                            .iter()
+                            .map(koe_core::SessionId::to_string)
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    )
+                }
+            })
+        },
+    }
+}
+
+fn human_config(config: &config::Config) -> String {
+    let retention = match config.retention {
+        config::RetentionPolicy::Forever => "forever".to_owned(),
+        config::RetentionPolicy::Days(days) => format!("{days} days"),
+    };
+    format!(
+        "retention: {}\ndefault microphone: {}\ndefault system audio: {}\ndefault model: {}\noffline policy: {:?}",
+        retention,
+        config.defaults.microphone_id.as_deref().unwrap_or("none"),
+        config.defaults.system_audio_id.as_deref().unwrap_or("none"),
+        config.defaults.model_selector.as_deref().unwrap_or("none"),
+        config.offline_policy,
+    )
 }
 
 fn license_line(manifest: &koe_model::ModelManifest) -> String {
@@ -1806,6 +2076,10 @@ enum CliError {
         "fresh recording consent is required; review the sources and destination, then pass --consent"
     )]
     ConsentRequired,
+    #[error("{0}")]
+    Config(#[from] config::ConfigError),
+    #[error("{0}")]
+    Session(#[from] sessions::SessionError),
 }
 
 impl CliError {
@@ -1820,12 +2094,16 @@ impl CliError {
             Self::Io(_) | Self::Json(_) => "KOE-OUTPUT-FAILED",
             Self::Signal => "KOE-SIGNAL-HANDLER-FAILED",
             Self::ConsentRequired => "KOE-POLICY-CONSENT-REQUIRED",
+            Self::Config(error) => error.code(),
+            Self::Session(error) => error.code(),
         }
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use std::fs;
+
     use clap::Parser;
     use koe_audio::{CanonicalNormalizer, DriftEstimator, UnsupportedBackend};
     use koe_core::SessionState;
@@ -1852,13 +2130,23 @@ mod tests {
 
     #[test]
     fn doctor_does_not_claim_network_access() {
-        let cli = Cli::try_parse_from(["koe", "--output-format", "json", "doctor"])
-            .unwrap_or_else(|error| panic!("{error}"));
+        let root = TempDir::new().expect("temp");
+        let cli = Cli::try_parse_from([
+            "koe",
+            "--output-format",
+            "json",
+            "doctor",
+            "--data-root",
+            root.path().to_str().expect("utf8"),
+        ])
+        .unwrap_or_else(|error| panic!("{error}"));
         let mut output = Vec::new();
         execute(&cli, &UnsupportedBackend, &mut output).unwrap_or_else(|error| panic!("{error}"));
         let value: serde_json::Value =
             serde_json::from_slice(&output).unwrap_or_else(|error| panic!("{error}"));
         assert_eq!(value["network_accessed"], false);
+        assert_eq!(value["config_valid"], true);
+        assert_eq!(value["session_count"], 0);
     }
 
     #[test]
@@ -2062,5 +2350,186 @@ mod tests {
         let error = execute(&cli, &UnsupportedBackend, &mut Vec::new())
             .expect_err("install requires network consent");
         assert_eq!(error.code(), "KOE-MODEL-OFFLINE-MISSING");
+    }
+
+    #[test]
+    fn sessions_list_empty_is_machine_readable() {
+        let root = TempDir::new().expect("temp");
+        fs::create_dir_all(root.path().join("sessions")).expect("sessions");
+        let cli = Cli::try_parse_from([
+            "koe",
+            "--output-format",
+            "json",
+            "sessions",
+            "--data-root",
+            root.path().to_str().expect("utf8"),
+            "list",
+        ])
+        .expect("parse");
+        let mut output = Vec::new();
+        execute(&cli, &UnsupportedBackend, &mut output).expect("execute");
+        let value: serde_json::Value = serde_json::from_slice(&output).expect("json");
+        assert_eq!(value, serde_json::json!([]));
+    }
+
+    #[test]
+    fn sessions_show_and_delete_completed_session() {
+        let root = TempDir::new().expect("temp");
+        let id = koe_core::SessionId::new();
+        let session_dir = root.path().join("sessions").join(id.to_string());
+        fs::create_dir_all(&session_dir).expect("dir");
+        fs::create_dir_all(session_dir.join("audio")).expect("audio");
+        fs::create_dir_all(session_dir.join("transcript")).expect("transcript");
+        fs::create_dir_all(session_dir.join("recovery")).expect("recovery");
+        let manifest = koe_recording::SessionManifest {
+            schema_version: 2,
+            session_id: id,
+            state: koe_core::SessionState::Completed,
+            started_unix_ms: 1_000,
+            ended_unix_ms: Some(2_000),
+            app_version: "0.1.0".to_owned(),
+            platform: "test".to_owned(),
+            backend: "test".to_owned(),
+            source_device_id: "fixture".to_owned(),
+            permission_result: "granted".to_owned(),
+            sample_rate: 16_000,
+            channels: 1,
+            native_sample_format: "signed-16-bit-pcm".to_owned(),
+            stored_sample_format: "wav-pcm-s16le".to_owned(),
+            timeline_unit: "microsecond".to_owned(),
+            normalization: "none".to_owned(),
+            mix: "isolated-microphone".to_owned(),
+            discontinuities: Vec::new(),
+            consent_record: "fresh-application-consent".to_owned(),
+            queue_capacity: 64,
+            overflow_count: 0,
+            network_policy: koe_core::NetworkPolicy::Denied,
+            audio_files: Vec::new(),
+            failure_code: None,
+            gaps: Vec::new(),
+            drift_corrections: Vec::new(),
+            sources: Vec::new(),
+            timeline_blocks: Vec::new(),
+            alignment_quality: "exact_block_timeline".to_owned(),
+        };
+        fs::write(
+            session_dir.join("session.json"),
+            serde_json::to_vec(&manifest).expect("json"),
+        )
+        .expect("manifest");
+
+        let show_cli = Cli::try_parse_from([
+            "koe",
+            "--output-format",
+            "json",
+            "sessions",
+            "--data-root",
+            root.path().to_str().expect("utf8"),
+            "show",
+            &id.to_string(),
+        ])
+        .expect("parse");
+        let mut output = Vec::new();
+        execute(&show_cli, &UnsupportedBackend, &mut output).expect("show");
+        let value: serde_json::Value = serde_json::from_slice(&output).expect("json");
+        assert_eq!(value["session_id"], id.to_string());
+
+        let delete_cli = Cli::try_parse_from([
+            "koe",
+            "sessions",
+            "--data-root",
+            root.path().to_str().expect("utf8"),
+            "delete",
+            &id.to_string(),
+        ])
+        .expect("parse");
+        execute(&delete_cli, &UnsupportedBackend, &mut Vec::new()).expect("delete");
+        assert!(!session_dir.exists());
+    }
+
+    #[test]
+    fn config_show_and_retention_round_trip() {
+        let root = TempDir::new().expect("temp");
+        let cli = Cli::try_parse_from([
+            "koe",
+            "--output-format",
+            "json",
+            "config",
+            "--data-root",
+            root.path().to_str().expect("utf8"),
+            "set-retention",
+            "--days",
+            "14",
+        ])
+        .expect("parse");
+        let mut output = Vec::new();
+        execute(&cli, &UnsupportedBackend, &mut output).expect("set");
+        let value: serde_json::Value = serde_json::from_slice(&output).expect("json");
+        assert!(matches!(value["retention"], serde_json::Value::Object(_)));
+    }
+
+    #[test]
+    fn stdout_contract_does_not_emit_audio_or_transcript_text() {
+        let root = TempDir::new().expect("temp");
+        let id = koe_core::SessionId::new();
+        let session_dir = root.path().join("sessions").join(id.to_string());
+        fs::create_dir_all(session_dir.join("transcript")).expect("transcript");
+        let manifest = koe_recording::SessionManifest {
+            schema_version: 2,
+            session_id: id,
+            state: koe_core::SessionState::Completed,
+            started_unix_ms: 1,
+            ended_unix_ms: Some(2),
+            app_version: "0.1.0".to_owned(),
+            platform: "test".to_owned(),
+            backend: "test".to_owned(),
+            source_device_id: "fixture".to_owned(),
+            permission_result: "granted".to_owned(),
+            sample_rate: 16_000,
+            channels: 1,
+            native_sample_format: "signed-16-bit-pcm".to_owned(),
+            stored_sample_format: "wav-pcm-s16le".to_owned(),
+            timeline_unit: "microsecond".to_owned(),
+            normalization: "none".to_owned(),
+            mix: "isolated-microphone".to_owned(),
+            discontinuities: Vec::new(),
+            consent_record: "fresh-application-consent".to_owned(),
+            queue_capacity: 64,
+            overflow_count: 0,
+            network_policy: koe_core::NetworkPolicy::Denied,
+            audio_files: Vec::new(),
+            failure_code: None,
+            gaps: Vec::new(),
+            drift_corrections: Vec::new(),
+            sources: Vec::new(),
+            timeline_blocks: Vec::new(),
+            alignment_quality: "exact_block_timeline".to_owned(),
+        };
+        fs::write(
+            session_dir.join("session.json"),
+            serde_json::to_vec(&manifest).expect("json"),
+        )
+        .expect("manifest");
+        fs::write(
+            session_dir.join("transcript").join("final.txt"),
+            "secret transcript text",
+        )
+        .expect("final");
+
+        let cli = Cli::try_parse_from([
+            "koe",
+            "--output-format",
+            "human",
+            "sessions",
+            "--data-root",
+            root.path().to_str().expect("utf8"),
+            "list",
+        ])
+        .expect("parse");
+        let mut output = Vec::new();
+        execute(&cli, &UnsupportedBackend, &mut output).expect("execute");
+        let text = String::from_utf8_lossy(&output);
+        assert!(!text.contains("secret"));
+        assert!(!text.contains("transcript text"));
     }
 }

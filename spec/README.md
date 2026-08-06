@@ -44,14 +44,16 @@ artifact の暗号学的検証方法は公開資料だけでは確定できな�
 
 ## 現在の repository
 
-現在は Milestone 3 までの基盤として `koe-core`、`koe-audio`、`koe-recording`、
+現在は Milestone 4 までの基盤として `koe-core`、`koe-audio`、`koe-recording`、
 `koe-app`、`koe-model`、`koe-transcript`、`koe-cli` が存在する。Milestone 1/2 の
 domain state machine、bounded callback handoff、segmented WAV と crash recovery、
-単一所有 coordinator、capability/doctor CLI、system audio と同期、manifest v2 に
-加えて、Milestone 3 で Foundry Local を `koe-model` 内に隔離した。`
+単一所有 coordinator、capability/doctor CLI、system audio と同期、manifest v2、
+Milestone 3 の Foundry Local モデル管理に加えて、Milestone 4 で CLI reference
+product を完成させた。
 
-- `FoundryAdapter`/`StreamingAsrSession` の port と `KoeModelManager` を実装し、
-  list/resolve/install/load/unload/remove と model state machine を提供する。
+- `koe-model` で `FoundryAdapter`/`StreamingAsrSession` の port と
+  `KoeModelManager` を実装し、list/resolve/install/load/unload/remove と model
+  state machine を提供する。
 - offline 契約は manager 境界で強制する。`Denied` は adapter へ一切触れず、
   cache に無い artifact は `KOE-MODEL-OFFLINE-MISSING` を返す。
 - install は明示同意 (`ModelInstallOnly`) のみ許可し、digest inventory を
@@ -60,6 +62,14 @@ domain state machine、bounded callback handoff、segmented WAV と crash recove
 - ライブ ASR は 16 kHz mono PCM を bounded feed bridge で async session へ送り、
   `koe-transcript` が `events.jsonl` / `final.json` / `final.txt` を materialize する。
 - chunk size ごとの latency/WER/RTF baseline を `koe models benchmark` で保存する。
+- Milestone 4 で `koe sessions` (list/show/export/delete) と `koe config`
+  (show/set-retention/apply-retention) を追加し、データルートの設定・保存期間
+  ポリシー・自動削除を実装する。
+- `koe doctor` を拡張し、data root 書き込み、config 整合性、session ストア、
+  audio backend、permission 状態を包括的に診断する。
+- すべてのコマンドで `--output-format json|jsonl` を提供し、stdout/stderr の
+  機械可読 contract をテストで保証する。default log には audio 波形や transcript
+  テキストは含まれない。
 - ネイティブ live-audio session は公開された foundry SDK に無いため、capability
   として報告する。E2E offline テストは fixture adapter で駆動する。
 - `unsafe_code`、panic、unwrap、unused などを deny する strict lint は維持する。
