@@ -24,3 +24,5 @@ jobs:
       - uses: ./.github/actions/setup-nix
       - run: nix flake check
         shell: bash
+        env:
+          NIX_LOG_LINES: 200

@@ -605,6 +605,8 @@ const fn availability_from_legacy(state: CapabilityState) -> Availability {
     }
 }
 
+// This is const on Linux, but the macOS branch performs a runtime OS probe.
+#[allow(clippy::missing_const_for_fn)]
 fn platform_availability(
     source: SourceKind,
     state: CapabilityState,
@@ -618,6 +620,8 @@ fn platform_availability(
     availability_from_legacy(state)
 }
 
+// This is const on Linux, but the macOS branch queries AVFoundation.
+#[allow(clippy::missing_const_for_fn)]
 fn platform_permission_state(
     source: SourceKind,
     state: CapabilityState,
@@ -871,7 +875,7 @@ fn platform_system_audio_allowed(_policy: PackagingPolicy) -> bool {
 }
 
 #[cfg(target_os = "linux")]
-fn platform_system_audio_allowed(policy: PackagingPolicy) -> bool {
+const fn platform_system_audio_allowed(policy: PackagingPolicy) -> bool {
     // Runtime heuristics are diagnostic only. The distribution policy is the
     // authority because absence of sandbox markers cannot prove host access.
     matches!(policy, PackagingPolicy::DirectAllowed)
