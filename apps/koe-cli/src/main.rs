@@ -18,11 +18,16 @@ use koe_audio::{
     CpalBackend, DriftEstimator, FrameConsumer, OpenSource, frame_ring, mix_canonical,
     process_timeline_now_ns,
 };
-use koe_core::{CapabilityState, SourceKind};
+use koe_core::{CapabilityState, NetworkPolicy, SourceKind};
+use koe_model::{
+    AsrSessionSettings, DigestAllowlist, FoundryLocalAdapter, InstallOptions, KoeModelManager,
+    ModelDescriptor, ModelManager,
+};
 use koe_recording::{
     AudioGap, DriftCorrection, RecordingConfig, RecordingError, TimelineBlock, TrackConfig,
     TrackKind, recover_sessions,
 };
+use koe_transcript::{SegmentId, TranscriptModel, TranscriptSegment, TranscriptStore};
 use serde::Serialize;
 
 const MIX_JITTER_CAPACITY: usize = 32_000;
@@ -179,6 +184,14 @@ enum Command {
     },
     /// Run local configuration checks without network access.
     Doctor,
+    /// Inspect and manage locally installed ASR models.
+    Models {
+        /// App-owned data root shared with `record --output`.
+        #[arg(long)]
+        data_root: PathBuf,
+        #[command(subcommand)]
+        command: ModelsCommand,
+    },
     /// Record microphone PCM until Ctrl-C.
     Record {
         /// Opaque stable microphone ID from `devices list`.
@@ -209,6 +222,38 @@ enum DeviceCommand {
     List {
         #[arg(long, value_enum, default_value = "mic")]
         source: SourceArgument,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum ModelsCommand {
+    /// List catalog/installed/loaded models. Catalog and install require
+    /// explicit `--network` consent.
+    List {
+        #[arg(long, conflicts_with = "loaded")]
+        installed: bool,
+        #[arg(long, conflicts_with = "installed")]
+        loaded: bool,
+        #[arg(long)]
+        network: bool,
+    },
+    /// Install a model after explicit network consent.
+    Install {
+        selector: String,
+        #[arg(long)]
+        network: bool,
+        #[arg(long)]
+        force: bool,
+    },
+    /// Show an installed model manifest, digest inventory and license.
+    Show { installed_id: String },
+    /// Remove an installed model. Refused while loaded or in use.
+    Remove { installed_id: String },
+    /// Record a chunk-size latency/WER/RTF baseline for an installed model.
+    Benchmark {
+        installed_id: String,
+        #[arg(long, default_value_t = 160)]
+        chunk_ms: u64,
     },
 }
 
@@ -297,6 +342,9 @@ fn execute(
                 format!("status: {status}\naudio backend: {audio_backend}\nnetwork accessed: no")
             })?;
         },
+        Command::Models { data_root, command } => {
+            run_models_command(data_root, command, cli.output_format, output)?;
+        },
         Command::Record {
             mic,
             system,
@@ -321,6 +369,287 @@ fn execute(
         },
     }
     Ok(())
+}
+
+/// Builds a model manager for the explicit data root. Network operations
+/// require `--network` consent; everything else is strictly offline.
+fn model_manager(
+    data_root: &PathBuf,
+    network: bool,
+) -> Result<KoeModelManager, CliError> {
+    let policy = if network {
+        NetworkPolicy::ModelInstallOnly
+    } else {
+        NetworkPolicy::Denied
+    };
+    KoeModelManager::new(
+        data_root,
+        DigestAllowlist::empty(),
+        Box::new(FoundryLocalAdapter::new()),
+        policy,
+    )
+    .map_err(CliError::Model)
+}
+
+/// Runs one model future on a short-lived current-thread runtime.
+fn run_blocking<F, T>(future: F) -> Result<T, CliError>
+where
+    F: std::future::Future<Output = Result<T, CliError>>,
+{
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|_| CliError::Model(koe_model::ModelError::Internal))?;
+    runtime.block_on(future)
+}
+
+/// Executes one `koe models` subcommand.
+#[allow(clippy::too_many_lines)]
+fn run_models_command(
+    data_root: &PathBuf,
+    command: &ModelsCommand,
+    format: OutputFormat,
+    output: &mut impl io::Write,
+) -> Result<(), CliError> {
+    match command {
+        ModelsCommand::List {
+            installed,
+            loaded,
+            network,
+        } => {
+            let manager = model_manager(data_root, *network)?;
+            let scope = if *installed {
+                koe_model::ModelScope::Installed
+            } else if *loaded {
+                koe_model::ModelScope::Loaded
+            } else {
+                koe_model::ModelScope::Catalog
+            };
+            if matches!(scope, koe_model::ModelScope::Catalog) && !network {
+                eprintln!(
+                    "catalog listing requires --network consent; use --installed for offline use"
+                );
+            }
+            let descriptors =
+                run_blocking(async { manager.list(scope).await.map_err(CliError::Model) })?;
+            render_model_descriptors(&descriptors, format, output)
+        },
+        ModelsCommand::Install {
+            selector,
+            network,
+            force,
+        } => {
+            if !network {
+                return Err(CliError::Model(koe_model::ModelError::NetworkDenied));
+            }
+            let manager = model_manager(data_root, *network)?;
+            let (progress, mut progress_rx) = tokio::sync::mpsc::channel(8);
+            let selector = selector.parse::<koe_model::ModelSelector>()?;
+            let installed = run_blocking(async {
+                let options = InstallOptions {
+                    policy: NetworkPolicy::ModelInstallOnly,
+                    cancel: tokio_util::sync::CancellationToken::new(),
+                    progress: Some(progress),
+                    force_redownload: *force,
+                };
+                while let Ok(phase) = progress_rx.try_recv() {
+                    match phase {
+                        koe_model::ModelProgress::Resolving => {
+                            eprintln!("resolving model");
+                        },
+                        koe_model::ModelProgress::Downloading => {
+                            eprintln!("downloading model");
+                        },
+                        koe_model::ModelProgress::Verifying => {
+                            eprintln!("verifying digest inventory");
+                        },
+                        koe_model::ModelProgress::Installing => {
+                            eprintln!("installing manifest");
+                        },
+                        koe_model::ModelProgress::Done => {},
+                    }
+                }
+                manager
+                    .install(&selector, &options)
+                    .await
+                    .map_err(CliError::Model)
+            })?;
+            render(&installed, format, output, || {
+                format!(
+                    "installed: {} ({}) verification={:?}\n{}",
+                    installed.manifest.alias.0,
+                    installed.manifest.version.0,
+                    installed.manifest.verification,
+                    license_line(&installed.manifest),
+                )
+            })
+        },
+        ModelsCommand::Show { installed_id } => {
+            let manager = model_manager(data_root, false)?;
+            let id = koe_model::InstalledModelId::parse(installed_id)?;
+            let installed = manager.installed_model(&id)?;
+            render(&installed, format, output, || {
+                let mut lines = vec![
+                    format!("model: {}", installed.manifest.alias.0),
+                    format!("id: {}", installed.manifest.model_id.0),
+                    format!("version: {}", installed.manifest.version.0),
+                    format!("variant: {}", installed.manifest.variant),
+                    format!("provider: {}", installed.manifest.provider),
+                    license_line(&installed.manifest),
+                    format!("verification: {:?}", installed.manifest.verification),
+                    format!("files: {}", installed.manifest.files.len()),
+                ];
+                for file in &installed.manifest.files {
+                    lines.push(format!(
+                        "  {} ({} bytes, sha256 {})",
+                        file.path, file.size, file.sha256
+                    ));
+                }
+                if let Ok(report) = manager.benchmarks(&id) {
+                    for baseline in &report.baselines {
+                        lines.push(format!(
+                            "benchmark chunk={}ms latency={}ms wer={:.1}% rtf={:.2}",
+                            baseline.chunk_ms,
+                            baseline.final_latency_ms,
+                            baseline.wer_pct,
+                            baseline.rtf,
+                        ));
+                    }
+                }
+                lines.join("\n")
+            })
+        },
+        ModelsCommand::Remove { installed_id } => {
+            let manager = model_manager(data_root, false)?;
+            let id = koe_model::InstalledModelId::parse(installed_id)?;
+            run_blocking(async { manager.remove(&id).await.map_err(CliError::Model) })?;
+            render(&id.to_string(), format, output, || {
+                format!("removed model {id}")
+            })
+        },
+        ModelsCommand::Benchmark {
+            installed_id,
+            chunk_ms,
+        } => {
+            let manager = model_manager(data_root, false)?;
+            let id = koe_model::InstalledModelId::parse(installed_id)?;
+            let baseline = run_blocking(async {
+                let settings = AsrSessionSettings {
+                    chunk_ms: *chunk_ms,
+                    ..AsrSessionSettings::default()
+                };
+                manager
+                    .run_benchmark(&id, &settings, BENCHMARK_AUDIO, "")
+                    .await
+                    .map_err(CliError::Model)
+            })?;
+            render(&baseline, format, output, || {
+                format!(
+                    "baseline chunk={}ms first={}ms final={}ms wer={:.1}% rtf={:.2}",
+                    baseline.chunk_ms,
+                    baseline.first_result_latency_ms,
+                    baseline.final_latency_ms,
+                    baseline.wer_pct,
+                    baseline.rtf,
+                )
+            })
+        },
+    }
+}
+
+fn license_line(manifest: &koe_model::ModelManifest) -> String {
+    format!(
+        "license: {} ({}); see the model card before acceptance",
+        manifest.license_id, manifest.license_description
+    )
+}
+
+fn render_model_descriptors(
+    descriptors: &[ModelDescriptor],
+    format: OutputFormat,
+    output: &mut impl io::Write,
+) -> Result<(), CliError> {
+    render_collection(descriptors, format, output, || {
+        if descriptors.is_empty() {
+            "No models available.".to_owned()
+        } else {
+            descriptors
+                .iter()
+                .map(|descriptor| {
+                    format!(
+                        "{}\t{}\t{}\t{} ({})",
+                        descriptor.alias.0,
+                        descriptor.id.0,
+                        descriptor.version.0,
+                        descriptor.variant,
+                        descriptor.provider,
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join("\n")
+        }
+    })
+}
+
+/// Deterministic 2-second audio used by `koe models benchmark`.
+const BENCHMARK_AUDIO: &[i16] = &benchmark_audio();
+
+#[allow(
+    clippy::large_stack_arrays,
+    clippy::cast_possible_truncation,
+    clippy::cast_lossless,
+    clippy::cast_possible_wrap
+)]
+const fn benchmark_audio() -> [i16; 32_000] {
+    let mut samples = [0_i16; 32_000];
+    let mut index = 0;
+    while index < samples.len() {
+        samples[index] = ((index % 1999) as i32 - 999) as i16;
+        index += 1;
+    }
+    samples
+}
+
+/// Prepares an offline ASR session before any audio stream is opened.
+///
+/// `model == "none"` disables transcription. Otherwise the model must be
+/// already installed; a missing artifact yields
+/// [`koe_model::ModelError::OfflineArtifactMissing`] without touching the
+/// adapter. The session is created here and fed later through the
+/// lock-free feed bridge in the capture loop.
+#[allow(clippy::type_complexity)]
+fn prepare_asr(
+    data_root: &PathBuf,
+    model: &str,
+) -> Result<Option<(Box<dyn koe_model::StreamingAsrSession>, TranscriptModel)>, CliError> {
+    if model == "none" {
+        return Ok(None);
+    }
+    let selector = model.parse::<koe_model::ModelSelector>()?;
+    let manager = model_manager(data_root, false)?;
+    let installed_id = manager
+        .installed_id_for(&selector)?
+        .ok_or(koe_model::ModelError::OfflineArtifactMissing)?;
+    let settings = AsrSessionSettings::default();
+    let loaded = run_blocking(async {
+        let manager = &manager;
+        manager.load(&installed_id).await.map_err(CliError::Model)
+    })?;
+    let session = run_blocking(async {
+        let manager = &manager;
+        manager
+            .create_asr_session(&installed_id, &settings)
+            .await
+            .map_err(CliError::Model)
+    })?;
+    Ok(Some((
+        session,
+        TranscriptModel {
+            id: loaded.descriptor.id.0,
+            version: loaded.descriptor.version.0,
+            variant: loaded.descriptor.variant,
+        },
+    )))
 }
 
 fn render_capabilities(
@@ -409,6 +738,11 @@ fn record<B: AudioBackend>(
     if !consent {
         return Err(CliError::ConsentRequired);
     }
+    let asr_enabled = model != "none";
+    // Model load and session creation happen strictly before capture and
+    // never touch the network (`Denied` policy); a missing artifact is an
+    // explicit error instead of an implicit download.
+    let prepared_asr = prepare_asr(data_root, model)?;
     report_recovered_sessions(data_root)?;
     let mut stream = backend.open(&OpenSource {
         device_id: microphone_id.to_owned(),
@@ -487,6 +821,19 @@ fn record<B: AudioBackend>(
                 native_sample_format: "signed-16-bit-pcm".to_owned(),
             },
         ];
+    } else if asr_enabled {
+        // ASR without system audio still needs the canonical 16 kHz mono
+        // mix track so the timeline mixer can feed the model runtime.
+        config.additional_tracks = vec![TrackConfig {
+            kind: TrackKind::Mix,
+            sample_rate: 16_000,
+            channels: 1,
+            samples_per_segment: 16_000 * 15 * 60,
+            backend: "koe-timeline-mixer".to_owned(),
+            source_device_id: "application-generated".to_owned(),
+            permission_result: "not-applicable".to_owned(),
+            native_sample_format: "signed-16-bit-pcm".to_owned(),
+        }];
     }
     let queue_capacity = config.queue_capacity;
     let (producer, mut consumer) = frame_ring(queue_capacity, 16_384)?;
@@ -498,9 +845,14 @@ fn record<B: AudioBackend>(
     };
     let safe_microphone_id = terminal_safe(microphone_id);
     let safe_model = terminal_safe(model);
+    let asr_note = if asr_enabled {
+        "offline ASR; transcript saved to the session transcript dir"
+    } else {
+        "no model inference (audio-only)"
+    };
     if system_id.is_some() {
         eprintln!(
-            "confirmed recording: microphone={}, system={}, scope=system-wide, destination={}, retention=until explicitly deleted, model={} (Milestone 2 records audio locally; no model inference), sharing=none",
+            "confirmed recording: microphone={}, system={}, scope=system-wide, destination={}, retention=until explicitly deleted, model={} ({asr_note}), sharing=none",
             safe_microphone_id,
             terminal_safe(system_id.unwrap_or("none")),
             terminal_safe(&data_root.display().to_string()),
@@ -508,7 +860,7 @@ fn record<B: AudioBackend>(
         );
     } else {
         eprintln!(
-            "confirmed recording: microphone={}, system=none, destination={}, retention=until explicitly deleted, model={} (Milestone 2 records audio locally; no model inference), sharing=none",
+            "confirmed recording: microphone={}, system=none, destination={}, retention=until explicitly deleted, model={} ({asr_note}), sharing=none",
             safe_microphone_id,
             terminal_safe(&data_root.display().to_string()),
             safe_model,
@@ -534,6 +886,18 @@ fn record<B: AudioBackend>(
     // before either OS stream can deliver a callback.
     let session_clock = Instant::now();
     let session_process_origin_ns = process_timeline_now_ns();
+    let mut asr = if let Some((session, model)) = prepared_asr {
+        let session_id = recording
+            .session_id
+            .ok_or(CliError::Model(koe_model::ModelError::Internal))?;
+        let transcript_dir = data_root
+            .join("sessions")
+            .join(session_id.to_string())
+            .join("transcript");
+        Some(AsrBridge::spawn(session, model, transcript_dir))
+    } else {
+        None
+    };
     if let Err(error) = stream.start(Box::new(producer)) {
         let _failed = coordinator.fail(error.code())?;
         task.shutdown(&coordinator)?;
@@ -691,7 +1055,7 @@ fn record<B: AudioBackend>(
                     samples[..count].to_vec(),
                     stored_timeline_block(metadata, timeline_ns, microphone_epoch_id)?,
                 )?;
-                if system_stream.is_some() {
+                if system_stream.is_some() || asr.is_some() {
                     normalize_for_mix(
                         &samples[..count],
                         metadata,
@@ -820,6 +1184,7 @@ fn record<B: AudioBackend>(
                 &coordinator,
                 !microphone_active,
                 !system_active,
+                asr.as_ref(),
             )?;
         }
         thread::sleep(Duration::from_millis(5));
@@ -862,7 +1227,7 @@ fn record<B: AudioBackend>(
                 samples[..count].to_vec(),
                 stored_timeline_block(metadata, timeline_ns, microphone_epoch_id)?,
             )?;
-            if system_stream.is_some() {
+            if system_stream.is_some() || asr.is_some() {
                 normalize_for_mix(
                     &samples[..count],
                     metadata,
@@ -927,6 +1292,7 @@ fn record<B: AudioBackend>(
             &coordinator,
             true,
             true,
+            asr.as_ref(),
         )?;
         let dropped = system_consumer.take_dropped_frames();
         if dropped != 0 {
@@ -950,6 +1316,11 @@ fn record<B: AudioBackend>(
         coordinator.stop()?
     };
     task.shutdown(&coordinator)?;
+    if let Some(asr) = asr.take() {
+        // Drains remaining chunks, runs the model finalization and
+        // materializes `events.jsonl` -> `final.json`/`final.txt`.
+        asr.finish()?;
+    }
     render(&terminal, format, output, || {
         format!(
             "session: {}\nstate: {:?}",
@@ -1161,15 +1532,141 @@ fn normalize_for_mix(
     Ok(())
 }
 
+/// Bounded feed bridge from the sync capture loop into the async ASR session.
+///
+/// The worker thread owns a current-thread tokio runtime and the transcript
+/// store, so the capture loop never blocks on the model runtime.
+enum AsrCommand {
+    Chunk { samples: Vec<i16>, start_us: u64 },
+    Stop,
+}
+
+struct AsrBridge {
+    sender: std::sync::mpsc::SyncSender<AsrCommand>,
+    worker: Option<std::thread::JoinHandle<Result<(), CliError>>>,
+}
+
+impl AsrBridge {
+    fn spawn(
+        session: Box<dyn koe_model::StreamingAsrSession>,
+        model: TranscriptModel,
+        directory: PathBuf,
+    ) -> Self {
+        let (sender, receiver) = std::sync::mpsc::sync_channel(64);
+        let worker = std::thread::spawn(move || asr_worker(session, &model, &directory, receiver));
+        Self {
+            sender,
+            worker: Some(worker),
+        }
+    }
+
+    fn feed(
+        &self,
+        samples: Vec<i16>,
+        start_us: u64,
+    ) -> Result<(), CliError> {
+        self.sender
+            .send(AsrCommand::Chunk { samples, start_us })
+            .map_err(|_| CliError::Model(koe_model::ModelError::Internal))
+    }
+
+    /// Stops the feed and waits for the materialized transcript.
+    fn finish(mut self) -> Result<(), CliError> {
+        self.sender
+            .send(AsrCommand::Stop)
+            .map_err(|_| CliError::Model(koe_model::ModelError::Internal))?;
+        if let Some(worker) = self.worker.take() {
+            worker
+                .join()
+                .map_err(|_| CliError::Model(koe_model::ModelError::Internal))?
+        } else {
+            Ok(())
+        }
+    }
+}
+
+fn asr_worker(
+    session: Box<dyn koe_model::StreamingAsrSession>,
+    model: &TranscriptModel,
+    directory: &Path,
+    receiver: std::sync::mpsc::Receiver<AsrCommand>,
+) -> Result<(), CliError> {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|_| CliError::Model(koe_model::ModelError::Internal))?;
+    let mut session = session;
+    let mut store = TranscriptStore::open(directory)?;
+    let mut feed = |event: &koe_model::AsrEvent| -> Result<(), CliError> {
+        append_asr_event(&mut store, model, event)
+    };
+    for command in receiver {
+        match command {
+            AsrCommand::Chunk { samples, start_us } => {
+                runtime.block_on(session.append(koe_model::Pcm16Mono16k {
+                    samples,
+                    session_start_us: start_us,
+                }))?;
+                while let Some(event) = runtime.block_on(session.poll_results())? {
+                    feed(&event)?;
+                }
+            },
+            AsrCommand::Stop => break,
+        }
+    }
+    while let Some(event) = runtime.block_on(session.poll_results())? {
+        feed(&event)?;
+    }
+    let transcript = runtime.block_on(session.finish())?;
+    for event in transcript.events {
+        feed(&event)?;
+    }
+    let report = store.finalize()?;
+    eprintln!(
+        "transcript materialized: {} segment(s) -> {}",
+        report.segment_count,
+        report.json_path.display(),
+    );
+    Ok(())
+}
+
+fn append_asr_event(
+    store: &mut TranscriptStore,
+    model: &TranscriptModel,
+    event: &koe_model::AsrEvent,
+) -> Result<(), CliError> {
+    if event.text.is_empty() {
+        return Ok(());
+    }
+    store.append(TranscriptSegment {
+        schema_version: 1,
+        segment_id: SegmentId::new(),
+        source: "mixed".to_owned(),
+        start_ms: event.start_us / 1_000,
+        end_ms: event.end_us / 1_000,
+        text: event.text.clone(),
+        is_final: event.is_final,
+        model: Some(model.clone()),
+        audio_discontinuities: Vec::new(),
+    })?;
+    store.checkpoint().map_err(CliError::from)
+}
+
 fn write_available_mix(
     microphone: &mut TimelineTrack,
     system: &mut TimelineTrack,
     coordinator: &RecorderCoordinator,
     microphone_ended: bool,
     system_ended: bool,
+    asr: Option<&AsrBridge>,
 ) -> Result<(), CliError> {
-    while let Some(mixed) = take_available_mix(microphone, system, microphone_ended, system_ended) {
-        coordinator.append_track(TrackKind::Mix, mixed)?;
+    while let Some((mixed, start_us)) =
+        take_available_mix(microphone, system, microphone_ended, system_ended)
+    {
+        coordinator.append_track(TrackKind::Mix, mixed.clone())?;
+        if let Some(asr) = asr {
+            asr.feed(mixed, start_us)?;
+        }
     }
     Ok(())
 }
@@ -1179,7 +1676,7 @@ fn take_available_mix(
     system: &mut TimelineTrack,
     microphone_ended: bool,
     system_ended: bool,
-) -> Option<Vec<i16>> {
+) -> Option<(Vec<i16>, u64)> {
     let mut cursor = match (microphone.start_sample, system.start_sample) {
         (Some(microphone), Some(system)) => microphone.min(system),
         (Some(microphone), None) if system_ended => microphone,
@@ -1209,10 +1706,11 @@ fn take_available_mix(
         .collect::<Vec<_>>();
     let mut mixed = vec![0_i16; count];
     let produced = mix_canonical(&microphone_chunk, &system_chunk, &mut mixed);
+    let start_us = cursor.saturating_mul(1_000_000) / CANONICAL_SAMPLE_RATE;
     cursor = cursor.saturating_add(count as u64);
     microphone.consume_before(cursor);
     system.consume_before(cursor);
-    Some(mixed[..produced].to_vec())
+    Some((mixed[..produced].to_vec(), start_us))
 }
 
 fn report_recovered_sessions(data_root: &Path) -> Result<(), CliError> {
@@ -1296,6 +1794,12 @@ enum CliError {
     App(#[from] AppError),
     #[error("{0}")]
     Recording(#[from] RecordingError),
+    #[error("{0}")]
+    Model(#[from] koe_model::ModelError),
+    #[error("{0}")]
+    Transcript(#[from] koe_transcript::TranscriptError),
+    #[error("{0}")]
+    Asr(#[from] koe_model::AsrError),
     #[error("failed to install Ctrl-C handler")]
     Signal,
     #[error(
@@ -1310,6 +1814,9 @@ impl CliError {
             Self::Audio(error) => error.code(),
             Self::App(error) => error.code(),
             Self::Recording(error) => error.code(),
+            Self::Model(error) => error.code(),
+            Self::Transcript(error) => error.code(),
+            Self::Asr(error) => error.code(),
             Self::Io(_) | Self::Json(_) => "KOE-OUTPUT-FAILED",
             Self::Signal => "KOE-SIGNAL-HANDLER-FAILED",
             Self::ConsentRequired => "KOE-POLICY-CONSENT-REQUIRED",
@@ -1451,10 +1958,10 @@ mod tests {
         let mut system = TimelineTrack::default();
         microphone.push(0, &[10, 10, 10]);
         system.push(125_000, &[1, 1]);
-        assert_eq!(
-            take_available_mix(&mut microphone, &mut system, true, true),
-            Some(vec![10, 10, 11, 1])
-        );
+        let (first, start_us) =
+            take_available_mix(&mut microphone, &mut system, true, true).expect("first chunk");
+        assert_eq!(start_us, 0);
+        assert_eq!(first, vec![10, 10, 11, 1]);
         assert!(take_available_mix(&mut microphone, &mut system, true, true).is_none());
     }
 
@@ -1503,5 +2010,57 @@ mod tests {
             manifest["state"],
             serde_json::json!(SessionState::RecoveredPartial)
         );
+    }
+    #[test]
+    fn models_list_installed_is_offline_and_machine_readable() {
+        let root = TempDir::new().expect("temp");
+        let cli = Cli::try_parse_from([
+            "koe",
+            "--output-format",
+            "json",
+            "models",
+            "--data-root",
+            root.path().to_str().expect("utf8"),
+            "list",
+            "--installed",
+        ])
+        .expect("parse");
+        let mut output = Vec::new();
+        execute(&cli, &UnsupportedBackend, &mut output).expect("offline list");
+        let value: serde_json::Value = serde_json::from_slice(&output).expect("json");
+        assert_eq!(value, serde_json::json!([]));
+    }
+
+    #[test]
+    fn models_catalog_without_network_is_refused() {
+        let root = TempDir::new().expect("temp");
+        let cli = Cli::try_parse_from([
+            "koe",
+            "models",
+            "--data-root",
+            root.path().to_str().expect("utf8"),
+            "list",
+        ])
+        .expect("parse");
+        let error = execute(&cli, &UnsupportedBackend, &mut Vec::new())
+            .expect_err("catalog requires network consent");
+        assert_eq!(error.code(), "KOE-MODEL-OFFLINE-MISSING");
+    }
+
+    #[test]
+    fn models_install_without_network_is_refused() {
+        let root = TempDir::new().expect("temp");
+        let cli = Cli::try_parse_from([
+            "koe",
+            "models",
+            "--data-root",
+            root.path().to_str().expect("utf8"),
+            "install",
+            "nemotron-3.5-asr-streaming-0.6b",
+        ])
+        .expect("parse");
+        let error = execute(&cli, &UnsupportedBackend, &mut Vec::new())
+            .expect_err("install requires network consent");
+        assert_eq!(error.code(), "KOE-MODEL-OFFLINE-MISSING");
     }
 }

@@ -4,20 +4,28 @@ members = [
   "crates/koe-app",
   "crates/koe-audio",
   "crates/koe-core",
+  "crates/koe-model",
   "crates/koe-recording",
+  "crates/koe-transcript",
 ]
 resolver = "3"
 
 [workspace.dependencies]
 cap-std = "4.0.2"
 clap = { version = "4.5.42", features = ["derive"] }
+async-trait = "0.1.88"
 cpal = { version = "0.18.1", features = ["pipewire", "pulseaudio"] }
 ctrlc = "3.4.7"
+foundry-local = "0.1.0"
 hound = "3.5.1"
 koe-app = { path = "crates/koe-app" }
 koe-audio = { path = "crates/koe-audio" }
 koe-core = { path = "crates/koe-core" }
+koe-model = { path = "crates/koe-model" }
 koe-recording = { path = "crates/koe-recording" }
+koe-transcript = { path = "crates/koe-transcript" }
+tokio = { version = "1.45.1", features = ["macros", "rt-multi-thread", "sync", "time"] }
+tokio-util = { version = "0.7.15", features = ["rt"] }
 objc2-av-foundation = { version = "0.3.2", default-features = false, features = [
   "AVCaptureDevice",
   "AVMediaFormat",
