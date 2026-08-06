@@ -6,7 +6,10 @@ use std::{
 };
 
 use koe_core::{CoreError, OperationId, SessionId, SessionState};
-use koe_recording::{RecordingConfig, RecordingError, SessionManifest, SessionRecorder};
+use koe_recording::{
+    AudioGap, DriftCorrection, RecordingConfig, RecordingError, SessionManifest, SessionRecorder,
+    TimelineBlock, TrackKind,
+};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
@@ -16,12 +19,16 @@ const COMMAND_CAPACITY: usize = 32;
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 pub struct RecordingConsent {
     pub microphone: bool,
+    pub system_audio: bool,
     pub storage: bool,
 }
 
 impl RecordingConsent {
-    const fn permits_recording(self) -> bool {
-        self.microphone && self.storage
+    const fn permits_recording(
+        self,
+        system_requested: bool,
+    ) -> bool {
+        self.microphone && self.storage && (!system_requested || self.system_audio)
     }
 }
 
@@ -42,13 +49,53 @@ enum Command {
         samples: Vec<i16>,
         response: SyncSender<Result<(), AppError>>,
     },
+    AppendBlock {
+        samples: Vec<i16>,
+        timeline: TimelineBlock,
+        response: SyncSender<Result<(), AppError>>,
+    },
+    AppendTrack {
+        kind: TrackKind,
+        samples: Vec<i16>,
+        response: SyncSender<Result<(), AppError>>,
+    },
+    AppendTrackBlock {
+        kind: TrackKind,
+        samples: Vec<i16>,
+        timeline: TimelineBlock,
+        response: SyncSender<Result<(), AppError>>,
+    },
     RecordOverflow {
+        source: TrackKind,
         count: u64,
+        response: SyncSender<Result<(), AppError>>,
+    },
+    RecordPermission {
+        source: TrackKind,
+        result: String,
         response: SyncSender<Result<(), AppError>>,
     },
     RecordDiscontinuity {
         timeline_timestamp_ns: u64,
         response: SyncSender<Result<(), AppError>>,
+    },
+    RecordGap {
+        gap: AudioGap,
+        response: SyncSender<Result<(), AppError>>,
+    },
+    RecordDrift {
+        correction: DriftCorrection,
+        response: SyncSender<Result<(), AppError>>,
+    },
+    MarkRecording {
+        response: SyncSender<Result<(), AppError>>,
+    },
+    MarkDegraded {
+        response: SyncSender<Result<(), AppError>>,
+    },
+    Fail {
+        code: String,
+        response: SyncSender<Result<SessionSnapshot, AppError>>,
     },
     Stop {
         cancelled: bool,
@@ -109,6 +156,59 @@ impl RecorderCoordinator {
         self.request(|response| Command::Append { samples, response })?
     }
 
+    /// Writes microphone PCM with its canonical session-clock placement.
+    ///
+    /// # Errors
+    ///
+    /// Returns a conflict, invalid timeline, storage, or channel error.
+    pub fn append_block(
+        &self,
+        samples: Vec<i16>,
+        timeline: TimelineBlock,
+    ) -> Result<(), AppError> {
+        self.request(|response| Command::AppendBlock {
+            samples,
+            timeline,
+            response,
+        })?
+    }
+
+    /// Writes an isolated system or canonical mixed track.
+    ///
+    /// # Errors
+    ///
+    /// Returns a conflict, configuration, storage, or channel error.
+    pub fn append_track(
+        &self,
+        kind: TrackKind,
+        samples: Vec<i16>,
+    ) -> Result<(), AppError> {
+        self.request(|response| Command::AppendTrack {
+            kind,
+            samples,
+            response,
+        })?
+    }
+
+    /// Writes an isolated or mixed track with its session-clock placement.
+    ///
+    /// # Errors
+    ///
+    /// Returns a conflict, configuration, invalid timeline, storage, or channel error.
+    pub fn append_track_block(
+        &self,
+        kind: TrackKind,
+        samples: Vec<i16>,
+        timeline: TimelineBlock,
+    ) -> Result<(), AppError> {
+        self.request(|response| Command::AppendTrackBlock {
+            kind,
+            samples,
+            timeline,
+            response,
+        })?
+    }
+
     /// Adds rejected callback frames to the durable session metric.
     ///
     /// # Errors
@@ -116,9 +216,32 @@ impl RecorderCoordinator {
     /// Returns a conflict if no recording is active.
     pub fn record_overflow(
         &self,
+        source: TrackKind,
         count: u64,
     ) -> Result<(), AppError> {
-        self.request(|response| Command::RecordOverflow { count, response })?
+        self.request(|response| Command::RecordOverflow {
+            source,
+            count,
+            response,
+        })?
+    }
+
+    /// Persists the permission result observed when a source stream starts.
+    ///
+    /// # Errors
+    ///
+    /// Returns a conflict, persistence, or coordinator channel failure.
+    pub fn record_permission_result(
+        &self,
+        source: TrackKind,
+        result: impl Into<String>,
+    ) -> Result<(), AppError> {
+        let result = result.into();
+        self.request(|response| Command::RecordPermission {
+            source,
+            result,
+            response,
+        })?
     }
 
     /// Adds a capture-clock discontinuity to the durable session timeline.
@@ -134,6 +257,65 @@ impl RecorderCoordinator {
             timeline_timestamp_ns,
             response,
         })?
+    }
+
+    /// Persists a source-specific missing interval.
+    ///
+    /// # Errors
+    ///
+    /// Returns a conflict if no session is active.
+    pub fn record_gap(
+        &self,
+        gap: AudioGap,
+    ) -> Result<(), AppError> {
+        self.request(|response| Command::RecordGap { gap, response })?
+    }
+
+    /// Persists a measured drift correction.
+    ///
+    /// # Errors
+    ///
+    /// Returns a conflict if no session is active.
+    pub fn record_drift_correction(
+        &self,
+        correction: DriftCorrection,
+    ) -> Result<(), AppError> {
+        self.request(|response| Command::RecordDrift {
+            correction,
+            response,
+        })?
+    }
+
+    /// Marks a previously degraded session healthy after all requested sources
+    /// have been reopened with their original format.
+    ///
+    /// # Errors
+    ///
+    /// Returns a conflict or coordinator channel failure.
+    pub fn mark_recording(&self) -> Result<(), AppError> {
+        self.request(|response| Command::MarkRecording { response })?
+    }
+
+    /// Marks an active session degraded immediately when one source is lost.
+    ///
+    /// # Errors
+    ///
+    /// Returns a conflict or coordinator channel failure.
+    pub fn mark_degraded(&self) -> Result<(), AppError> {
+        self.request(|response| Command::MarkDegraded { response })?
+    }
+
+    /// Persists a fatal asynchronous capture failure before returning it.
+    ///
+    /// # Errors
+    ///
+    /// Returns a conflict, persistence, or coordinator channel failure.
+    pub fn fail(
+        &self,
+        code: impl Into<String>,
+    ) -> Result<SessionSnapshot, AppError> {
+        let code = code.into();
+        self.request(|response| Command::Fail { code, response })?
     }
 
     /// Cooperatively stops and finalizes. Repeated calls return the same terminal
@@ -226,6 +408,7 @@ impl Drop for CoordinatorTask {
     }
 }
 
+#[allow(clippy::too_many_lines)]
 fn run_coordinator(
     config: &RecordingConfig,
     commands: &Receiver<Command>,
@@ -238,7 +421,11 @@ fn run_coordinator(
     while let Ok(command) = commands.recv() {
         match command {
             Command::Start { consent, response } => {
-                let result = if !consent.permits_recording() {
+                let system_requested = config
+                    .additional_tracks
+                    .iter()
+                    .any(|track| track.kind == TrackKind::System);
+                let result = if !consent.permits_recording(system_requested) {
                     Err(AppError::Core(CoreError::ConsentRequired))
                 } else if recorder.is_some()
                     || matches!(
@@ -259,7 +446,7 @@ fn run_coordinator(
                         Ok(new_recorder) => {
                             snapshot.operation_id = OperationId::new();
                             snapshot.session_id = Some(new_recorder.session_id());
-                            snapshot.state = SessionState::Recording;
+                            snapshot.state = SessionState::Starting;
                             recorder = Some(new_recorder);
                             Ok(snapshot.clone())
                         },
@@ -278,11 +465,77 @@ fn run_coordinator(
                 );
                 let _ignored = response.send(result);
             },
-            Command::RecordOverflow { count, response } => {
+            Command::AppendBlock {
+                samples,
+                timeline,
+                response,
+            } => {
+                let result = append_timeline_samples(
+                    &samples,
+                    timeline,
+                    &mut recorder,
+                    &mut snapshot,
+                    &mut terminal_manifest,
+                    &mut terminal_failure,
+                );
+                let _ignored = response.send(result);
+            },
+            Command::AppendTrack {
+                kind,
+                samples,
+                response,
+            } => {
+                let result = append_track_samples(
+                    kind,
+                    &samples,
+                    &mut recorder,
+                    &mut snapshot,
+                    &mut terminal_manifest,
+                    &mut terminal_failure,
+                );
+                let _ignored = response.send(result);
+            },
+            Command::AppendTrackBlock {
+                kind,
+                samples,
+                timeline,
+                response,
+            } => {
+                let result = append_track_timeline_samples(
+                    kind,
+                    &samples,
+                    timeline,
+                    &mut recorder,
+                    &mut snapshot,
+                    &mut terminal_manifest,
+                    &mut terminal_failure,
+                );
+                let _ignored = response.send(result);
+            },
+            Command::RecordOverflow {
+                source,
+                count,
+                response,
+            } => {
                 let result = recorder
                     .as_mut()
                     .ok_or(AppError::Core(CoreError::SessionConflict))
-                    .map(|active| active.record_overflow(count));
+                    .map(|active| active.record_overflow(source, count));
+                let _ignored = response.send(result);
+            },
+            Command::RecordPermission {
+                source,
+                result,
+                response,
+            } => {
+                let result = recorder
+                    .as_mut()
+                    .ok_or(AppError::Core(CoreError::SessionConflict))
+                    .and_then(|active| {
+                        active
+                            .record_permission_result(source, &result)
+                            .map_err(AppError::Recording)
+                    });
                 let _ignored = response.send(result);
             },
             Command::RecordDiscontinuity {
@@ -293,6 +546,71 @@ fn run_coordinator(
                     .as_mut()
                     .ok_or(AppError::Core(CoreError::SessionConflict))
                     .map(|active| active.record_discontinuity(timeline_timestamp_ns));
+                let _ignored = response.send(result);
+            },
+            Command::RecordGap { gap, response } => {
+                let device_lost = gap.reason == "device-lost";
+                let result = recorder
+                    .as_mut()
+                    .ok_or(AppError::Core(CoreError::SessionConflict))
+                    .and_then(|active| {
+                        active.record_gap(gap);
+                        if device_lost {
+                            active.mark_degraded().map_err(AppError::Recording)?;
+                            snapshot.state = SessionState::Degraded;
+                        }
+                        Ok(())
+                    });
+                let _ignored = response.send(result);
+            },
+            Command::RecordDrift {
+                correction,
+                response,
+            } => {
+                let result = recorder
+                    .as_mut()
+                    .ok_or(AppError::Core(CoreError::SessionConflict))
+                    .map(|active| active.record_drift_correction(correction));
+                let _ignored = response.send(result);
+            },
+            Command::MarkRecording { response } => {
+                let result = recorder
+                    .as_mut()
+                    .ok_or(AppError::Core(CoreError::SessionConflict))
+                    .and_then(|active| {
+                        active.mark_recording().map_err(AppError::Recording)?;
+                        snapshot.state = SessionState::Recording;
+                        Ok(())
+                    });
+                let _ignored = response.send(result);
+            },
+            Command::MarkDegraded { response } => {
+                let result = recorder
+                    .as_mut()
+                    .ok_or(AppError::Core(CoreError::SessionConflict))
+                    .and_then(|active| {
+                        active.mark_degraded().map_err(AppError::Recording)?;
+                        snapshot.state = SessionState::Degraded;
+                        Ok(())
+                    });
+                let _ignored = response.send(result);
+            },
+            Command::Fail { code, response } => {
+                let result = if let Some(mut active) = recorder.take() {
+                    snapshot.state = SessionState::Failed;
+                    terminal_failure = true;
+                    match active.mark_failed_with_code(&code) {
+                        Ok(manifest) => {
+                            terminal_manifest = Some(manifest);
+                            Ok(snapshot.clone())
+                        },
+                        Err(error) => Err(AppError::Recording(error)),
+                    }
+                } else if terminal_manifest.is_some() {
+                    Ok(snapshot.clone())
+                } else {
+                    Err(AppError::Core(CoreError::SessionConflict))
+                };
                 let _ignored = response.send(result);
             },
             Command::Stop {
@@ -373,6 +691,73 @@ fn append_samples(
     result
 }
 
+fn append_timeline_samples(
+    samples: &[i16],
+    timeline: TimelineBlock,
+    recorder: &mut Option<SessionRecorder>,
+    snapshot: &mut SessionSnapshot,
+    terminal_manifest: &mut Option<SessionManifest>,
+    terminal_failure: &mut bool,
+) -> Result<(), AppError> {
+    let result =
+        recorder
+            .as_mut()
+            .map_or(Err(AppError::Core(CoreError::SessionConflict)), |active| {
+                active
+                    .write_samples_block(samples, timeline)
+                    .map_err(AppError::Recording)
+            });
+    if result.is_err() && recorder.is_some() {
+        transition_active_to_failed(recorder, snapshot, terminal_manifest, terminal_failure);
+    }
+    result
+}
+
+fn append_track_samples(
+    kind: TrackKind,
+    samples: &[i16],
+    recorder: &mut Option<SessionRecorder>,
+    snapshot: &mut SessionSnapshot,
+    terminal_manifest: &mut Option<SessionManifest>,
+    terminal_failure: &mut bool,
+) -> Result<(), AppError> {
+    let result =
+        recorder
+            .as_mut()
+            .map_or(Err(AppError::Core(CoreError::SessionConflict)), |active| {
+                active
+                    .write_track(kind, samples)
+                    .map_err(AppError::Recording)
+            });
+    if result.is_err() && recorder.is_some() {
+        transition_active_to_failed(recorder, snapshot, terminal_manifest, terminal_failure);
+    }
+    result
+}
+
+fn append_track_timeline_samples(
+    kind: TrackKind,
+    samples: &[i16],
+    timeline: TimelineBlock,
+    recorder: &mut Option<SessionRecorder>,
+    snapshot: &mut SessionSnapshot,
+    terminal_manifest: &mut Option<SessionManifest>,
+    terminal_failure: &mut bool,
+) -> Result<(), AppError> {
+    let result =
+        recorder
+            .as_mut()
+            .map_or(Err(AppError::Core(CoreError::SessionConflict)), |active| {
+                active
+                    .write_track_block(kind, samples, timeline)
+                    .map_err(AppError::Recording)
+            });
+    if result.is_err() && recorder.is_some() {
+        transition_active_to_failed(recorder, snapshot, terminal_manifest, terminal_failure);
+    }
+    result
+}
+
 fn transition_active_to_failed(
     recorder: &mut Option<SessionRecorder>,
     snapshot: &mut SessionSnapshot,
@@ -438,7 +823,7 @@ impl AppError {
 #[allow(clippy::expect_used)]
 mod tests {
     use koe_core::{NetworkPolicy, SessionState};
-    use koe_recording::RecordingConfig;
+    use koe_recording::{AudioGap, RecordingConfig, TrackConfig, TrackKind};
     use tempfile::TempDir;
 
     use super::{RecorderCoordinator, RecordingConsent};
@@ -455,6 +840,7 @@ mod tests {
             backend: "test".to_owned(),
             source_device_id: "fixture".to_owned(),
             permission_result: "granted".to_owned(),
+            additional_tracks: Vec::new(),
         }
     }
 
@@ -470,15 +856,129 @@ mod tests {
     }
 
     #[test]
+    fn system_track_requires_separate_consent() {
+        let root = TempDir::new().expect("temp");
+        let mut recording_config = config(&root);
+        recording_config.additional_tracks.push(TrackConfig {
+            kind: TrackKind::System,
+            sample_rate: 16_000,
+            channels: 1,
+            samples_per_segment: 4,
+            backend: "fixture".to_owned(),
+            source_device_id: "system-fixture".to_owned(),
+            permission_result: "granted".to_owned(),
+            native_sample_format: "signed-16-bit-pcm".to_owned(),
+        });
+        let (coordinator, task) = RecorderCoordinator::spawn(recording_config);
+        let error = coordinator
+            .start(RecordingConsent {
+                microphone: true,
+                system_audio: false,
+                storage: true,
+            })
+            .expect_err("system consent must fail");
+        assert_eq!(error.code(), "KOE-POLICY-CONSENT-REQUIRED");
+        task.shutdown(&coordinator).expect("shutdown");
+    }
+
+    #[test]
+    fn device_loss_degrades_without_stopping_remaining_sources() {
+        let root = TempDir::new().expect("temp");
+        let (coordinator, task) = RecorderCoordinator::spawn(config(&root));
+        coordinator
+            .start(RecordingConsent {
+                microphone: true,
+                system_audio: false,
+                storage: true,
+            })
+            .expect("start");
+        coordinator
+            .record_gap(AudioGap {
+                source: TrackKind::Microphone,
+                start_us: 10,
+                duration_us: 0,
+                reason: "device-lost".to_owned(),
+            })
+            .expect("gap");
+        assert_eq!(
+            coordinator.snapshot().expect("snapshot").state,
+            SessionState::Degraded
+        );
+        coordinator
+            .append(vec![1, 2])
+            .expect("remaining source data");
+        coordinator.mark_recording().expect("source recovered");
+        assert_eq!(
+            coordinator.snapshot().expect("snapshot").state,
+            SessionState::Recording
+        );
+        assert_eq!(
+            coordinator.stop().expect("stop").state,
+            SessionState::Completed
+        );
+        task.shutdown(&coordinator).expect("shutdown");
+    }
+
+    #[test]
+    fn asynchronous_failure_code_is_persisted() {
+        let root = TempDir::new().expect("temp");
+        let (coordinator, task) = RecorderCoordinator::spawn(config(&root));
+        let recording = coordinator
+            .start(RecordingConsent {
+                microphone: true,
+                system_audio: false,
+                storage: true,
+            })
+            .expect("start");
+        coordinator
+            .fail("KOE-AUDIO-PERMISSION-DENIED")
+            .expect("persist failure");
+        assert_eq!(
+            coordinator.snapshot().expect("snapshot").state,
+            SessionState::Failed
+        );
+        task.shutdown(&coordinator).expect("shutdown");
+        let session = recording.session_id.expect("session");
+        let manifest: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(
+                root.path()
+                    .join("sessions")
+                    .join(session.to_string())
+                    .join("session.json"),
+            )
+            .expect("manifest"),
+        )
+        .expect("manifest JSON");
+        assert_eq!(manifest["state"], "failed");
+        assert_eq!(manifest["failure_code"], "KOE-AUDIO-PERMISSION-DENIED");
+    }
+
+    #[test]
     fn owns_one_session_and_idempotently_stops() {
         let root = TempDir::new().expect("temp");
         let (coordinator, task) = RecorderCoordinator::spawn(config(&root));
         let consent = RecordingConsent {
             microphone: true,
+            system_audio: false,
             storage: true,
         };
         let recording = coordinator.start(consent).expect("start");
-        assert_eq!(recording.state, SessionState::Recording);
+        assert_eq!(recording.state, SessionState::Starting);
+        let session = recording.session_id.expect("session");
+        let manifest_path = root
+            .path()
+            .join("sessions")
+            .join(session.to_string())
+            .join("session.json");
+        let starting: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&manifest_path).expect("starting manifest"))
+                .expect("manifest JSON");
+        assert_eq!(starting["state"], "starting");
+        coordinator.mark_recording().expect("streams started");
+        let recording_manifest: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&manifest_path).expect("recording manifest"))
+                .expect("manifest JSON");
+        assert_eq!(recording_manifest["state"], "recording");
         assert!(coordinator.start(consent).is_err());
         coordinator.append(vec![1, 2, 3]).expect("append");
         let completed = coordinator.stop().expect("stop");
@@ -495,6 +995,7 @@ mod tests {
         coordinator
             .start(RecordingConsent {
                 microphone: true,
+                system_audio: false,
                 storage: true,
             })
             .expect("start");
@@ -515,6 +1016,7 @@ mod tests {
         let recording = coordinator
             .start(RecordingConsent {
                 microphone: true,
+                system_audio: false,
                 storage: true,
             })
             .expect("start");
@@ -548,6 +1050,7 @@ mod tests {
         let recording = coordinator
             .start(RecordingConsent {
                 microphone: true,
+                system_audio: false,
                 storage: true,
             })
             .expect("start");
@@ -571,5 +1074,48 @@ mod tests {
         )
         .expect("manifest JSON");
         assert_eq!(manifest["state"], "failed");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn additional_track_failure_transitions_to_failed() {
+        let root = TempDir::new().expect("temp");
+        let mut recording_config = config(&root);
+        recording_config.sample_rate = 1;
+        recording_config.additional_tracks.push(TrackConfig {
+            kind: TrackKind::System,
+            sample_rate: 1,
+            channels: 1,
+            samples_per_segment: 10,
+            backend: "fixture".to_owned(),
+            source_device_id: "system-fixture".to_owned(),
+            permission_result: "granted".to_owned(),
+            native_sample_format: "signed-16-bit-pcm".to_owned(),
+        });
+        let (coordinator, task) = RecorderCoordinator::spawn(recording_config);
+        let recording = coordinator
+            .start(RecordingConsent {
+                microphone: true,
+                system_audio: true,
+                storage: true,
+            })
+            .expect("start");
+        let session = recording.session_id.expect("session");
+        std::fs::remove_file(
+            root.path()
+                .join("sessions")
+                .join(session.to_string())
+                .join("audio/system-000001.wav"),
+        )
+        .expect("remove open system WAV name");
+
+        coordinator
+            .append_track(TrackKind::System, vec![1, 2, 3, 4, 5])
+            .expect_err("system checkpoint must fail");
+        assert_eq!(
+            coordinator.snapshot().expect("snapshot").state,
+            SessionState::Failed
+        );
+        task.shutdown(&coordinator).expect("shutdown");
     }
 }
