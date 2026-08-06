@@ -64,6 +64,10 @@
                 drv.overrideAttrs {
                   patches = [ ./nix/patches/libspa-sys-bindgen-out-dir.patch ];
                 }
+              else if package.name == "pipewire-sys" && package.version == "0.10.0" then
+                drv.overrideAttrs {
+                  patches = [ ./nix/patches/pipewire-sys-bindgen-out-dir.patch ];
+                }
               else
                 drv;
           };
