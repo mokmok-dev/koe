@@ -44,19 +44,27 @@ artifact の暗号学的検証方法は公開資料だけでは確定できな�
 
 ## 現在の repository
 
-現在は Milestone 2 までの基盤として `koe-core`、`koe-audio`、`koe-recording`、
-`koe-app`、`koe-cli` が存在する。domain state machine、bounded callback handoff、
-segmented WAV と crash recovery、単一所有 coordinator、および capability/doctor
-CLI を実装済みである。CPAL microphone capture adapter に加え、Windows/macOS の
-output loopback と Linux の PipeWire sink/PulseAudio monitor を実行時に検出する。
-system audio を選択した session は isolated stems と 16 kHz mono mix を保存し、
-drift correction と gap marker を manifest に記録する。利用不能な source は
-availability、permission、probe effect を分離して機械可読に報告する。manifest v2 は
-callback block ごとの session timeline と capture epoch を整数 microseconds で保存する。
-crash recovery は境界検証済みの専用 artifact を生成し、元の WAV を変更しない。
-`unsafe_code`、panic、unwrap、unused などを deny する strict lint は維持する。
-Nix の対象は `x86_64-linux`、`aarch64-linux`、`aarch64-darwin` であり、
-Windows と Intel macOS は CI で補完する。
+現在は Milestone 3 までの基盤として `koe-core`、`koe-audio`、`koe-recording`、
+`koe-app`、`koe-model`、`koe-transcript`、`koe-cli` が存在する。Milestone 1/2 の
+domain state machine、bounded callback handoff、segmented WAV と crash recovery、
+単一所有 coordinator、capability/doctor CLI、system audio と同期、manifest v2 に
+加えて、Milestone 3 で Foundry Local を `koe-model` 内に隔離した。`
+
+- `FoundryAdapter`/`StreamingAsrSession` の port と `KoeModelManager` を実装し、
+  list/resolve/install/load/unload/remove と model state machine を提供する。
+- offline 契約は manager 境界で強制する。`Denied` は adapter へ一切触れず、
+  cache に無い artifact は `KOE-MODEL-OFFLINE-MISSING` を返す。
+- install は明示同意 (`ModelInstallOnly`) のみ許可し、digest inventory を
+  manifest に記録して allowlist 照合 / quarantine を行う。active model の
+  remove と version switch は `KOE-MODEL-BUSY` で拒否する。
+- ライブ ASR は 16 kHz mono PCM を bounded feed bridge で async session へ送り、
+  `koe-transcript` が `events.jsonl` / `final.json` / `final.txt` を materialize する。
+- chunk size ごとの latency/WER/RTF baseline を `koe models benchmark` で保存する。
+- ネイティブ live-audio session は公開された foundry SDK に無いため、capability
+  として報告する。E2E offline テストは fixture adapter で駆動する。
+- `unsafe_code`、panic、unwrap、unused などを deny する strict lint は維持する。
+- Nix の対象は `x86_64-linux`、`aarch64-linux`、`aarch64-darwin` であり、
+  Windows と Intel macOS は CI で補完する。
 
 ## 調査の範囲
 
