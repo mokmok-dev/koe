@@ -44,12 +44,16 @@ artifact の暗号学的検証方法は公開資料だけでは確定できな�
 
 ## 現在の repository
 
-現在は Milestone 1 の基盤として `koe-core`、`koe-audio`、`koe-recording`、
+現在は Milestone 2 までの基盤として `koe-core`、`koe-audio`、`koe-recording`、
 `koe-app`、`koe-cli` が存在する。domain state machine、bounded callback handoff、
 segmented WAV と crash recovery、単一所有 coordinator、および capability/doctor
-CLI を実装済みである。CPAL microphone capture adapter は接続済みで、利用可能な
-input device を capability として実行時に報告する。system audio capture は未接続の
-ため `unsupported` capability として機械可読に報告する。
+CLI を実装済みである。CPAL microphone capture adapter に加え、Windows/macOS の
+output loopback と Linux の PipeWire sink/PulseAudio monitor を実行時に検出する。
+system audio を選択した session は isolated stems と 16 kHz mono mix を保存し、
+drift correction と gap marker を manifest に記録する。利用不能な source は
+availability、permission、probe effect を分離して機械可読に報告する。manifest v2 は
+callback block ごとの session timeline と capture epoch を整数 microseconds で保存する。
+crash recovery は境界検証済みの専用 artifact を生成し、元の WAV を変更しない。
 `unsafe_code`、panic、unwrap、unused などを deny する strict lint は維持する。
 Nix の対象は `x86_64-linux`、`aarch64-linux`、`aarch64-darwin` であり、
 Windows と Intel macOS は CI で補完する。

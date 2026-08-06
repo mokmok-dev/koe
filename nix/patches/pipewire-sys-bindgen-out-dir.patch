@@ -1,0 +1,12 @@
+diff --git a/build.rs b/build.rs
+index f11c64d..b7edce5 100644
+--- a/build.rs
++++ b/build.rs
+@@ -13,0 +14 @@ fn main() {
++    let out_path = PathBuf::from(env::var("OUT_DIR").unwrap());
+@@ -31 +32,2 @@ fn main() {
+-        .clang_macro_fallback();
++        .clang_macro_fallback()
++        .clang_macro_fallback_build_dir(&out_path);
+@@ -44 +45,0 @@ fn main() {
+-    let out_path = PathBuf::from(env::var("OUT_DIR").unwrap());

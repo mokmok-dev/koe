@@ -196,6 +196,43 @@ pub enum CapabilityState {
     PermissionRequired,
 }
 
+/// Runtime availability independent from the current permission decision.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum Availability {
+    Available,
+    OsTooOld,
+    ApiUnavailable,
+    BackendUnavailable,
+    #[default]
+    Unsupported,
+}
+
+/// Permission state without conflating hardware/backend availability.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum PermissionState {
+    Granted,
+    NotDetermined,
+    Denied,
+    Restricted,
+    Revoked,
+    /// The platform has no side-effect-free status API.
+    Unobservable,
+    #[default]
+    NotApplicable,
+}
+
+/// Side effects a capability probe is allowed to perform.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ProbeEffect {
+    #[default]
+    None,
+    MayPrompt,
+    OpensCapture,
+}
+
 /// Network access frozen at session start.
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]

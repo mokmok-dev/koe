@@ -56,6 +56,21 @@
               doCheck = false;
             }
           );
+          cargoVendorDir = config.rust-project.crane-lib.vendorCargoDeps {
+            src = ./.;
+            overrideVendorCargoPackage =
+              package: drv:
+              if package.name == "libspa-sys" && package.version == "0.10.0" then
+                drv.overrideAttrs {
+                  patches = [ ./nix/patches/libspa-sys-bindgen-out-dir.patch ];
+                }
+              else if package.name == "pipewire-sys" && package.version == "0.10.0" then
+                drv.overrideAttrs {
+                  patches = [ ./nix/patches/pipewire-sys-bindgen-out-dir.patch ];
+                }
+              else
+                drv;
+          };
         in
         {
           checks = pkgs.lib.optionalAttrs pkgs.stdenv.isLinux {
@@ -77,7 +92,20 @@
 
           rust-project = {
             toolchain = pkgs.rust-bin.fromRustupToolchainFile ./rust-toolchain.toml;
-            defaults.perCrate.crane.args.buildInputs = pkgs.lib.optionals pkgs.stdenv.isLinux [ pkgs.alsa-lib ];
+            defaults.perCrate.crane.args = {
+              BINDGEN_EXTRA_CLANG_ARGS = pkgs.lib.optionalString pkgs.stdenv.isLinux "-isystem ${pkgs.llvmPackages_18.clang-unwrapped.lib}/lib/clang/18/include";
+              LIBCLANG_PATH = "${pkgs.llvmPackages_18.libclang.lib}/lib";
+              inherit cargoVendorDir;
+              buildInputs = pkgs.lib.optionals pkgs.stdenv.isLinux [
+                pkgs.alsa-lib
+                pkgs.libpulseaudio
+                pkgs.pipewire
+              ];
+              nativeBuildInputs = pkgs.lib.optionals pkgs.stdenv.isLinux [
+                pkgs.llvmPackages_18.libclang
+                pkgs.pkg-config
+              ];
+            };
           };
 
           treefmt = {
