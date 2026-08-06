@@ -1,6 +1,6 @@
 use std::{collections::HashMap, env};
 
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 use log::{debug, info};
 use serde_json::Value;
 
@@ -37,19 +37,28 @@ impl FoundryLocalManagerBuilder {
     }
 
     /// Set the alias or model ID to download and load.
-    pub fn alias_or_model_id(mut self, alias_or_model_id: impl Into<String>) -> Self {
+    pub fn alias_or_model_id(
+        mut self,
+        alias_or_model_id: impl Into<String>,
+    ) -> Self {
         self.alias_or_model_id = Some(alias_or_model_id.into());
         self
     }
 
     /// Set whether to start the service if it is not running.
-    pub fn bootstrap(mut self, bootstrap: bool) -> Self {
+    pub fn bootstrap(
+        mut self,
+        bootstrap: bool,
+    ) -> Self {
         self.bootstrap = bootstrap;
         self
     }
 
     /// Set the timeout for the HTTP client in seconds.
-    pub fn timeout_secs(mut self, timeout_secs: u64) -> Self {
+    pub fn timeout_secs(
+        mut self,
+        timeout_secs: u64,
+    ) -> Self {
         self.timeout_secs = Some(timeout_secs);
         self
     }
@@ -89,7 +98,10 @@ impl FoundryLocalManager {
         FoundryLocalManagerBuilder::new()
     }
 
-    fn set_service_uri_and_client(&mut self, service_uri: Option<String>) {
+    fn set_service_uri_and_client(
+        &mut self,
+        service_uri: Option<String>,
+    ) {
         self.service_uri = service_uri.clone();
         self.client = service_uri.map(|uri| HttpClient::new(&uri, self.timeout));
     }
@@ -341,7 +353,10 @@ impl FoundryLocalManager {
         self.fetch_model_infos(&model_ids).await
     }
 
-    async fn fetch_model_infos(&mut self, model_ids: &[String]) -> Result<Vec<FoundryModelInfo>> {
+    async fn fetch_model_infos(
+        &mut self,
+        model_ids: &[String],
+    ) -> Result<Vec<FoundryModelInfo>> {
         let mut results = Vec::new();
         let catalog_dict = self.get_catalog_dict().await?;
 
@@ -459,7 +474,11 @@ impl FoundryLocalManager {
     /// # Returns
     ///
     /// Result indicating success or failure.
-    pub async fn unload_model(&mut self, alias_or_model_id: &str, force: bool) -> Result<()> {
+    pub async fn unload_model(
+        &mut self,
+        alias_or_model_id: &str,
+        force: bool,
+    ) -> Result<()> {
         let model_info = self.get_model_info(alias_or_model_id, true).await?;
         info!("Unloading model: {} ({})", model_info.alias, model_info.id);
 
@@ -509,7 +528,10 @@ impl FoundryLocalManager {
 
     /// Set a custom service URI and client for testing purposes.
     #[doc(hidden)]
-    pub fn set_test_service_uri(&mut self, uri: &str) {
+    pub fn set_test_service_uri(
+        &mut self,
+        uri: &str,
+    ) {
         self.service_uri = Some(uri.to_string());
         self.client = Some(HttpClient::new(uri, self.timeout));
         self.catalog_list = None;

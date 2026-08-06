@@ -23,7 +23,7 @@
 //!         .alias_or_model_id("phi-4-mini")
 //!         .build()
 //!         .await?;
-//!     
+//!
 //!     // Use the OpenAI compatible API to interact with the model
 //!     let client = reqwest::Client::new();
 //!     let response = client.post(&format!("{}/chat/completions", manager.endpoint()?))
@@ -35,10 +35,10 @@
 //!         }))
 //!         .send()
 //!         .await?;
-//!     
+//!
 //!     let result = response.json::<serde_json::Value>().await?;
 //!     println!("{}", result["choices"][0]["message"]["content"]);
-//!     
+//!
 //!     Ok(())
 //! }
 //! ```

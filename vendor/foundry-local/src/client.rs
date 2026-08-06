@@ -44,7 +44,10 @@ impl HttpClient {
     /// # Returns
     ///
     /// A new HttpClient instance.
-    pub fn new(host: &str, timeout_secs: Option<u64>) -> Self {
+    pub fn new(
+        host: &str,
+        timeout_secs: Option<u64>,
+    ) -> Self {
         let timeout = timeout_secs.map(Duration::from_secs);
         let mut client_builder = Client::builder().user_agent("foundry-local-rust-sdk/0.1.0");
 
@@ -164,11 +167,11 @@ impl HttpClient {
                             }
                         }
                     }
-                }
+                },
                 Err(e) => {
                     error!("Error reading response chunk: {e}");
                     return Err(ClientError::RequestError(e));
-                }
+                },
             }
         }
 

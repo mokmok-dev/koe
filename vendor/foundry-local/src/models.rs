@@ -11,7 +11,10 @@ pub enum DeviceType {
 }
 
 impl fmt::Display for DeviceType {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    fn fmt(
+        &self,
+        f: &mut fmt::Formatter<'_>,
+    ) -> fmt::Result {
         match self {
             DeviceType::CPU => write!(f, "CPU"),
             DeviceType::GPU => write!(f, "GPU"),
@@ -46,7 +49,10 @@ impl ExecutionProvider {
 }
 
 impl fmt::Display for ExecutionProvider {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    fn fmt(
+        &self,
+        f: &mut fmt::Formatter<'_>,
+    ) -> fmt::Result {
         write!(
             f,
             "{}",
@@ -156,7 +162,10 @@ impl FoundryModelInfo {
 }
 
 impl fmt::Display for FoundryModelInfo {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    fn fmt(
+        &self,
+        f: &mut fmt::Formatter<'_>,
+    ) -> fmt::Result {
         write!(
             f,
             "FoundryModelInfo(alias={}, id={}, runtime={}, file_size={} MB, license={})",
