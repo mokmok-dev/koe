@@ -1,0 +1,24 @@
+[package]
+name = "koe-desktop"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "koe-desktop"
+path = "src/main.rs"
+
+[dependencies]
+gpui.workspace = true
+koe-app.workspace = true
+koe-audio.workspace = true
+koe-core.workspace = true
+koe-model.workspace = true
+koe-recording.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[lints]
+workspace = true

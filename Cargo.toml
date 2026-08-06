@@ -1,6 +1,7 @@
 [workspace]
 members = [
   "apps/koe-cli",
+  "apps/koe-desktop",
   "crates/koe-app",
   "crates/koe-audio",
   "crates/koe-core",
@@ -15,6 +16,7 @@ cap-std = "4.0.2"
 clap = { version = "4.5.42", features = ["derive"] }
 async-trait = "0.1.88"
 cpal = { version = "0.18.1", features = ["pipewire", "pulseaudio"] }
+gpui = { version = "0.2.2", features = ["runtime_shaders"] }
 ctrlc = "3.4.7"
 foundry-local = "0.1.0"
 hound = "3.5.1"
@@ -56,3 +58,9 @@ unused = "deny"
 [workspace.package]
 edition = "2024"
 version = "0.0.0"
+
+[patch.crates-io]
+# Upstream 0.1.0 pins an unused `url = 2.4.1`, which cannot coexist with
+# GPUI's platform dependencies. This is the published source with only that
+# unused dependency removed.
+foundry-local = { path = "vendor/foundry-local" }
