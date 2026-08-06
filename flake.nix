@@ -78,13 +78,14 @@
           rust-project = {
             toolchain = pkgs.rust-bin.fromRustupToolchainFile ./rust-toolchain.toml;
             defaults.perCrate.crane.args = {
+              LIBCLANG_PATH = "${pkgs.llvmPackages.libclang.lib}/lib";
               buildInputs = pkgs.lib.optionals pkgs.stdenv.isLinux [
                 pkgs.alsa-lib
                 pkgs.libpulseaudio
                 pkgs.pipewire
               ];
               nativeBuildInputs = pkgs.lib.optionals pkgs.stdenv.isLinux [
-                pkgs.clang
+                pkgs.llvmPackages.libclang
                 pkgs.pkg-config
               ];
             };
