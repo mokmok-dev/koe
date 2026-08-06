@@ -372,7 +372,7 @@ impl CpalBackend {
         #[cfg(target_os = "linux")]
         {
             let backend = self.host.id().name().to_ascii_lowercase();
-            return Ok(devices
+            Ok(devices
                 .into_iter()
                 .filter(|(_, device, name)| {
                     let name = name.to_ascii_lowercase();
@@ -386,7 +386,7 @@ impl CpalBackend {
                         explicit_monitor
                     }
                 })
-                .collect());
+                .collect())
         }
         #[cfg(not(target_os = "linux"))]
         {
@@ -881,32 +881,7 @@ const fn platform_system_audio_allowed(policy: PackagingPolicy) -> bool {
     matches!(policy, PackagingPolicy::DirectAllowed)
 }
 
-#[cfg(target_os = "linux")]
-fn linux_process_is_sandboxed() -> bool {
-    if ["FLATPAK_ID", "SNAP", "container"]
-        .iter()
-        .any(|name| std::env::var_os(name).is_some())
-        || [
-            "/.flatpak-info",
-            "/.dockerenv",
-            "/run/.containerenv",
-            "/run/systemd/container",
-        ]
-        .iter()
-        .any(|path| std::path::Path::new(path).exists())
-    {
-        return true;
-    }
-    // Fail closed when procfs cannot establish that this is a normal host
-    // process. Sandboxes can scrub environment variables but cannot normally
-    // hide their cgroup/container identity from this process.
-    let Ok(cgroup) = std::fs::read_to_string("/proc/self/cgroup") else {
-        return true;
-    };
-    linux_cgroup_is_sandboxed(&cgroup)
-}
-
-#[cfg(any(test, target_os = "linux"))]
+#[cfg(test)]
 fn linux_cgroup_is_sandboxed(cgroup: &str) -> bool {
     if cgroup.trim().is_empty() {
         return true;
