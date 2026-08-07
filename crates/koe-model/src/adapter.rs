@@ -26,8 +26,13 @@ pub struct InstalledFile {
 pub struct InstalledArtifact {
     /// Root that owns every reported file, used for path validation.
     pub cache_root: PathBuf,
+    /// Exact, unambiguous directory for this descriptor inside `cache_root`.
+    pub artifact_root: PathBuf,
     pub model_id: ModelId,
     pub files: Vec<InstalledFile>,
+    /// Whether this install operation created the artifact from an absent
+    /// cache entry. Only such artifacts may be removed on cancellation.
+    pub created_by_install: bool,
 }
 
 /// Bounded live-session configuration frozen at creation.
@@ -211,6 +216,17 @@ pub trait FoundryAdapter: Send + Sync {
         model: &ModelDescriptor,
         cancel: &tokio_util::sync::CancellationToken,
         force: bool,
+    ) -> Result<InstalledArtifact, AdapterError>;
+
+    /// Inventories the current local cache entry without network access.
+    /// Used to reverify immutable manifest data immediately before loading.
+    ///
+    /// # Errors
+    ///
+    /// Returns an adapter error when the local artifact cannot be inspected.
+    async fn inspect_local_artifact(
+        &mut self,
+        model: &ModelDescriptor,
     ) -> Result<InstalledArtifact, AdapterError>;
 
     /// Loads the model into the local runtime.

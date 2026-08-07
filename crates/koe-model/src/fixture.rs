@@ -5,7 +5,7 @@
 //! [`fixture_transcribe`] maps PCM to a stable word sequence so latency and
 //! WER baselines are reproducible.
 
-use std::{collections::BTreeSet, fs, path::PathBuf, sync::Arc};
+use std::{collections::BTreeSet, fs, path::PathBuf, sync::Arc, time::Duration};
 
 use async_trait::async_trait;
 use sha2::{Digest, Sha256};
@@ -164,6 +164,8 @@ pub struct FixtureFoundryAdapter {
     installed: BTreeSet<ModelId>,
     loaded: BTreeSet<ModelId>,
     install_calls: Arc<Mutex<usize>>,
+    install_delay: Duration,
+    ignore_install_cancellation: bool,
 }
 
 impl FixtureFoundryAdapter {
@@ -176,7 +178,27 @@ impl FixtureFoundryAdapter {
             installed: BTreeSet::new(),
             loaded: BTreeSet::new(),
             install_calls: Arc::new(Mutex::new(0)),
+            install_delay: Duration::ZERO,
+            ignore_install_cancellation: false,
         }
+    }
+
+    /// Delays fixture installation so cancellation races can be tested.
+    #[must_use]
+    pub const fn with_install_delay(
+        mut self,
+        delay: Duration,
+    ) -> Self {
+        self.install_delay = delay;
+        self
+    }
+
+    /// Simulates an SDK download that cannot observe cancellation until its
+    /// blocking operation completes.
+    #[must_use]
+    pub const fn ignoring_install_cancellation(mut self) -> Self {
+        self.ignore_install_cancellation = true;
+        self
     }
 
     /// Number of install (download) calls performed.
@@ -241,19 +263,31 @@ impl FixtureFoundryAdapter {
             serde_json::to_writer_pretty(file, &metadata)
                 .map_err(|_| AdapterError::DownloadFailed)?;
         }
+        self.artifact_from_cache(model)
+    }
+
+    fn artifact_from_cache(
+        &self,
+        model: &ModelDescriptor,
+    ) -> Result<InstalledArtifact, AdapterError> {
+        let model_dir = self
+            .cache_root
+            .join("models")
+            .join(sanitize_component(&model.id.0));
         let mut files = Vec::new();
-        for entry in fs::read_dir(&model_dir).map_err(|_| AdapterError::DownloadFailed)? {
-            let entry = entry.map_err(|_| AdapterError::DownloadFailed)?;
+        for entry in fs::read_dir(&model_dir).map_err(|_| AdapterError::RuntimeFailed)? {
+            let entry = entry.map_err(|_| AdapterError::RuntimeFailed)?;
             let path = entry.path();
-            if !matches!(entry.file_type(), Ok(kind) if kind.is_file()) {
-                continue;
+            let file_type = entry.file_type().map_err(|_| AdapterError::RuntimeFailed)?;
+            if file_type.is_symlink() || !file_type.is_file() {
+                return Err(AdapterError::RuntimeFailed);
             }
-            let bytes = fs::read(&path).map_err(|_| AdapterError::DownloadFailed)?;
+            let bytes = fs::read(&path).map_err(|_| AdapterError::RuntimeFailed)?;
             let sha256 = hex_encode(&Sha256::digest(&bytes));
             let size = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
             let relative = path
                 .strip_prefix(&self.cache_root)
-                .map_err(|_| AdapterError::DownloadFailed)?
+                .map_err(|_| AdapterError::RuntimeFailed)?
                 .to_string_lossy()
                 .replace('\\', "/");
             files.push(InstalledFile {
@@ -266,8 +300,10 @@ impl FixtureFoundryAdapter {
         files.sort_by(|left, right| left.relative_path.cmp(&right.relative_path));
         Ok(InstalledArtifact {
             cache_root: self.cache_root.clone(),
+            artifact_root: model_dir,
             model_id: model.id.clone(),
             files,
+            created_by_install: false,
         })
     }
 }
@@ -356,25 +392,46 @@ impl FoundryAdapter for FixtureFoundryAdapter {
             let mut counter = self.install_calls.lock().await;
             *counter = counter.saturating_add(1);
         }
-        let cached = self.installed.contains(&model.id);
-        if cached && !force {
-            return Ok(InstalledArtifact {
-                cache_root: self.cache_root.clone(),
-                model_id: model.id.clone(),
-                files: Vec::new(),
-            });
+        if !self.install_delay.is_zero() {
+            if self.ignore_install_cancellation {
+                tokio::time::sleep(self.install_delay).await;
+            } else {
+                tokio::select! {
+                    () = tokio::time::sleep(self.install_delay) => {},
+                    () = cancel.cancelled() => return Err(AdapterError::DownloadFailed),
+                }
+            }
+        }
+        let model_dir = self
+            .cache_root
+            .join("models")
+            .join(sanitize_component(&model.id.0));
+        let cache_existed = model_dir.is_dir();
+        if cache_existed && !force {
+            self.installed.insert(model.id.clone());
+            return self.artifact_from_cache(model);
         }
         self.installed.insert(model.id.clone());
-        self.materialize_artifact(model)
+        let mut artifact = self.materialize_artifact(model)?;
+        artifact.created_by_install = !cache_existed;
+        Ok(artifact)
+    }
+
+    async fn inspect_local_artifact(
+        &mut self,
+        model: &ModelDescriptor,
+    ) -> Result<InstalledArtifact, AdapterError> {
+        let artifact = self.artifact_from_cache(model)?;
+        self.installed.insert(model.id.clone());
+        Ok(artifact)
     }
 
     async fn load(
         &mut self,
         model: &ModelDescriptor,
     ) -> Result<(), AdapterError> {
-        if !self.installed.contains(&model.id) {
-            return Err(AdapterError::NotFound);
-        }
+        self.artifact_from_cache(model)?;
+        self.installed.insert(model.id.clone());
         self.loaded.insert(model.id.clone());
         Ok(())
     }
@@ -397,10 +454,16 @@ impl FoundryAdapter for FixtureFoundryAdapter {
             .cache_root
             .join("models")
             .join(sanitize_component(&model.id.0));
-        if model_dir.exists() {
-            fs::remove_dir_all(&model_dir).map_err(|_| AdapterError::RuntimeFailed)?;
+        match fs::symlink_metadata(&model_dir) {
+            Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => {
+                Err(AdapterError::RuntimeFailed)
+            },
+            Ok(_) => fs::remove_dir_all(&model_dir).map_err(|_| AdapterError::RuntimeFailed),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                Err(AdapterError::NotFound)
+            },
+            Err(_) => Err(AdapterError::RuntimeFailed),
         }
-        Ok(())
     }
 
     async fn create_asr_session(
@@ -502,6 +565,17 @@ where
             *counter = counter.saturating_add(1);
         }
         self.inner.install(model, cancel, force).await
+    }
+
+    async fn inspect_local_artifact(
+        &mut self,
+        model: &ModelDescriptor,
+    ) -> Result<InstalledArtifact, AdapterError> {
+        {
+            let mut counter = self.calls.lock().await;
+            *counter = counter.saturating_add(1);
+        }
+        self.inner.inspect_local_artifact(model).await
     }
 
     async fn load(

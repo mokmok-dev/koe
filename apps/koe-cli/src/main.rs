@@ -223,9 +223,20 @@ enum Command {
         /// Optional system-audio device ID from `devices list --source system`.
         #[arg(long)]
         system: Option<String>,
-        /// Reserved model selector; Milestone 2 records audio without ASR.
+        /// Installed model selector, or `none` for audio-only recording.
         #[arg(long)]
         model: String,
+        /// Consent to install `--model` when it is not available locally.
+        /// This never enables updates or other network fallback.
+        #[arg(long)]
+        install_model: bool,
+        /// Permit network access only for the consented missing-model install.
+        #[arg(long)]
+        network: bool,
+        /// Accept the exact license ID displayed for the resolved model.
+        /// Required only when the selected model must be installed.
+        #[arg(long, value_name = "LICENSE_ID")]
+        accept_model_license: Option<String>,
         /// App-owned data root below which `sessions/<uuid>` is created.
         #[arg(long)]
         output: PathBuf,
@@ -359,6 +370,15 @@ fn execute(
     backend: &impl AudioBackend,
     output: &mut impl io::Write,
 ) -> Result<(), CliError> {
+    execute_with_model_manager(cli, backend, output, None)
+}
+
+fn execute_with_model_manager(
+    cli: &Cli,
+    backend: &impl AudioBackend,
+    output: &mut impl io::Write,
+    record_model_manager: Option<&KoeModelManager>,
+) -> Result<(), CliError> {
     match &cli.command {
         Command::Capabilities => {
             let capabilities = backend.capabilities()?;
@@ -392,6 +412,9 @@ fn execute(
             mic,
             system,
             model,
+            install_model,
+            network,
+            accept_model_license,
             output: data_root,
             sample_rate,
             channels,
@@ -402,12 +425,16 @@ fn execute(
                 mic,
                 system.as_deref(),
                 model,
+                *install_model,
+                *network,
+                accept_model_license.as_deref(),
                 data_root,
                 *sample_rate,
                 *channels,
                 *consent,
                 cli.output_format,
                 output,
+                record_model_manager,
             )?;
         },
     }
@@ -486,37 +513,15 @@ fn run_models_command(
                 return Err(CliError::Model(koe_model::ModelError::NetworkDenied));
             }
             let manager = model_manager(data_root, *network)?;
-            let (progress, mut progress_rx) = tokio::sync::mpsc::channel(8);
             let selector = selector.parse::<koe_model::ModelSelector>()?;
-            let installed = run_blocking(async {
-                let options = InstallOptions {
-                    policy: NetworkPolicy::ModelInstallOnly,
-                    cancel: tokio_util::sync::CancellationToken::new(),
-                    progress: Some(progress),
-                    force_redownload: *force,
-                };
-                while let Ok(phase) = progress_rx.try_recv() {
-                    match phase {
-                        koe_model::ModelProgress::Resolving => {
-                            eprintln!("resolving model");
-                        },
-                        koe_model::ModelProgress::Downloading => {
-                            eprintln!("downloading model");
-                        },
-                        koe_model::ModelProgress::Verifying => {
-                            eprintln!("verifying digest inventory");
-                        },
-                        koe_model::ModelProgress::Installing => {
-                            eprintln!("installing manifest");
-                        },
-                        koe_model::ModelProgress::Done => {},
-                    }
-                }
-                manager
-                    .install(&selector, &options)
-                    .await
-                    .map_err(CliError::Model)
-            })?;
+            let installed = run_blocking(install_model_with_progress(
+                &manager,
+                &selector,
+                *force,
+                format,
+                tokio_util::sync::CancellationToken::new(),
+                None,
+            ))?;
             render(&installed, format, output, || {
                 format!(
                     "installed: {} ({}) verification={:?}\n{}",
@@ -880,46 +885,372 @@ const fn benchmark_audio() -> [i16; 32_000] {
     samples
 }
 
-/// Prepares an offline ASR session before any audio stream is opened.
-///
-/// `model == "none"` disables transcription. Otherwise the model must be
-/// already installed; a missing artifact yields
-/// [`koe_model::ModelError::OfflineArtifactMissing`] without touching the
-/// adapter. The session is created here and fed later through the
-/// lock-free feed bridge in the capture loop.
-#[allow(clippy::type_complexity)]
+/// Installs a model under a narrowly scoped policy while reporting progress.
+/// The manager itself can remain frozen to [`NetworkPolicy::Denied`], so all
+/// operations after this explicit install are offline.
+async fn install_model_with_progress(
+    manager: &KoeModelManager,
+    selector: &koe_model::ModelSelector,
+    force_redownload: bool,
+    format: OutputFormat,
+    cancel: tokio_util::sync::CancellationToken,
+    accepted_descriptor: Option<ModelDescriptor>,
+) -> Result<koe_model::InstalledModel, CliError> {
+    let (progress, mut progress_rx) = tokio::sync::mpsc::channel(8);
+    let options = InstallOptions {
+        policy: NetworkPolicy::ModelInstallOnly,
+        cancel: cancel.clone(),
+        progress: Some(progress),
+        accepted_descriptor,
+        force_redownload,
+    };
+    let install = manager.install(selector, &options);
+    tokio::pin!(install);
+    let mut progress_open = true;
+    loop {
+        tokio::select! {
+            result = &mut install => {
+                while let Ok(phase) = progress_rx.try_recv() {
+                    report_model_progress(format, selector, &phase);
+                }
+                return result.map_err(CliError::Model);
+            }
+            phase = progress_rx.recv(), if progress_open => {
+                if let Some(phase) = phase {
+                    report_model_progress(format, selector, &phase);
+                } else {
+                    progress_open = false;
+                }
+            }
+        }
+    }
+}
+
+#[derive(Serialize)]
+struct ModelProgressEnvelope<'a> {
+    event: &'static str,
+    model: &'a str,
+    phase: &'static str,
+}
+
+fn model_progress_line(
+    format: OutputFormat,
+    selector: &koe_model::ModelSelector,
+    phase: &koe_model::ModelProgress,
+) -> String {
+    let phase = match phase {
+        koe_model::ModelProgress::Resolving => "resolving",
+        koe_model::ModelProgress::Downloading => "downloading",
+        koe_model::ModelProgress::Verifying => "verifying",
+        koe_model::ModelProgress::Installing => "installing",
+        koe_model::ModelProgress::Done => "done",
+    };
+    let model = selector.key();
+    if matches!(format, OutputFormat::Human) {
+        format!("model {}: {phase}", terminal_safe(&model))
+    } else {
+        serde_json::to_string(&ModelProgressEnvelope {
+            event: "model_install_progress",
+            model: &model,
+            phase,
+        })
+        .unwrap_or_else(|_| {
+            "{\"event\":\"model_install_progress\",\"phase\":\"serialization_failed\"}".to_owned()
+        })
+    }
+}
+
+fn report_model_progress(
+    format: OutputFormat,
+    selector: &koe_model::ModelSelector,
+    phase: &koe_model::ModelProgress,
+) {
+    emit_stderr(&model_progress_line(format, selector, phase));
+}
+
+#[derive(Serialize)]
+struct ModelCandidateEnvelope<'a> {
+    event: &'static str,
+    model_id: &'a str,
+    alias: &'a str,
+    version: &'a str,
+    variant: &'a str,
+    provider: &'a str,
+    license_id: &'a str,
+    license_description: &'a str,
+    source: &'a str,
+    size_mb: u64,
+    verification: &'static str,
+}
+
+fn report_model_descriptor(
+    format: OutputFormat,
+    event: &'static str,
+    descriptor: &ModelDescriptor,
+) {
+    if matches!(format, OutputFormat::Human) {
+        emit_stderr(&format!(
+            "model: {} ({}) version={} variant={} provider={} size={} MiB license={} ({}) source={} verification=runtime-only; accept with --accept-model-license {}",
+            terminal_safe(&descriptor.alias.0),
+            terminal_safe(&descriptor.id.0),
+            terminal_safe(&descriptor.version.0),
+            terminal_safe(&descriptor.variant),
+            terminal_safe(&descriptor.provider),
+            descriptor.size_mb,
+            terminal_safe(&descriptor.license_id),
+            terminal_safe(&descriptor.license_description),
+            terminal_safe(&descriptor.source),
+            terminal_safe(&descriptor.license_id),
+        ));
+    } else {
+        let envelope = ModelCandidateEnvelope {
+            event,
+            model_id: &descriptor.id.0,
+            alias: &descriptor.alias.0,
+            version: &descriptor.version.0,
+            variant: &descriptor.variant,
+            provider: &descriptor.provider,
+            license_id: &descriptor.license_id,
+            license_description: &descriptor.license_description,
+            source: &descriptor.source,
+            size_mb: descriptor.size_mb,
+            verification: "runtime-only",
+        };
+        emit_stderr(
+            &serde_json::to_string(&envelope).unwrap_or_else(|_| {
+                "{\"event\":\"model_metadata_serialization_failed\"}".to_owned()
+            }),
+        );
+    }
+}
+
+#[derive(Serialize)]
+struct InstalledModelEnvelope<'a> {
+    event: &'static str,
+    model_id: &'a str,
+    alias: &'a str,
+    version: &'a str,
+    variant: &'a str,
+    provider: &'a str,
+    license_id: &'a str,
+    license_description: &'a str,
+    source: &'a str,
+    size_bytes: u64,
+    verification: &'static str,
+}
+
+fn report_installed_model(
+    format: OutputFormat,
+    installed: &koe_model::InstalledModel,
+) {
+    let descriptor = &installed.descriptor;
+    let size_bytes = installed
+        .manifest
+        .files
+        .iter()
+        .fold(0_u64, |total, file| total.saturating_add(file.size));
+    let verification = match installed.manifest.verification {
+        koe_model::Verification::Verified => "verified",
+        koe_model::Verification::RuntimeOnly => "runtime-only",
+        koe_model::Verification::Quarantined => "quarantined",
+    };
+    if matches!(format, OutputFormat::Human) {
+        emit_stderr(&format!(
+            "model: {} ({}) version={} variant={} provider={} size={} bytes license={} ({}) source={} verification={}",
+            terminal_safe(&descriptor.alias.0),
+            terminal_safe(&descriptor.id.0),
+            terminal_safe(&descriptor.version.0),
+            terminal_safe(&descriptor.variant),
+            terminal_safe(&descriptor.provider),
+            size_bytes,
+            terminal_safe(&descriptor.license_id),
+            terminal_safe(&descriptor.license_description),
+            terminal_safe(&descriptor.source),
+            verification,
+        ));
+    } else {
+        let envelope = InstalledModelEnvelope {
+            event: "model_selected",
+            model_id: &descriptor.id.0,
+            alias: &descriptor.alias.0,
+            version: &descriptor.version.0,
+            variant: &descriptor.variant,
+            provider: &descriptor.provider,
+            license_id: &descriptor.license_id,
+            license_description: &descriptor.license_description,
+            source: &descriptor.source,
+            size_bytes,
+            verification,
+        };
+        emit_stderr(
+            &serde_json::to_string(&envelope).unwrap_or_else(|_| {
+                "{\"event\":\"model_metadata_serialization_failed\"}".to_owned()
+            }),
+        );
+    }
+}
+
+#[derive(Serialize)]
+struct DiagnosticEnvelope<'a> {
+    event: &'static str,
+    message: &'a str,
+}
+
+fn diagnostic_line(
+    format: OutputFormat,
+    event: &'static str,
+    message: &str,
+) -> String {
+    if matches!(format, OutputFormat::Human) {
+        message.to_owned()
+    } else {
+        serde_json::to_string(&DiagnosticEnvelope { event, message })
+            .unwrap_or_else(|_| "{\"event\":\"diagnostic_serialization_failed\"}".to_owned())
+    }
+}
+
+fn report_diagnostic(
+    format: OutputFormat,
+    event: &'static str,
+    message: &str,
+) {
+    emit_stderr(&diagnostic_line(format, event, message));
+}
+
+#[cfg(not(test))]
+fn emit_stderr(line: &str) {
+    eprintln!("{line}");
+}
+
+#[cfg(test)]
+thread_local! {
+    static STDERR_CAPTURE: std::cell::RefCell<Option<Vec<String>>> = const {
+        std::cell::RefCell::new(None)
+    };
+}
+
+#[cfg(test)]
+fn emit_stderr(line: &str) {
+    let captured = STDERR_CAPTURE.with(|capture| {
+        let mut capture = capture.borrow_mut();
+        capture.as_mut().is_some_and(|lines| {
+            lines.push(line.to_owned());
+            true
+        })
+    });
+    if !captured {
+        eprintln!("{line}");
+    }
+}
+
+#[cfg(test)]
+fn capture_stderr<T>(operation: impl FnOnce() -> T) -> (T, Vec<String>) {
+    STDERR_CAPTURE.with(|capture| {
+        assert!(capture.borrow().is_none(), "nested stderr capture");
+        *capture.borrow_mut() = Some(Vec::new());
+    });
+    let result = operation();
+    let lines = STDERR_CAPTURE.with(|capture| capture.borrow_mut().take().unwrap_or_default());
+    (result, lines)
+}
+
+/// Prepares ASR before any audio stream is opened. A missing model is only
+/// installed when both install consent and the narrow network permission are
+/// present. The manager remains offline for load and inference.
+#[allow(clippy::too_many_arguments, clippy::type_complexity)]
 fn prepare_asr(
     data_root: &PathBuf,
     model: &str,
+    install_missing: bool,
+    network: bool,
+    accepted_license: Option<&str>,
+    format: OutputFormat,
+    cancel: &tokio_util::sync::CancellationToken,
+    manager_override: Option<&KoeModelManager>,
 ) -> Result<Option<(Box<dyn koe_model::StreamingAsrSession>, TranscriptModel)>, CliError> {
     if model == "none" {
         return Ok(None);
     }
+    let owned_manager;
+    let manager = if let Some(manager) = manager_override {
+        manager
+    } else {
+        owned_manager = model_manager(data_root, false)?;
+        &owned_manager
+    };
+    prepare_asr_with_manager(
+        manager,
+        model,
+        install_missing,
+        network,
+        accepted_license,
+        format,
+        cancel,
+    )
+    .map(Some)
+}
+
+#[allow(clippy::type_complexity)]
+fn prepare_asr_with_manager(
+    manager: &KoeModelManager,
+    model: &str,
+    install_missing: bool,
+    network: bool,
+    accepted_license: Option<&str>,
+    format: OutputFormat,
+    cancel: &tokio_util::sync::CancellationToken,
+) -> Result<(Box<dyn koe_model::StreamingAsrSession>, TranscriptModel), CliError> {
     let selector = model.parse::<koe_model::ModelSelector>()?;
-    let manager = model_manager(data_root, false)?;
-    let installed_id = manager
-        .installed_id_for(&selector)?
-        .ok_or(koe_model::ModelError::OfflineArtifactMissing)?;
+    let installed_id = match manager.installed_id_for(&selector)? {
+        Some(installed_id) => {
+            let installed = manager.installed_model(&installed_id)?;
+            report_installed_model(format, &installed);
+            installed_id
+        },
+        None if !install_missing => {
+            return Err(koe_model::ModelError::OfflineArtifactMissing.into());
+        },
+        None if !network => return Err(koe_model::ModelError::NetworkDenied.into()),
+        None => {
+            let descriptor = run_blocking(async {
+                manager
+                    .resolve_for_install(&selector, NetworkPolicy::ModelInstallOnly, cancel)
+                    .await
+                    .map_err(CliError::Model)
+            })?;
+            report_model_descriptor(format, "model_install_candidate", &descriptor);
+            if accepted_license != Some(descriptor.license_id.as_str()) {
+                return Err(koe_model::ModelError::LicenseNotAccepted.into());
+            }
+            let installed = run_blocking(install_model_with_progress(
+                manager,
+                &selector,
+                false,
+                format,
+                cancel.clone(),
+                Some(descriptor),
+            ))?;
+            report_installed_model(format, &installed);
+            installed.id
+        },
+    };
     let settings = AsrSessionSettings::default();
-    let loaded = run_blocking(async {
-        let manager = &manager;
-        manager.load(&installed_id).await.map_err(CliError::Model)
-    })?;
+    let loaded =
+        run_blocking(async { manager.load(&installed_id).await.map_err(CliError::Model) })?;
     let session = run_blocking(async {
-        let manager = &manager;
         manager
             .create_asr_session(&installed_id, &settings)
             .await
             .map_err(CliError::Model)
     })?;
-    Ok(Some((
+    Ok((
         session,
         TranscriptModel {
             id: loaded.descriptor.id.0,
             version: loaded.descriptor.version.0,
             variant: loaded.descriptor.variant,
         },
-    )))
+    ))
 }
 
 fn render_capabilities(
@@ -998,22 +1329,46 @@ fn record<B: AudioBackend>(
     microphone_id: &str,
     system_id: Option<&str>,
     model: &str,
+    install_missing_model: bool,
+    network: bool,
+    accepted_model_license: Option<&str>,
     data_root: &PathBuf,
     sample_rate: u32,
     channels: u16,
     consent: bool,
     format: OutputFormat,
     output: &mut impl io::Write,
+    model_manager_override: Option<&KoeModelManager>,
 ) -> Result<(), CliError> {
     if !consent {
         return Err(CliError::ConsentRequired);
     }
     let asr_enabled = model != "none";
-    // Model load and session creation happen strictly before capture and
-    // never touch the network (`Denied` policy); a missing artifact is an
-    // explicit error instead of an implicit download.
-    let prepared_asr = prepare_asr(data_root, model)?;
-    report_recovered_sessions(data_root)?;
+    let interrupts = Arc::new(AtomicUsize::new(0));
+    let install_cancel = tokio_util::sync::CancellationToken::new();
+    let interrupt_handler = Arc::clone(&interrupts);
+    let handler_cancel = install_cancel.clone();
+    if model_manager_override.is_none() {
+        ctrlc::set_handler(move || {
+            interrupt_handler.fetch_add(1, Ordering::Relaxed);
+            handler_cancel.cancel();
+        })
+        .map_err(|_| CliError::Signal)?;
+    }
+    // A consented install, model load and session creation all finish before
+    // capture. Network permission is scoped to the missing-model install;
+    // inference remains under the manager's frozen `Denied` policy.
+    let prepared_asr = prepare_asr(
+        data_root,
+        model,
+        install_missing_model,
+        network,
+        accepted_model_license,
+        format,
+        &install_cancel,
+        model_manager_override,
+    )?;
+    report_recovered_sessions(data_root, format)?;
     let mut stream = backend.open(&OpenSource {
         device_id: microphone_id.to_owned(),
         kind: SourceKind::Microphone,
@@ -1120,22 +1475,23 @@ fn record<B: AudioBackend>(
     } else {
         "no model inference (audio-only)"
     };
-    if system_id.is_some() {
-        eprintln!(
+    let confirmation = if system_id.is_some() {
+        format!(
             "confirmed recording: microphone={}, system={}, scope=system-wide, destination={}, retention=until explicitly deleted, model={} ({asr_note}), sharing=none",
             safe_microphone_id,
             terminal_safe(system_id.unwrap_or("none")),
             terminal_safe(&data_root.display().to_string()),
             safe_model,
-        );
+        )
     } else {
-        eprintln!(
+        format!(
             "confirmed recording: microphone={}, system=none, destination={}, retention=until explicitly deleted, model={} ({asr_note}), sharing=none",
             safe_microphone_id,
             terminal_safe(&data_root.display().to_string()),
             safe_model,
-        );
-    }
+        )
+    };
+    report_diagnostic(format, "recording_confirmed", &confirmation);
     let (coordinator, task) = RecorderCoordinator::spawn(config);
     let recording = match coordinator.start(RecordingConsent {
         microphone: true,
@@ -1164,7 +1520,7 @@ fn record<B: AudioBackend>(
             .join("sessions")
             .join(session_id.to_string())
             .join("transcript");
-        Some(AsrBridge::spawn(session, model, transcript_dir))
+        Some(AsrBridge::spawn(session, model, transcript_dir, format))
     } else {
         None
     };
@@ -1186,13 +1542,11 @@ fn record<B: AudioBackend>(
         coordinator.record_permission_result(TrackKind::System, "granted")?;
     }
     coordinator.mark_recording()?;
-    let interrupts = Arc::new(AtomicUsize::new(0));
-    let interrupt_handler = Arc::clone(&interrupts);
-    ctrlc::set_handler(move || {
-        interrupt_handler.fetch_add(1, Ordering::Relaxed);
-    })
-    .map_err(|_| CliError::Signal)?;
-    eprintln!("recording; press Ctrl-C to stop (press twice to cancel)");
+    report_diagnostic(
+        format,
+        "recording_started",
+        "recording; press Ctrl-C to stop (press twice to cancel)",
+    );
 
     let mut samples = vec![0_i16; 16_384];
     let mut system_samples = vec![0_i16; 16_384];
@@ -1821,9 +2175,11 @@ impl AsrBridge {
         session: Box<dyn koe_model::StreamingAsrSession>,
         model: TranscriptModel,
         directory: PathBuf,
+        format: OutputFormat,
     ) -> Self {
         let (sender, receiver) = std::sync::mpsc::sync_channel(64);
-        let worker = std::thread::spawn(move || asr_worker(session, &model, &directory, receiver));
+        let worker =
+            std::thread::spawn(move || asr_worker(session, &model, &directory, receiver, format));
         Self {
             sender,
             worker: Some(worker),
@@ -1860,6 +2216,7 @@ fn asr_worker(
     model: &TranscriptModel,
     directory: &Path,
     receiver: std::sync::mpsc::Receiver<AsrCommand>,
+    format: OutputFormat,
 ) -> Result<(), CliError> {
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -1892,10 +2249,13 @@ fn asr_worker(
         feed(&event)?;
     }
     let report = store.finalize()?;
-    eprintln!(
-        "transcript materialized: {} segment(s) -> {}",
-        report.segment_count,
-        report.json_path.display(),
+    report_diagnostic(
+        format,
+        "transcript_materialized",
+        &format!(
+            "transcript materialized: {} segment(s)",
+            report.segment_count
+        ),
     );
     Ok(())
 }
@@ -1983,13 +2343,20 @@ fn take_available_mix(
     Some((mixed[..produced].to_vec(), start_us))
 }
 
-fn report_recovered_sessions(data_root: &Path) -> Result<(), CliError> {
+fn report_recovered_sessions(
+    data_root: &Path,
+    format: OutputFormat,
+) -> Result<(), CliError> {
     let recovered = recover_sessions(data_root)?;
     for manifest in recovered {
-        eprintln!(
-            "recovered partial session {} ({})",
-            manifest.session_id,
-            manifest.failure_code.as_deref().unwrap_or("recovered")
+        report_diagnostic(
+            format,
+            "session_recovered",
+            &format!(
+                "recovered partial session {} ({})",
+                manifest.session_id,
+                manifest.failure_code.as_deref().unwrap_or("recovered")
+            ),
         );
     }
     Ok(())
@@ -2102,19 +2469,59 @@ impl CliError {
 
 #[cfg(test)]
 mod tests {
-    use std::fs;
+    use std::{
+        fs,
+        sync::atomic::{AtomicUsize, Ordering},
+    };
 
     use clap::Parser;
-    use koe_audio::{CanonicalNormalizer, DriftEstimator, UnsupportedBackend};
-    use koe_core::SessionState;
+    use koe_audio::{
+        AudioBackend, AudioCapability, AudioDevice, AudioError, CanonicalNormalizer,
+        DriftEstimator, OpenSource, UnsupportedBackend, UnsupportedStream,
+    };
+    use koe_core::{NetworkPolicy, SessionState, SourceKind};
+    use koe_model::{DigestAllowlist, FixtureFoundryAdapter, KoeModelManager};
     use koe_recording::{RecordingConfig, SessionRecorder};
     use tempfile::TempDir;
 
     use super::{
-        Cli, OutputFormat, TimelineMapper, TimelineTrack, all_requested_sources_active, execute,
-        no_capture_source_active, render_collection, report_recovered_sessions,
-        reset_source_pipeline, take_available_mix, terminal_safe,
+        Cli, OutputFormat, TimelineMapper, TimelineTrack, all_requested_sources_active,
+        capture_stderr, execute, execute_with_model_manager, model_progress_line,
+        no_capture_source_active, prepare_asr, prepare_asr_with_manager, render_collection,
+        report_recovered_sessions, reset_source_pipeline, take_available_mix, terminal_safe,
     };
+
+    #[derive(Default)]
+    struct CountingUnsupportedBackend {
+        opens: AtomicUsize,
+    }
+
+    impl AudioBackend for CountingUnsupportedBackend {
+        type Stream = UnsupportedStream;
+
+        fn capabilities(&self) -> Result<Vec<AudioCapability>, AudioError> {
+            UnsupportedBackend.capabilities()
+        }
+
+        fn permissions(&self) -> Result<Vec<AudioCapability>, AudioError> {
+            UnsupportedBackend.permissions()
+        }
+
+        fn enumerate(
+            &self,
+            kind: SourceKind,
+        ) -> Result<Vec<AudioDevice>, AudioError> {
+            UnsupportedBackend.enumerate(kind)
+        }
+
+        fn open(
+            &self,
+            _request: &OpenSource,
+        ) -> Result<Self::Stream, AudioError> {
+            self.opens.fetch_add(1, Ordering::SeqCst);
+            Err(AudioError::Unsupported)
+        }
+    }
 
     #[test]
     fn json_capabilities_are_machine_readable() {
@@ -2177,6 +2584,28 @@ mod tests {
         .expect("CLI");
         let error = execute(&cli, &UnsupportedBackend, &mut Vec::new()).expect_err("consent");
         assert_eq!(error.code(), "KOE-POLICY-CONSENT-REQUIRED");
+    }
+
+    #[test]
+    fn missing_model_is_rejected_before_the_audio_backend_is_opened() {
+        let root = TempDir::new().expect("temp");
+        let cli = Cli::try_parse_from([
+            "koe",
+            "record",
+            "--mic",
+            "fixture",
+            "--model",
+            "missing-fixture-model",
+            "--output",
+            root.path().to_str().expect("UTF-8 path"),
+            "--consent",
+        ])
+        .expect("CLI");
+        let error = execute(&cli, &UnsupportedBackend, &mut Vec::new()).expect_err("missing model");
+        assert!(matches!(
+            error,
+            super::CliError::Model(koe_model::ModelError::OfflineArtifactMissing)
+        ));
     }
 
     #[test]
@@ -2283,7 +2712,8 @@ mod tests {
             recorder.session_id()
         };
 
-        report_recovered_sessions(root.path()).unwrap_or_else(|error| panic!("{error}"));
+        report_recovered_sessions(root.path(), OutputFormat::Human)
+            .unwrap_or_else(|error| panic!("{error}"));
         let manifest: serde_json::Value = serde_json::from_slice(
             &std::fs::read(
                 root.path()
@@ -2333,6 +2763,296 @@ mod tests {
         let error = execute(&cli, &UnsupportedBackend, &mut Vec::new())
             .expect_err("catalog requires network consent");
         assert_eq!(error.code(), "KOE-MODEL-OFFLINE-MISSING");
+    }
+
+    #[test]
+    fn record_model_none_ignores_install_and_network_flags() {
+        let root = TempDir::new().expect("temp");
+        let cancel = tokio_util::sync::CancellationToken::new();
+        assert!(
+            prepare_asr(
+                &root.path().to_path_buf(),
+                "none",
+                true,
+                true,
+                Some("unrelated-license"),
+                OutputFormat::Json,
+                &cancel,
+                None,
+            )
+            .expect("audio-only")
+            .is_none()
+        );
+        assert!(!root.path().join("models").exists());
+    }
+
+    #[test]
+    fn record_missing_model_requires_both_install_consent_and_network_permission() {
+        let root = TempDir::new().expect("temp");
+        let cache = TempDir::new().expect("cache");
+        let manager = KoeModelManager::new(
+            root.path(),
+            DigestAllowlist::empty(),
+            Box::new(FixtureFoundryAdapter::new(cache.path())),
+            NetworkPolicy::Denied,
+        )
+        .expect("manager");
+
+        for (install, network, expected) in [
+            (false, false, koe_model::ModelError::OfflineArtifactMissing),
+            (false, true, koe_model::ModelError::OfflineArtifactMissing),
+            (true, false, koe_model::ModelError::NetworkDenied),
+        ] {
+            let cancel = tokio_util::sync::CancellationToken::new();
+            let Err(error) = prepare_asr_with_manager(
+                &manager,
+                "fixture-nemotron-asr-0.6b",
+                install,
+                network,
+                None,
+                OutputFormat::Jsonl,
+                &cancel,
+            ) else {
+                panic!("missing consent or network permission must fail");
+            };
+            assert!(matches!(&error, super::CliError::Model(actual) if actual == &expected));
+            assert_eq!(error.code(), "KOE-MODEL-OFFLINE-MISSING");
+            assert!(manager.installed_models().expect("installed").is_empty());
+        }
+    }
+
+    #[test]
+    fn record_missing_model_requires_exact_license_acceptance() {
+        let root = TempDir::new().expect("temp");
+        let cache = TempDir::new().expect("cache");
+        let manager = KoeModelManager::new(
+            root.path(),
+            DigestAllowlist::empty(),
+            Box::new(FixtureFoundryAdapter::new(cache.path())),
+            NetworkPolicy::Denied,
+        )
+        .expect("manager");
+        for accepted_license in [None, Some(""), Some("wrong-license")] {
+            let cancel = tokio_util::sync::CancellationToken::new();
+            let Err(error) = prepare_asr_with_manager(
+                &manager,
+                "fixture-nemotron-asr-0.6b",
+                true,
+                true,
+                accepted_license,
+                OutputFormat::Json,
+                &cancel,
+            ) else {
+                panic!("model-specific license token must be required");
+            };
+            assert!(matches!(
+                error,
+                super::CliError::Model(koe_model::ModelError::LicenseNotAccepted)
+            ));
+            assert_eq!(error.code(), "KOE-MODEL-LICENSE-NOT-ACCEPTED");
+            assert!(manager.installed_models().expect("installed").is_empty());
+        }
+    }
+
+    #[test]
+    fn record_can_install_missing_model_then_prepare_offline_asr() {
+        let root = TempDir::new().expect("temp");
+        let cache = TempDir::new().expect("cache");
+        let manager = KoeModelManager::new(
+            root.path(),
+            DigestAllowlist::empty(),
+            Box::new(FixtureFoundryAdapter::new(cache.path())),
+            NetworkPolicy::Denied,
+        )
+        .expect("manager");
+
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let (_session, transcript_model) = prepare_asr_with_manager(
+            &manager,
+            "fixture-nemotron-asr-0.6b",
+            true,
+            true,
+            Some("fixture-license-apache-2.0"),
+            OutputFormat::Jsonl,
+            &cancel,
+        )
+        .expect("consented install and ASR preparation");
+
+        assert_eq!(manager.policy(), NetworkPolicy::Denied);
+        assert_eq!(transcript_model.id, "FixtureLocal/NemotronASRStreaming0.6B");
+        assert_eq!(
+            manager.installed_models().expect("installed models").len(),
+            1
+        );
+
+        // Once installed, both permissions and license acceptance can be
+        // absent: the second preparation is entirely local.
+        let (_session, repeated_model) = prepare_asr_with_manager(
+            &manager,
+            "fixture-nemotron-asr-0.6b",
+            false,
+            false,
+            None,
+            OutputFormat::Json,
+            &cancel,
+        )
+        .expect("installed model stays offline");
+        assert_eq!(repeated_model.id, transcript_model.id);
+        assert_eq!(
+            manager.installed_models().expect("installed models").len(),
+            1
+        );
+    }
+
+    #[test]
+    fn record_flags_parse_through_the_command_boundary() {
+        let cli = Cli::try_parse_from([
+            "koe",
+            "record",
+            "--mic",
+            "fixture",
+            "--model",
+            "fixture-nemotron-asr-0.6b",
+            "--install-model",
+            "--network",
+            "--accept-model-license",
+            "fixture-license-apache-2.0",
+            "--output",
+            "/tmp/koe-fixture",
+            "--consent",
+        ])
+        .expect("record CLI");
+        let super::Command::Record {
+            install_model,
+            network,
+            accept_model_license,
+            ..
+        } = cli.command
+        else {
+            panic!("record command");
+        };
+        assert!(install_model && network);
+        assert_eq!(
+            accept_model_license.as_deref(),
+            Some("fixture-license-apache-2.0")
+        );
+    }
+
+    #[test]
+    fn record_command_installs_and_prepares_asr_before_opening_audio() {
+        let root = TempDir::new().expect("temp");
+        let cache = TempDir::new().expect("cache");
+        let manager = KoeModelManager::new(
+            root.path(),
+            DigestAllowlist::empty(),
+            Box::new(FixtureFoundryAdapter::new(cache.path())),
+            NetworkPolicy::Denied,
+        )
+        .expect("manager");
+        let cli = Cli::try_parse_from([
+            "koe",
+            "--output-format",
+            "jsonl",
+            "record",
+            "--mic",
+            "fixture",
+            "--model",
+            "fixture-nemotron-asr-0.6b",
+            "--install-model",
+            "--network",
+            "--accept-model-license",
+            "fixture-license-apache-2.0",
+            "--output",
+            root.path().to_str().expect("UTF-8 root"),
+            "--consent",
+        ])
+        .expect("record CLI");
+        let backend = CountingUnsupportedBackend::default();
+        let error = execute_with_model_manager(&cli, &backend, &mut Vec::new(), Some(&manager))
+            .expect_err("fake backend stops after preparation");
+        assert!(
+            matches!(error, super::CliError::Audio(AudioError::Unsupported)),
+            "unexpected command result: {error:?}"
+        );
+        assert_eq!(backend.opens.load(Ordering::SeqCst), 1);
+        assert_eq!(manager.installed_models().expect("installed").len(), 1);
+    }
+
+    #[test]
+    fn model_install_progress_is_machine_readable() {
+        for format in [OutputFormat::Json, OutputFormat::Jsonl] {
+            let root = TempDir::new().expect("temp");
+            let cache = TempDir::new().expect("cache");
+            let manager = KoeModelManager::new(
+                root.path(),
+                DigestAllowlist::empty(),
+                Box::new(FixtureFoundryAdapter::new(cache.path())),
+                NetworkPolicy::Denied,
+            )
+            .expect("manager");
+            let cancel = tokio_util::sync::CancellationToken::new();
+            let (result, lines) = capture_stderr(|| {
+                prepare_asr_with_manager(
+                    &manager,
+                    "fixture-nemotron-asr-0.6b",
+                    true,
+                    true,
+                    Some("fixture-license-apache-2.0"),
+                    format,
+                    &cancel,
+                )
+            });
+            let (_session, _model) = result.expect("prepare ASR");
+            let events = lines
+                .iter()
+                .map(|line| {
+                    serde_json::from_str::<serde_json::Value>(line)
+                        .unwrap_or_else(|error| panic!("non-JSON stderr line {line:?}: {error}"))
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(
+                events
+                    .iter()
+                    .map(|event| event["event"].as_str().expect("event"))
+                    .collect::<Vec<_>>(),
+                [
+                    "model_install_candidate",
+                    "model_install_progress",
+                    "model_install_progress",
+                    "model_install_progress",
+                    "model_install_progress",
+                    "model_install_progress",
+                    "model_selected",
+                ]
+            );
+            assert_eq!(events[0]["license_id"], "fixture-license-apache-2.0");
+            assert_eq!(events[6]["verification"], "runtime-only");
+            assert_eq!(
+                events[1..6]
+                    .iter()
+                    .map(|event| event["phase"].as_str().expect("phase"))
+                    .collect::<Vec<_>>(),
+                [
+                    "resolving",
+                    "downloading",
+                    "verifying",
+                    "installing",
+                    "done"
+                ]
+            );
+        }
+
+        let unsafe_selector = "model\u{202e}name"
+            .parse::<koe_model::ModelSelector>()
+            .expect("selector");
+        assert_eq!(
+            model_progress_line(
+                OutputFormat::Human,
+                &unsafe_selector,
+                &koe_model::ModelProgress::Resolving,
+            ),
+            "model model\\u{202E}name: resolving"
+        );
     }
 
     #[test]

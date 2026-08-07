@@ -19,6 +19,13 @@ tokio = { workspace = true }
 tokio-util.workspace = true
 uuid.workspace = true
 
+[target.'cfg(windows)'.dependencies]
+same-file = "1.0.6"
+windows-sys = { version = "0.61.2", features = [
+    "Win32_Foundation",
+    "Win32_Storage_FileSystem",
+] }
+
 [dev-dependencies]
 tempfile.workspace = true
 
