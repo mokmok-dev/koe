@@ -272,6 +272,9 @@ pub struct InstallOptions {
     pub cancel: tokio_util::sync::CancellationToken,
     /// Optional progress sink; `None` means no caller is observing.
     pub progress: Option<tokio::sync::mpsc::Sender<ModelProgress>>,
+    /// Catalog metadata the caller displayed and explicitly accepted. When
+    /// present, installation is refused if a second resolution differs.
+    pub accepted_descriptor: Option<ModelDescriptor>,
     /// Re-download even when the runtime cache already has the model.
     pub force_redownload: bool,
 }
@@ -305,6 +308,8 @@ pub enum ModelError {
     Conflict,
     #[error("the model operation was cancelled")]
     Cancelled,
+    #[error("the resolved model license was not explicitly accepted")]
+    LicenseNotAccepted,
     #[error("the model selector is invalid")]
     InvalidSelector,
     #[error("the model identifier is invalid")]
@@ -331,6 +336,7 @@ impl ModelError {
             Self::NotFound => "KOE-MODEL-NOT-FOUND",
             Self::Conflict => "KOE-MODEL-CONFLICT",
             Self::Cancelled => "KOE-MODEL-CANCELLED",
+            Self::LicenseNotAccepted => "KOE-MODEL-LICENSE-NOT-ACCEPTED",
             Self::InvalidSelector | Self::InvalidId => "KOE-MODEL-INVALID-SELECTOR",
             Self::PathRejected => "KOE-STORE-PATH-REJECTED",
             Self::StoreFailed | Self::InvalidTransition | Self::Internal => {
@@ -376,5 +382,9 @@ mod tests {
         );
         assert_eq!(ModelError::VerifyFailed.code(), "KOE-MODEL-VERIFY-FAILED");
         assert_eq!(ModelError::Unavailable.code(), "KOE-MODEL-UNAVAILABLE");
+        assert_eq!(
+            ModelError::LicenseNotAccepted.code(),
+            "KOE-MODEL-LICENSE-NOT-ACCEPTED"
+        );
     }
 }

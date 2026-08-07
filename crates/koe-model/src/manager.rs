@@ -1,8 +1,10 @@
 //! Model manager: policy enforcement and install/load/unload/remove lifecycle.
 
 use std::{
-    collections::BTreeMap,
-    path::PathBuf,
+    collections::{BTreeMap, BTreeSet},
+    fs::File,
+    io::Read,
+    path::{Path, PathBuf},
     sync::{
         Arc,
         atomic::{AtomicUsize, Ordering},
@@ -29,8 +31,9 @@ use crate::{
     },
 };
 
-/// Maximum artifact bytes hashed for the digest inventory.
-const MAX_INVENTORY_BYTES: u64 = 16 * 1024 * 1024 * 1024;
+/// Maximum bytes hashed for one file and for an entire artifact inventory.
+const MAX_INVENTORY_FILE_BYTES: u64 = 16 * 1024 * 1024 * 1024;
+const MAX_INVENTORY_TOTAL_BYTES: u64 = 16 * 1024 * 1024 * 1024;
 
 /// The spec's async model manager port.
 #[async_trait]
@@ -141,10 +144,18 @@ impl KoeModelManager {
     ) -> Result<Self, ModelError> {
         let data_root = data_root.into();
         let store = ModelStore::open(&data_root, allowlist)?;
+        let lifecycles = store
+            .installed_manifests()?
+            .into_iter()
+            .map(|(id, _manifest)| (id, ModelLifecycle::persisted_installed()))
+            .collect();
         Ok(Self {
             store,
             adapter: Mutex::new(adapter),
-            state: RwLock::new(ManagerState::default()),
+            state: RwLock::new(ManagerState {
+                loaded: BTreeMap::new(),
+                lifecycles,
+            }),
             install_gate: Mutex::new(()),
             default_policy,
         })
@@ -246,6 +257,34 @@ impl KoeModelManager {
         self.default_policy
     }
 
+    /// Resolves metadata for a specifically consented install operation.
+    /// This is the only catalog access allowed when the manager's frozen
+    /// session policy is [`NetworkPolicy::Denied`].
+    ///
+    /// # Errors
+    ///
+    /// Returns a policy, cancellation, or normalized adapter error.
+    pub async fn resolve_for_install(
+        &self,
+        selector: &ModelSelector,
+        policy: NetworkPolicy,
+        cancel: &tokio_util::sync::CancellationToken,
+    ) -> Result<ModelDescriptor, ModelError> {
+        if policy != NetworkPolicy::ModelInstallOnly {
+            return Err(ModelError::NetworkDenied);
+        }
+        check_cancel(cancel)?;
+        let descriptor = self
+            .adapter
+            .lock()
+            .await
+            .resolve(selector)
+            .await
+            .map_err(map_adapter_error)?;
+        check_cancel(cancel)?;
+        Ok(descriptor)
+    }
+
     /// Adapter backend label for capability reporting.
     ///
     /// # Errors
@@ -330,7 +369,7 @@ impl ModelManager for KoeModelManager {
         selector: &ModelSelector,
         options: &InstallOptions,
     ) -> Result<InstalledModel, ModelError> {
-        if options.policy == NetworkPolicy::Denied {
+        if options.policy != NetworkPolicy::ModelInstallOnly {
             return Err(ModelError::NetworkDenied);
         }
         let _gate = self.install_gate.lock().await;
@@ -351,13 +390,18 @@ impl ModelManager for KoeModelManager {
         let installed_id = InstalledModelId::new();
         self.transition(&installed_id, ModelState::Resolving)
             .await?;
-        send_progress(options, ModelProgress::Resolving)?;
+        send_progress(options, ModelProgress::Resolving);
         let cancel = options.cancel.clone();
         let descriptor = {
             let mut adapter = self.adapter.lock().await;
             check_cancel(&cancel)?;
             adapter.resolve(selector).await.map_err(map_adapter_error)?
         };
+        if let Some(accepted) = &options.accepted_descriptor
+            && accepted != &descriptor
+        {
+            return Err(ModelError::LicenseNotAccepted);
+        }
         // Idempotent install: the identical version is already registered.
         let resolved_id = descriptor.id.0.clone();
         let resolved_version = descriptor.version.0.clone();
@@ -379,32 +423,51 @@ impl ModelManager for KoeModelManager {
         }
         self.transition(&installed_id, ModelState::Downloading)
             .await?;
-        send_progress(options, ModelProgress::Downloading)?;
+        send_progress(options, ModelProgress::Downloading);
         check_cancel(&cancel)?;
         let artifact = {
             let mut adapter = self.adapter.lock().await;
-            adapter
+            match adapter
                 .install(&descriptor, &cancel, options.force_redownload)
                 .await
-                .map_err(|error| {
-                    if cancel.is_cancelled() {
-                        ModelError::Cancelled
-                    } else {
-                        map_adapter_error(error)
+            {
+                Ok(artifact) if cancel.is_cancelled() => {
+                    // Some SDK downloads are not cooperatively cancellable.
+                    // Wait for them to return, then remove only a cache entry
+                    // this operation proved it created. Pre-existing shared
+                    // cache content is never cancellation cleanup.
+                    if artifact.created_by_install {
+                        let _ignored = adapter.remove_from_cache(&descriptor).await;
                     }
-                })?
+                    return Err(ModelError::Cancelled);
+                },
+                Ok(artifact) => artifact,
+                Err(_error) if cancel.is_cancelled() => {
+                    // The adapter owns any unpublished staging left by a
+                    // failed install. Without an ownership-bearing artifact,
+                    // deleting a shared cache entry would be unsafe.
+                    return Err(ModelError::Cancelled);
+                },
+                Err(error) => return Err(map_adapter_error(error)),
+            }
         };
-        check_cancel(&cancel)?;
         self.transition(&installed_id, ModelState::Verifying)
             .await?;
-        send_progress(options, ModelProgress::Verifying)?;
-        let files = inventory_from_artifact(&artifact)?;
+        send_progress(options, ModelProgress::Verifying);
+        let files = inventory_from_artifact(&artifact, &descriptor, &cancel)?;
+        check_cancel(&cancel)?;
         let verification = self.store.verify_inventory(&descriptor, &files)?;
+        check_cancel(&cancel)?;
+        send_progress(options, ModelProgress::Installing);
+        // Publication is the completion boundary: cancellation observed
+        // before this point wins; once the immutable manifest is published,
+        // the operation is reported as completed.
+        check_cancel(&cancel)?;
         let id = self
             .store
             .publish_manifest(installed_id, &descriptor, files, verification)?;
         self.transition(&id, ModelState::Installed).await?;
-        send_progress(options, ModelProgress::Done)?;
+        send_progress(options, ModelProgress::Done);
         let manifest = self.store.load_manifest(&id)?;
         Ok(InstalledModel {
             id,
@@ -435,9 +498,34 @@ impl ModelManager for KoeModelManager {
             return Ok(loaded);
         }
         self.transition(installed, ModelState::Loading).await?;
-        {
+        let load_result = {
             let mut adapter = self.adapter.lock().await;
-            adapter.load(&descriptor).await.map_err(map_adapter_error)?;
+            let result = async {
+                let artifact = adapter
+                    .inspect_local_artifact(&descriptor)
+                    .await
+                    .map_err(map_adapter_error)?;
+                let current = inventory_from_artifact(
+                    &artifact,
+                    &descriptor,
+                    &tokio_util::sync::CancellationToken::new(),
+                )?;
+                if current != manifest.files {
+                    return Err(ModelError::VerifyFailed);
+                }
+                adapter.load(&descriptor).await.map_err(map_adapter_error)
+            }
+            .await;
+            if result.is_err() {
+                // A runtime can fail after partially loading. Best-effort
+                // unload keeps the retry state aligned with the manager.
+                let _ignored = adapter.unload(&descriptor).await;
+            }
+            result
+        };
+        if let Err(error) = load_result {
+            self.transition(installed, ModelState::Installed).await?;
+            return Err(error);
         }
         let loaded_id = LoadedModelId::new();
         let mut state = self.state.write().await;
@@ -585,9 +673,10 @@ impl StreamingAsrSession for SessionGuard {
 
     async fn finish(mut self: Box<Self>) -> Result<FinalTranscript, AsrError> {
         let inner = self.inner.take().ok_or(AsrError::SessionNotActive)?;
-        let result = inner.finish().await;
-        (self.release)();
-        result
+        // `self` drops exactly once after finalization and releases the model
+        // reference through `Drop`; releasing here as well would underflow the
+        // reference count and make the model permanently busy.
+        inner.finish().await
     }
 }
 
@@ -599,28 +688,235 @@ impl Drop for SessionGuard {
 
 /// Hashes artifact files into the manifest inventory, rejecting escape paths.
 fn inventory_from_artifact(
-    artifact: &crate::adapter::InstalledArtifact
+    artifact: &crate::adapter::InstalledArtifact,
+    descriptor: &ModelDescriptor,
+    cancel: &tokio_util::sync::CancellationToken,
 ) -> Result<Vec<ModelFile>, ModelError> {
+    inventory_from_artifact_with_limits(
+        artifact,
+        descriptor,
+        cancel,
+        MAX_INVENTORY_FILE_BYTES,
+        MAX_INVENTORY_TOTAL_BYTES,
+    )
+}
+
+fn inventory_from_artifact_with_limits(
+    artifact: &crate::adapter::InstalledArtifact,
+    descriptor: &ModelDescriptor,
+    cancel: &tokio_util::sync::CancellationToken,
+    max_file_bytes: u64,
+    max_total_bytes: u64,
+) -> Result<Vec<ModelFile>, ModelError> {
+    if artifact.model_id != descriptor.id {
+        return Err(ModelError::VerifyFailed);
+    }
+    let (root, artifact_root) = canonical_artifact_roots(artifact)?;
+    if artifact.files.is_empty() {
+        return Err(ModelError::VerifyFailed);
+    }
     let mut files = Vec::new();
-    for file in &artifact.files {
-        if relative_path_escapes(&file.relative_path) {
+    let mut paths = BTreeSet::new();
+    let mut total_size = 0_u64;
+    for reported in &artifact.files {
+        check_cancel(cancel)?;
+        if relative_path_escapes(&reported.relative_path)
+            || !paths.insert(reported.relative_path.replace('\\', "/"))
+        {
             return Err(ModelError::PathRejected);
         }
-        let size = std::fs::metadata(&file.absolute_path)
-            .map_err(|_| ModelError::StoreFailed)?
-            .len();
-        if size > MAX_INVENTORY_BYTES {
+        let link_metadata = std::fs::symlink_metadata(&reported.absolute_path)
+            .map_err(|_| ModelError::StoreFailed)?;
+        if link_metadata.file_type().is_symlink() || !link_metadata.is_file() {
+            return Err(ModelError::PathRejected);
+        }
+        let canonical = reported
+            .absolute_path
+            .canonicalize()
+            .map_err(|_| ModelError::StoreFailed)?;
+        if !canonical.starts_with(&artifact_root) {
+            return Err(ModelError::PathRejected);
+        }
+        let relative = canonical
+            .strip_prefix(&root)
+            .map_err(|_| ModelError::PathRejected)?;
+        if normalized_relative(relative) != reported.relative_path.replace('\\', "/") {
+            return Err(ModelError::PathRejected);
+        }
+        let expected_metadata =
+            std::fs::metadata(&canonical).map_err(|_| ModelError::StoreFailed)?;
+        let mut input = File::open(&canonical).map_err(|_| ModelError::StoreFailed)?;
+        let metadata = input.metadata().map_err(|_| ModelError::StoreFailed)?;
+        let reopened_path = reported
+            .absolute_path
+            .canonicalize()
+            .map_err(|_| ModelError::StoreFailed)?;
+        if reopened_path != canonical
+            || !same_file(&canonical, &input, &expected_metadata, &metadata)
+        {
+            return Err(ModelError::PathRejected);
+        }
+        let size = metadata.len();
+        if !safe_regular_file(&input, &metadata) {
+            return Err(ModelError::PathRejected);
+        }
+        if size > max_file_bytes {
             return Err(ModelError::StoreFailed);
         }
-        let bytes = std::fs::read(&file.absolute_path).map_err(|_| ModelError::StoreFailed)?;
+        total_size = total_size
+            .checked_add(size)
+            .filter(|total| *total <= max_total_bytes)
+            .ok_or(ModelError::StoreFailed)?;
+        let mut digest = Sha256::new();
+        let mut buffer = vec![0_u8; 64 * 1024];
+        let mut hashed = 0_u64;
+        loop {
+            check_cancel(cancel)?;
+            let count = input
+                .read(&mut buffer)
+                .map_err(|_| ModelError::StoreFailed)?;
+            if count == 0 {
+                break;
+            }
+            hashed = hashed
+                .checked_add(u64::try_from(count).map_err(|_| ModelError::StoreFailed)?)
+                .filter(|value| *value <= size)
+                .ok_or(ModelError::StoreFailed)?;
+            digest.update(&buffer[..count]);
+        }
+        if hashed != size {
+            return Err(ModelError::StoreFailed);
+        }
+        check_cancel(cancel)?;
+        let after_metadata = input.metadata().map_err(|_| ModelError::StoreFailed)?;
+        let after_path = reported
+            .absolute_path
+            .canonicalize()
+            .map_err(|_| ModelError::StoreFailed)?;
+        if after_path != canonical
+            || !same_file(&canonical, &input, &metadata, &after_metadata)
+            || after_metadata.len() != size
+        {
+            return Err(ModelError::PathRejected);
+        }
         files.push(ModelFile {
-            path: file.relative_path.clone(),
-            sha256: hex_encode(&Sha256::digest(&bytes)),
+            path: reported.relative_path.clone(),
+            sha256: hex_encode(&digest.finalize()),
             size,
         });
     }
     files.sort_by(|left, right| left.path.cmp(&right.path));
     Ok(files)
+}
+
+fn canonical_artifact_roots(
+    artifact: &crate::adapter::InstalledArtifact
+) -> Result<(PathBuf, PathBuf), ModelError> {
+    let root = canonical_directory(&artifact.cache_root)?;
+    let artifact_root = canonical_directory(&artifact.artifact_root)?;
+    if artifact_root == root || !artifact_root.starts_with(&root) {
+        return Err(ModelError::PathRejected);
+    }
+    Ok((root, artifact_root))
+}
+
+fn canonical_directory(path: &Path) -> Result<PathBuf, ModelError> {
+    let metadata = std::fs::symlink_metadata(path).map_err(|_| ModelError::StoreFailed)?;
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Err(ModelError::PathRejected);
+    }
+    path.canonicalize().map_err(|_| ModelError::StoreFailed)
+}
+
+fn normalized_relative(path: &Path) -> String {
+    path.to_string_lossy().replace('\\', "/")
+}
+
+#[cfg(unix)]
+fn safe_regular_file(
+    _file: &File,
+    metadata: &std::fs::Metadata,
+) -> bool {
+    use std::os::unix::fs::MetadataExt as _;
+    metadata.is_file() && metadata.nlink() == 1
+}
+
+#[cfg(windows)]
+#[allow(unsafe_code)]
+fn safe_regular_file(
+    file: &File,
+    metadata: &std::fs::Metadata,
+) -> bool {
+    use std::{
+        mem::{size_of, zeroed},
+        os::windows::io::AsRawHandle as _,
+    };
+    use windows_sys::Win32::{
+        Foundation::HANDLE,
+        Storage::FileSystem::{FILE_STANDARD_INFO, FileStandardInfo, GetFileInformationByHandleEx},
+    };
+
+    // SAFETY: the output buffer matches FileStandardInfo and the borrowed
+    // handle remains valid for the duration of the call.
+    let mut information: FILE_STANDARD_INFO = unsafe { zeroed() };
+    let result = unsafe {
+        GetFileInformationByHandleEx(
+            file.as_raw_handle() as HANDLE,
+            FileStandardInfo,
+            (&raw mut information).cast(),
+            u32::try_from(size_of::<FILE_STANDARD_INFO>()).unwrap_or(0),
+        )
+    };
+    metadata.is_file() && result != 0 && information.NumberOfLinks == 1
+}
+
+#[cfg(not(any(unix, windows)))]
+fn safe_regular_file(
+    _file: &File,
+    metadata: &std::fs::Metadata,
+) -> bool {
+    metadata.is_file()
+}
+
+#[cfg(unix)]
+fn same_file(
+    _path: &Path,
+    _opened: &File,
+    left: &std::fs::Metadata,
+    right: &std::fs::Metadata,
+) -> bool {
+    use std::os::unix::fs::MetadataExt as _;
+    left.dev() == right.dev() && left.ino() == right.ino()
+}
+
+#[cfg(windows)]
+fn same_file(
+    path: &Path,
+    opened: &File,
+    _left: &std::fs::Metadata,
+    _right: &std::fs::Metadata,
+) -> bool {
+    File::open(path)
+        .ok()
+        .and_then(|identity| {
+            Some(
+                same_file::Handle::from_file(identity).ok()?
+                    == same_file::Handle::from_file(opened.try_clone().ok()?).ok()?,
+            )
+        })
+        .unwrap_or(false)
+}
+
+#[cfg(not(any(unix, windows)))]
+fn same_file(
+    _path: &Path,
+    _opened: &File,
+    left: &std::fs::Metadata,
+    right: &std::fs::Metadata,
+) -> bool {
+    left.len() == right.len()
+        && left.modified().ok() == right.modified().ok()
+        && left.is_file() == right.is_file()
 }
 
 fn relative_path_escapes(relative: &str) -> bool {
@@ -643,10 +939,12 @@ fn check_cancel(cancel: &tokio_util::sync::CancellationToken) -> Result<(), Mode
 fn send_progress(
     options: &InstallOptions,
     phase: ModelProgress,
-) -> Result<(), ModelError> {
-    options.progress.as_ref().map_or(Ok(()), |tx| {
-        tx.try_send(phase).map_err(|_| ModelError::Internal)
-    })
+) {
+    if let Some(tx) = &options.progress {
+        // Progress is observational: a slow or departed observer must never
+        // turn a successfully published model into an operation failure.
+        let _ignored = tx.try_send(phase);
+    }
 }
 
 fn descriptor_from_manifest(manifest: &crate::types::ModelManifest) -> ModelDescriptor {

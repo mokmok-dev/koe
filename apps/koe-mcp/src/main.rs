@@ -433,6 +433,7 @@ impl Server {
                 policy: NetworkPolicy::ModelInstallOnly,
                 cancel: thread_cancellation.clone(),
                 progress: Some(progress),
+                accepted_descriptor: None,
                 force_redownload: false,
             };
             let result = block_on(async {

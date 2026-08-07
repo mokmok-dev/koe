@@ -298,13 +298,22 @@ impl ModelStore {
         let Some(expected) = self.allowlist.entry(&descriptor.id, &descriptor.version) else {
             return Ok(Verification::RuntimeOnly);
         };
-        if files.len() != expected.files.len() {
+        let actual_paths = files
+            .iter()
+            .map(|file| file.path.as_str())
+            .collect::<std::collections::BTreeSet<_>>();
+        let expected_paths = expected
+            .files
+            .keys()
+            .map(String::as_str)
+            .collect::<std::collections::BTreeSet<_>>();
+        if files.len() != actual_paths.len() || actual_paths != expected_paths {
             self.quarantine(
                 descriptor,
                 format!(
-                    "file count mismatch ({} vs {})",
-                    files.len(),
-                    expected.files.len()
+                    "file set mismatch ({} vs {})",
+                    actual_paths.len(),
+                    expected_paths.len()
                 ),
             )?;
             return Err(ModelError::VerifyFailed);
