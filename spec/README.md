@@ -44,8 +44,8 @@ artifact の暗号学的検証方法は公開資料だけでは確定できな�
 
 ## 現在の repository
 
-現在は Milestone 5 までの基盤として `koe-core`、`koe-audio`、`koe-recording`、
-`koe-app`、`koe-model`、`koe-transcript`、`koe-cli` が存在する。Milestone 1/2 の
+現在は Milestone 6 までの基盤として `koe-core`、`koe-audio`、`koe-recording`、
+`koe-app`、`koe-model`、`koe-transcript`、`koe-cli`、`koe-desktop`、`koe-mcp` が存在する。Milestone 1/2 の
 domain state machine、bounded callback handoff、segmented WAV と crash recovery、
 単一所有 coordinator、capability/doctor CLI、system audio と同期、manifest v2、
 Milestone 3 の Foundry Local モデル管理、Milestone 4 の CLI reference product に
@@ -82,6 +82,12 @@ Milestone 3 の Foundry Local モデル管理、Milestone 4 の CLI reference pr
   settings は app-owned data root へ atomic rename で保存する。
 - ネイティブ live-audio session は公開された foundry SDK に無いため、capability
   として報告する。E2E offline テストは fixture adapter で駆動する。
+- `koe-mcp` は MCP 2025-06-18 の stdio JSON-RPC server として capability/device/model/
+  session tool、operation state と cancellation、session/transcript resource を提供する。
+- MCP の stdout は protocol 専用で、request/response size と operation concurrency を
+  制限する。data/export root は起動時に固定し、UUID session のみ認可する。
+- 録音、model install、session/transcript exposure、export、delete は call ごとの fresh
+  consent を要求する。stdio EOF 時は active recording/install を cooperative cancel する。
 - `unsafe_code`、panic、unwrap、unused などを deny する strict lint は維持する。
 - Nix の対象は `x86_64-linux`、`aarch64-linux`、`aarch64-darwin` であり、
   Windows と Intel macOS は CI で補完する。

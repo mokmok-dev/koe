@@ -2,6 +2,7 @@
 members = [
   "apps/koe-cli",
   "apps/koe-desktop",
+  "apps/koe-mcp",
   "crates/koe-app",
   "crates/koe-audio",
   "crates/koe-core",

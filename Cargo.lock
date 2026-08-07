@@ -3464,6 +3464,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "koe-mcp"
+version = "0.0.0"
+dependencies = [
+ "clap",
+ "koe-app",
+ "koe-audio",
+ "koe-core",
+ "koe-model",
+ "koe-recording",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.19",
+ "tokio",
+ "tokio-util",
+ "uuid",
+]
+
+[[package]]
 name = "koe-model"
 version = "0.0.0"
 dependencies = [

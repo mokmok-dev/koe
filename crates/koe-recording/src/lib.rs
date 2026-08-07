@@ -75,6 +75,25 @@ impl RecoveryBudget {
     }
 }
 
+/// Creates or tightens an application-owned directory to owner-only access.
+///
+/// This uses the same Unix mode and Windows protected-DACL implementation as
+/// session storage. Symlinks and non-directories are rejected.
+///
+/// # Errors
+///
+/// Returns a stable path/storage error when the directory cannot be secured.
+pub fn secure_app_directory(path: &Path) -> Result<(), RecordingError> {
+    fs::create_dir_all(path)?;
+    let metadata = fs::symlink_metadata(path)?;
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Err(RecordingError::PathRejected);
+    }
+    let directory = Dir::open_ambient_dir(path, ambient_authority())?;
+    set_private_directory_permissions(&directory)?;
+    Ok(())
+}
+
 /// Configuration frozen before the first audio writer is opened.
 #[derive(Clone, Debug)]
 pub struct RecordingConfig {
