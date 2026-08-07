@@ -1,0 +1,93 @@
+name: release-hil
+
+# Reusable real-device gate. It runs inside the release workflow after package
+# and metadata jobs, downloads that same run's immutable artifacts, and never
+# rebuilds application code from source.
+on:
+  workflow_call:
+
+permissions:
+  actions: read
+  contents: read
+
+jobs:
+  hil:
+    name: packaged HIL (${{ matrix.platform }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: macos
+            label: koe-hil-macos
+            triple: aarch64-apple-darwin
+          - platform: macos
+            label: koe-hil-macos-intel
+            triple: x86_64-apple-darwin
+          - platform: windows
+            label: koe-hil-windows
+            triple: x86_64-pc-windows-msvc
+          - platform: linux
+            label: koe-hil-linux
+            triple: x86_64-unknown-linux-gnu
+          - platform: linux
+            label: koe-hil-linux-arm64
+            triple: aarch64-unknown-linux-gnu
+    runs-on: [self-hosted, "${{ matrix.label }}"]
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - name: Clean stale HIL inputs and results
+        shell: bash
+        run: rm -rf target/hil target/hil-release && mkdir -p target/hil-release
+      - uses: actions/download-artifact@65a9edc5881444af0b9093a5e628f2fe47ea3b2e # v4.3.0
+        with:
+          name: platform-${{ matrix.triple }}
+          path: target/hil-release/platform
+      - uses: actions/download-artifact@65a9edc5881444af0b9093a5e628f2fe47ea3b2e # v4.3.0
+        with:
+          name: update-metadata
+          path: target/hil-release/update-metadata
+      - name: Run packaged macOS HIL
+        if: matrix.platform == 'macos'
+        shell: bash
+        run: |
+          set -euo pipefail
+          package="$(find "$PWD/target/hil-release/platform" -maxdepth 1 -name 'koe-*-${{ matrix.triple }}.tar.gz' -print -quit)"
+          export KOE_HIL_BIN="$PWD/target/hil-release/platform/koe-cli-${{ matrix.triple }}"
+          export KOE_HIL_PACKAGE="$package"
+          export KOE_HIL_UPDATE_METADATA="$PWD/target/hil-release/update-metadata/${{ matrix.triple }}.json"
+          export KOE_HIL_EXPIRED_UPDATE_METADATA="$PWD/target/hil-release/update-metadata/${{ matrix.triple }}.expired.json"
+          export KOE_HIL_TAMPER_UPDATE_METADATA="$PWD/target/hil-release/update-metadata/${{ matrix.triple }}.tamper.json"
+          test -n "$package"
+          ./scripts/hil/hil-macos.sh
+      - name: Run packaged Linux HIL
+        if: matrix.platform == 'linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          package="$(find "$PWD/target/hil-release/platform" -maxdepth 1 -name '*.AppImage' -print -quit)"
+          export KOE_HIL_BIN="$PWD/target/hil-release/platform/koe-cli-${{ matrix.triple }}"
+          export KOE_HIL_PACKAGE="$package"
+          export KOE_HIL_UPDATE_METADATA="$PWD/target/hil-release/update-metadata/${{ matrix.triple }}.json"
+          export KOE_HIL_EXPIRED_UPDATE_METADATA="$PWD/target/hil-release/update-metadata/${{ matrix.triple }}.expired.json"
+          export KOE_HIL_TAMPER_UPDATE_METADATA="$PWD/target/hil-release/update-metadata/${{ matrix.triple }}.tamper.json"
+          test -n "$package"
+          ./scripts/hil/hil-linux.sh
+      - name: Run packaged Windows HIL
+        if: matrix.platform == 'windows'
+        shell: pwsh
+        run: |
+          $env:KOE_HIL_BIN = Join-Path $PWD "target\hil-release\platform\koe-cli-${{ matrix.triple }}.exe"
+          $env:KOE_HIL_PACKAGE = (Get-ChildItem "target\hil-release\platform" -Filter "*.msix" | Select-Object -First 1).FullName
+          $env:KOE_HIL_UPDATE_METADATA = Join-Path $PWD "target\hil-release\update-metadata\${{ matrix.triple }}.json"
+          $env:KOE_HIL_EXPIRED_UPDATE_METADATA = Join-Path $PWD "target\hil-release\update-metadata\${{ matrix.triple }}.expired.json"
+          $env:KOE_HIL_TAMPER_UPDATE_METADATA = Join-Path $PWD "target\hil-release\update-metadata\${{ matrix.triple }}.tamper.json"
+          if (-not $env:KOE_HIL_PACKAGE) { throw "required MSIX artifact is absent" }
+          ./scripts/hil/hil-windows.ps1
+      - name: Require machine-readable metrics
+        shell: bash
+        run: test -s target/hil/metrics.json
+      - uses: actions/upload-artifact@65c4c4a1ddee5b7f698f829fe0844a0b9a75cc85 # v4.4.0
+        with:
+          name: hil-${{ matrix.triple }}-metrics
+          path: target/hil/metrics.json
+          if-no-files-found: error

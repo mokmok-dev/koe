@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=koe
+GenericName=Offline Recorder & Transcriber
+Comment=Fully offline recording and transcription
+Exec=koe-desktop
+Icon=org.mokmok.koe
+Terminal=false
+Categories=AudioVideo;Audio;Utility;
+Keywords=recording;transcription;speech-to-text;offline;
+StartupNotify=true

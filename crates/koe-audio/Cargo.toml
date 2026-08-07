@@ -2,6 +2,12 @@
 name = "koe-audio"
 version.workspace = true
 edition.workspace = true
+publish = false
+
+[features]
+default = ["pipewire", "pulseaudio"]
+pipewire = ["cpal/pipewire"]
+pulseaudio = ["cpal/pulseaudio"]
 
 [dependencies]
 cpal.workspace = true

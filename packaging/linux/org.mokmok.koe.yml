@@ -1,0 +1,35 @@
+# NON-PRODUCTION UI-only Flatpak prototype.
+#
+# koe's current CPAL adapter cannot consume the PipeWire remote FD and node IDs
+# returned by XDG ScreenCast. Granting direct device/Pulse/PipeWire access would
+# bypass portal-selected-node confinement, so this manifest deliberately grants
+# no audio-device access and is not a release artifact. Milestone 7 selects the
+# signed AppImage channel; a future Flatpak must implement and test a real portal
+# adapter before audio permissions are added.
+app-id: org.mokmok.koe
+runtime: org.freedesktop.Platform
+runtime-version: "24.08"
+sdk: org.freedesktop.Sdk
+command: koe-desktop
+finish-args:
+  - --unshare=network
+  - --share=ipc
+  - --socket=wayland
+  - --socket=fallback-x11
+modules:
+  - name: koe-desktop
+    buildsystem: simple
+    build-commands:
+      - install -Dm755 koe-desktop /app/bin/koe-desktop
+      - install -Dm644 org.mokmok.koe.appdata.xml /app/share/metainfo/org.mokmok.koe.appdata.xml
+      - install -Dm644 org.mokmok.koe.desktop /app/share/applications/org.mokmok.koe.desktop
+      - install -Dm644 org.mokmok.koe.svg /app/share/icons/hicolor/scalable/apps/org.mokmok.koe.svg
+    sources:
+      - type: file
+        path: ../../target/release/koe-desktop
+      - type: file
+        path: org.mokmok.koe.appdata.xml
+      - type: file
+        path: org.mokmok.koe.desktop
+      - type: file
+        path: icons/org.mokmok.koe.svg

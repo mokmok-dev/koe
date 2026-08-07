@@ -1,0 +1,455 @@
+name: release
+
+# Milestone 7 production distribution. Real audio/permission gates run in
+# release-hil.yaml; this workflow builds, signs, packages, inventories and
+# attests immutable release artifacts.
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Release version for an unsigned packaging dry run"
+        required: false
+        default: "0.0.0"
+
+permissions:
+  actions: read
+  contents: read
+  id-token: write
+  attestations: write
+
+env:
+  KOE_RELEASE_VERSION: ${{ github.event.inputs.version || github.ref_name }}
+  # Public publisher trust root compiled into every runtime binary. Tag builds
+  # fail if the separately managed repository variable is absent/mismatched.
+  KOE_UPDATE_PUBLIC_KEY_HEX: ${{ vars.KOE_UPDATE_PUBLIC_KEY_HEX }}
+
+jobs:
+  quality:
+    name: release quality gates
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: dtolnay/rust-toolchain@4fbf9754b167a5f8d6f5ba2bc63b89f464cc6a70 # stable
+        with:
+          components: rustfmt, clippy
+      - name: Install native dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang libasound2-dev libpipewire-0.3-dev libpulse-dev libxkbcommon-x11-dev pkg-config
+      - name: Require release/tag version to match the workspace
+        shell: bash
+        run: |
+          set -euo pipefail
+          workspace_version="$(python3 -c 'import tomllib; print(tomllib.load(open("Cargo.toml", "rb"))["workspace"]["package"]["version"])')"
+          requested="${KOE_RELEASE_VERSION#v}"
+          test "$requested" = "$workspace_version" || {
+            echo "release version $requested does not match workspace $workspace_version" >&2
+            exit 1
+          }
+      - run: cargo fmt --all -- --check
+      - run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      - run: cargo test --workspace --locked
+      - name: Feature matrix
+        run: |
+          cargo check --locked -p koe-audio --no-default-features
+          cargo check --locked -p koe-audio --no-default-features --features pipewire
+          cargo check --locked -p koe-audio --no-default-features --features pulseaudio
+          cargo test --locked -p koe-model --no-default-features
+          cargo check --locked -p koe-desktop -p koe-mcp
+      - run: cargo doc --workspace --no-deps --locked
+      - run: |
+          python3 -m unittest discover -s scripts/hil -p 'test_*.py'
+          python3 -m unittest discover -s tools/release -p 'test_*.py'
+      - name: Dependency advisory, license, ban and source policy
+        run: |
+          cargo install cargo-deny --version 0.20.2 --locked
+          cargo deny --locked check advisories licenses bans sources
+
+  build:
+    name: build (${{ matrix.name }})
+    needs: quality
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: linux-x86_64
+            os: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+            arch: x86_64
+            kind: linux
+            linuxdeploy_sha256: 421ca71d5c69ea97c6309276232990d43df1dcece0edfaa26bbf926ff96ed12e
+          - name: linux-aarch64
+            os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+            arch: aarch64
+            kind: linux
+            linuxdeploy_sha256: 9f04c4c2a8b69c392c4bbcc1a88bdd4d0a8ac03f587cf5242814cb7ae47b78e5
+          - name: windows-x86_64
+            os: windows-2022
+            target: x86_64-pc-windows-msvc
+            arch: x64
+            kind: windows
+          - name: macos-x86_64
+            os: macos-15-intel
+            target: x86_64-apple-darwin
+            arch: x86_64
+            kind: macos
+          - name: macos-aarch64
+            os: macos-14
+            target: aarch64-apple-darwin
+            arch: aarch64
+            kind: macos
+    runs-on: ${{ matrix.os }}
+    environment: ${{ startsWith(github.ref, 'refs/tags/') && 'production-release' || 'release-dry-run' }}
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: dtolnay/rust-toolchain@4fbf9754b167a5f8d6f5ba2bc63b89f464cc6a70 # stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: actions/cache@6849a6489940f00c2f30c0fb92c6274307ccb58a # v4.2.3
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: release-${{ matrix.target }}-${{ hashFiles('Cargo.lock') }}
+
+      - name: Install Linux native dependencies
+        if: matrix.kind == 'linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang libasound2-dev libpipewire-0.3-dev libpulse-dev libxkbcommon-x11-dev pkg-config
+
+      - name: Require pinned production update key
+        if: startsWith(github.ref, 'refs/tags/')
+        shell: bash
+        run: test "${#KOE_UPDATE_PUBLIC_KEY_HEX}" -eq 64
+
+      - name: Test native platform workspace
+        run: cargo test --workspace --locked --target ${{ matrix.target }}
+
+      - name: Build locked workspace
+        run: cargo build --release --workspace --locked --target ${{ matrix.target }}
+
+      - name: Package Linux archive and AppImage
+        if: matrix.kind == 'linux'
+        env:
+          ARCH: ${{ matrix.arch }}
+          KOE_RELEASE_TARGET: ${{ matrix.target }}
+          LINUXDEPLOY_SHA256: ${{ matrix.linuxdeploy_sha256 }}
+        run: |
+          set -euo pipefail
+          mkdir -p dist "$RUNNER_TEMP/linuxdeploy"
+          tool="$RUNNER_TEMP/linuxdeploy/linuxdeploy.AppImage"
+          curl --fail --location --retry 3 \
+            "https://github.com/linuxdeploy/linuxdeploy/releases/download/continuous/linuxdeploy-${ARCH}.AppImage" \
+            --output "$tool"
+          echo "$LINUXDEPLOY_SHA256  $tool" | sha256sum --check --strict
+          chmod +x "$tool"
+          KOE_APPIMAGE_TOOL="$tool" ./packaging/linux/build-appimage.sh
+          tar -C "target/${{ matrix.target }}/release" -czf \
+            "dist/koe-${KOE_RELEASE_VERSION}-${{ matrix.target }}.tar.gz" \
+            koe koe-desktop koe-mcp
+          cp "target/${{ matrix.target }}/release/koe" \
+            "dist/koe-cli-${{ matrix.target }}"
+          chmod 755 "dist/koe-cli-${{ matrix.target }}"
+
+      - name: Prepare Windows signing certificate
+        if: matrix.kind == 'windows' && startsWith(github.ref, 'refs/tags/')
+        shell: pwsh
+        env:
+          KOE_WINDOWS_PFX_BASE64: ${{ secrets.KOE_WINDOWS_PFX_BASE64 }}
+          KOE_WINDOWS_PFX_PASSWORD: ${{ secrets.KOE_WINDOWS_PFX_PASSWORD }}
+        run: |
+          if (-not $env:KOE_WINDOWS_PFX_BASE64 -or -not $env:KOE_WINDOWS_PFX_PASSWORD) { throw "Windows signing certificate and password are required" }
+          $pfx = "$env:RUNNER_TEMP\koe-signing.pfx"
+          [IO.File]::WriteAllBytes($pfx, [Convert]::FromBase64String($env:KOE_WINDOWS_PFX_BASE64))
+          try {
+            $password = ConvertTo-SecureString $env:KOE_WINDOWS_PFX_PASSWORD -AsPlainText -Force
+            $certificate = Import-PfxCertificate -FilePath $pfx -CertStoreLocation Cert:\CurrentUser\My -Password $password -Exportable:$false
+            if (-not $certificate.HasPrivateKey) { throw "imported certificate has no private key" }
+            "KOE_SIGNING_CERT_SHA1=$($certificate.Thumbprint)" | Out-File $env:GITHUB_ENV -Encoding utf8 -Append
+          } finally {
+            Remove-Item $pfx -Force -ErrorAction SilentlyContinue
+          }
+
+      - name: Sign every standalone Windows executable
+        if: matrix.kind == 'windows' && startsWith(github.ref, 'refs/tags/')
+        shell: pwsh
+        run: |
+          $signtool = Get-ChildItem "${env:ProgramFiles(x86)}\Windows Kits\10\bin" -Recurse -Filter signtool.exe |
+            Where-Object FullName -Match '\\x64\\' | Sort-Object FullName -Descending | Select-Object -First 1
+          if (-not $signtool) { throw "signtool.exe is required" }
+          Get-ChildItem "target\${{ matrix.target }}\release" -Filter "koe*.exe" | ForEach-Object {
+            & $signtool.FullName sign /sha1 $env:KOE_SIGNING_CERT_SHA1 /s My /fd SHA256 /tr "https://timestamp.digicert.com" /td SHA256 $_.FullName
+            if ($LASTEXITCODE -ne 0) { throw "signing failed: $($_.Name)" }
+            & $signtool.FullName verify /pa /v $_.FullName
+            if ($LASTEXITCODE -ne 0) { throw "verification failed: $($_.Name)" }
+          }
+
+      - name: Package Windows ZIP and MSIX
+        if: matrix.kind == 'windows'
+        shell: pwsh
+        env:
+          KOE_RELEASE_TARGET: ${{ matrix.target }}
+          KOE_SKIP_BUILD: "1"
+          KOE_MSIX_PUBLISHER: ${{ startsWith(github.ref, 'refs/tags/') && secrets.KOE_MSIX_PUBLISHER || '' }}
+          KOE_REQUIRE_SIGNING: ${{ startsWith(github.ref, 'refs/tags/') && '1' || '0' }}
+        run: |
+          ./packaging/windows/package.ps1
+          Compress-Archive -Path "target\${{ matrix.target }}\release\koe.exe", "target\${{ matrix.target }}\release\koe-desktop.exe", "target\${{ matrix.target }}\release\koe-mcp.exe" -DestinationPath "dist\koe-$env:KOE_RELEASE_VERSION-${{ matrix.target }}.zip"
+          Copy-Item "target\${{ matrix.target }}\release\koe.exe" "dist\koe-cli-${{ matrix.target }}.exe"
+
+      - name: Remove temporary Windows signing certificate
+        if: always() && matrix.kind == 'windows' && startsWith(github.ref, 'refs/tags/')
+        shell: pwsh
+        run: |
+          if ($env:KOE_SIGNING_CERT_SHA1) {
+            Remove-Item "Cert:\CurrentUser\My\$env:KOE_SIGNING_CERT_SHA1" -Force -ErrorAction SilentlyContinue
+          }
+
+      - name: Import macOS Developer ID certificate
+        if: matrix.kind == 'macos' && startsWith(github.ref, 'refs/tags/')
+        env:
+          MACOS_CERTIFICATE_P12_BASE64: ${{ secrets.MACOS_CERTIFICATE_P12_BASE64 }}
+          MACOS_CERTIFICATE_PASSWORD: ${{ secrets.MACOS_CERTIFICATE_PASSWORD }}
+          MACOS_SIGNING_IDENTITY: ${{ secrets.MACOS_SIGNING_IDENTITY }}
+        run: |
+          set -euo pipefail
+          test -n "$MACOS_CERTIFICATE_P12_BASE64"
+          test -n "$MACOS_CERTIFICATE_PASSWORD"
+          test -n "$MACOS_SIGNING_IDENTITY"
+          keychain="$RUNNER_TEMP/koe-signing.keychain-db"
+          certificate="$RUNNER_TEMP/koe-signing.p12"
+          password="$(openssl rand -hex 24)"
+          printf '%s' "$MACOS_CERTIFICATE_P12_BASE64" | /usr/bin/base64 -D > "$certificate"
+          security create-keychain -p "$password" "$keychain"
+          security set-keychain-settings -lut 21600 "$keychain"
+          security unlock-keychain -p "$password" "$keychain"
+          security import "$certificate" -k "$keychain" -P "$MACOS_CERTIFICATE_PASSWORD" -T /usr/bin/codesign
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$password" "$keychain"
+          security list-keychains -d user -s "$keychain" "$HOME/Library/Keychains/login.keychain-db"
+          security find-identity -v -p codesigning "$keychain" | grep -F "$MACOS_SIGNING_IDENTITY"
+          rm -f "$certificate"
+          echo "KOE_MACOS_KEYCHAIN=$keychain" >> "$GITHUB_ENV"
+
+      - name: Build, sign, notarize and staple macOS app
+        if: matrix.kind == 'macos'
+        env:
+          KOE_RELEASE_TARGET: ${{ matrix.target }}
+          KOE_SIGNING_IDENTITY: ${{ startsWith(github.ref, 'refs/tags/') && secrets.MACOS_SIGNING_IDENTITY || '' }}
+          KOE_REQUIRE_SIGNING: ${{ startsWith(github.ref, 'refs/tags/') && '1' || '0' }}
+          KOE_NOTARIZE_KEY_ID: ${{ startsWith(github.ref, 'refs/tags/') && secrets.MACOS_NOTARIZE_KEY_ID || '' }}
+          KOE_NOTARIZE_ISSUER_ID: ${{ startsWith(github.ref, 'refs/tags/') && secrets.MACOS_NOTARIZE_ISSUER_ID || '' }}
+          KOE_NOTARIZE_KEY_BASE64: ${{ startsWith(github.ref, 'refs/tags/') && secrets.MACOS_NOTARIZE_KEY_BASE64 || '' }}
+          KOE_REQUIRE_NOTARIZATION: ${{ startsWith(github.ref, 'refs/tags/') && '1' || '0' }}
+        run: |
+          ./packaging/macos/build-app-bundle.sh
+          ./packaging/macos/notarize.sh dist/koe.app
+          if [[ -n "${KOE_SIGNING_IDENTITY}" ]]; then
+            for executable in koe koe-mcp; do
+              codesign --force --timestamp --options runtime --sign "$KOE_SIGNING_IDENTITY" \
+                "target/${{ matrix.target }}/release/$executable"
+              codesign --verify --strict --verbose=2 \
+                "target/${{ matrix.target }}/release/$executable"
+            done
+            ditto -c -k --keepParent \
+              "target/${{ matrix.target }}/release/koe" \
+              "$RUNNER_TEMP/koe-cli-notarization.zip"
+            # Include the MCP binary in a second notarization submission because
+            # ditto's single-source mode intentionally preserves exact names.
+            ditto -c -k --keepParent \
+              "target/${{ matrix.target }}/release/koe-mcp" \
+              "$RUNNER_TEMP/koe-mcp-notarization.zip"
+            ./packaging/macos/notarize.sh "$RUNNER_TEMP/koe-cli-notarization.zip"
+            ./packaging/macos/notarize.sh "$RUNNER_TEMP/koe-mcp-notarization.zip"
+            spctl --assess --type execute --verbose=2 "target/${{ matrix.target }}/release/koe"
+            spctl --assess --type execute --verbose=2 "target/${{ matrix.target }}/release/koe-mcp"
+          fi
+          tar -C dist -czf "dist/koe-${KOE_RELEASE_VERSION}-${{ matrix.target }}.tar.gz" koe.app
+          rm -rf dist/koe.app
+          cp "target/${{ matrix.target }}/release/koe" "dist/koe-cli-${{ matrix.target }}"
+          cp "target/${{ matrix.target }}/release/koe-mcp" "dist/koe-mcp-${{ matrix.target }}"
+
+      - name: Remove temporary macOS signing keychain
+        if: always() && matrix.kind == 'macos' && startsWith(github.ref, 'refs/tags/')
+        run: |
+          if [[ -n "${KOE_MACOS_KEYCHAIN:-}" ]]; then
+            security delete-keychain "$KOE_MACOS_KEYCHAIN" || true
+          fi
+          rm -f "$RUNNER_TEMP/koe-signing.p12"
+
+      - name: Generate checksums
+        shell: bash
+        run: ./tools/release/checksums.sh dist
+
+      - name: Attest packaged artifacts
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: actions/attest-build-provenance@d5eb1a96a6178e747b95b0f666e79f7e0df3d17e # v2.2.3
+        with:
+          subject-path: dist/*
+
+      - uses: actions/upload-artifact@65c4c4a1ddee5b7f698f829fe0844a0b9a75cc85 # v4.4.0
+        with:
+          name: platform-${{ matrix.target }}
+          path: dist/
+          if-no-files-found: error
+
+  sbom:
+    name: sbom and notices
+    needs: quality
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: dtolnay/rust-toolchain@4fbf9754b167a5f8d6f5ba2bc63b89f464cc6a70 # stable
+      - name: Generate CycloneDX workspace SBOMs
+        run: ./tools/release/sbom.sh --install-dir "$RUNNER_TEMP/release-tools"
+      - name: Generate third-party notices
+        run: python3 tools/release/notices.py --lock Cargo.lock --out dist/THIRD_PARTY_NOTICES.md
+      - name: Reject unresolved licenses
+        run: |
+          if grep -q "RELEASE GATE" dist/THIRD_PARTY_NOTICES.md; then
+            echo "::error::third-party licenses require manual resolution"
+            exit 1
+          fi
+      - uses: actions/upload-artifact@65c4c4a1ddee5b7f698f829fe0844a0b9a75cc85 # v4.4.0
+        with:
+          name: release-inventory
+          path: |
+            dist/THIRD_PARTY_NOTICES.md
+            tools/release/MODEL_LICENSE_REGISTRY.md
+            target/release/sbom/
+          if-no-files-found: error
+
+  sign-update-metadata:
+    name: sign update metadata
+    if: startsWith(github.ref, 'refs/tags/')
+    needs: [build, sbom]
+    runs-on: ubuntu-24.04
+    environment: production-release
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: dtolnay/rust-toolchain@4fbf9754b167a5f8d6f5ba2bc63b89f464cc6a70 # stable
+      - run: cargo build --release --locked -p koe-update
+      - uses: actions/download-artifact@65a9edc5881444af0b9093a5e628f2fe47ea3b2e # v4.3.0
+        with:
+          pattern: platform-*
+          path: release-artifacts
+          merge-multiple: false
+      - name: Sign every platform release
+        env:
+          KOE_UPDATE_SIGNING_SEED_HEX: ${{ secrets.KOE_UPDATE_SIGNING_SEED_HEX }}
+          KOE_METADATA_VERSION: ${{ github.run_number }}
+        run: |
+          set -euo pipefail
+          test -n "$KOE_UPDATE_SIGNING_SEED_HEX"
+          expires=$(($(date +%s) + 30 * 24 * 3600))
+          release_version="${KOE_RELEASE_VERSION#v}"
+          metadata_base=$((KOE_METADATA_VERSION * 10))
+          mkdir -p dist/update-metadata
+          count=0
+          derived_key="$(./target/release/koe-release-sign keys)"
+          test "$derived_key" = "$KOE_UPDATE_PUBLIC_KEY_HEX"
+          for directory in release-artifacts/platform-*; do
+            triple="${directory##*/platform-}"
+            install_target="koe-cli-${triple}"
+            [[ "$triple" == *-windows-* ]] && install_target="${install_target}.exe"
+            test -f "$directory/$install_target"
+            ./target/release/koe-release-sign sign \
+              --app-version "$release_version" \
+              --platform "$triple" \
+              --install-target "$install_target" \
+              --expires-unix-s "$expires" \
+              --metadata-version "$metadata_base" \
+              --artifact-dir "$directory" \
+              --out "dist/update-metadata/${triple}.json"
+            ./target/release/koe-release-sign sign \
+              --app-version "${release_version}-expired-test" \
+              --platform "$triple" \
+              --install-target "$install_target" \
+              --expires-unix-s 1 \
+              --metadata-version "$((metadata_base + 1))" \
+              --artifact-dir "$directory" \
+              --out "dist/update-metadata/${triple}.expired.json"
+            ./target/release/koe-release-sign sign \
+              --app-version "${release_version}-tamper-test" \
+              --platform "$triple" \
+              --install-target "$install_target" \
+              --expires-unix-s "$expires" \
+              --metadata-version "$((metadata_base + 2))" \
+              --artifact-dir "$directory" \
+              --out "dist/update-metadata/${triple}.tamper.json"
+            count=$((count + 1))
+          done
+          test "$count" -eq 5
+          printf '%s\n' "$derived_key" > dist/update-metadata/UPDATE_PUBLIC_KEY.txt
+      - uses: actions/upload-artifact@65c4c4a1ddee5b7f698f829fe0844a0b9a75cc85 # v4.4.0
+        with:
+          name: update-metadata
+          path: dist/update-metadata/
+          if-no-files-found: error
+
+  hil:
+    name: exact packaged artifact HIL gate
+    if: startsWith(github.ref, 'refs/tags/')
+    needs: [build, sign-update-metadata]
+    uses: ./.github/workflows/release-hil.yaml
+
+  release:
+    name: publish immutable release
+    if: startsWith(github.ref, 'refs/tags/')
+    needs: [build, sbom, sign-update-metadata, hil]
+    runs-on: ubuntu-24.04
+    environment: production-release
+    permissions:
+      actions: read
+      contents: write
+    steps:
+      - uses: actions/download-artifact@65a9edc5881444af0b9093a5e628f2fe47ea3b2e # v4.3.0
+        with:
+          pattern: platform-*
+          path: release-input/platforms/
+          merge-multiple: false
+      - uses: actions/download-artifact@65a9edc5881444af0b9093a5e628f2fe47ea3b2e # v4.3.0
+        with:
+          name: release-inventory
+          path: release-input/inventory/
+      - uses: actions/download-artifact@65a9edc5881444af0b9093a5e628f2fe47ea3b2e # v4.3.0
+        with:
+          name: update-metadata
+          path: release-input/update-metadata/
+      - name: Assemble a flat, intentional, collision-free release
+        run: |
+          set -euo pipefail
+          mkdir release-staging
+          copy_unique() {
+            source="$1"; name="$2"
+            test ! -e "release-staging/$name" || { echo "duplicate release asset: $name" >&2; exit 1; }
+            cp "$source" "release-staging/$name"
+          }
+          while IFS= read -r -d '' file; do
+            [[ "$(basename "$file")" == SHA256SUMS ]] && continue
+            copy_unique "$file" "$(basename "$file")"
+          done < <(find release-input/platforms -type f -print0)
+          while IFS= read -r -d '' file; do
+            copy_unique "$file" "$(basename "$file")"
+          done < <(find release-input/inventory -type f -print0)
+          while IFS= read -r -d '' file; do
+            name="$(basename "$file")"
+            [[ "$name" == *.expired.json || "$name" == *.tamper.json ]] && continue
+            if [[ "$name" == *.json ]]; then name="${name%.json}.update.json"; fi
+            copy_unique "$file" "$name"
+          done < <(find release-input/update-metadata -type f -print0)
+          (cd release-staging && find . -maxdepth 1 -type f -print0 | \
+            LC_ALL=C sort -z | xargs -0 sha256sum) > aggregate-checksums
+          mv aggregate-checksums release-staging/SHA256SUMS
+          test "$(find release-staging -mindepth 1 -maxdepth 1 -type f | wc -l)" -gt 10
+      - uses: softprops/action-gh-release@c95fe1489396fe8a9eb87a0ab77e502ef43e0ad # v2.2.1
+        with:
+          tag_name: ${{ github.ref_name }}
+          name: koe ${{ env.KOE_RELEASE_VERSION }}
+          files: release-staging/*
+          generate_release_notes: true
+          fail_on_unmatched_files: true

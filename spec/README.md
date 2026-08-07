@@ -32,6 +32,21 @@ artifact の暗号学的検証方法は公開資料だけでは確定できな�
 | [07-testing-and-distribution.md](07-testing-and-distribution.md) | テスト matrix、CI、署名、配布 |
 | [08-roadmap.md](08-roadmap.md) | 段階的実装、受入条件、未解決事項 |
 
+## Milestone 7 の実装状況（Production distribution candidate）
+
+実装と fixture/hosted 検証は存在するが、Production 完了判定は 5 台の実機 HIL、
+signing/notarization、checklist 記録後にのみ行う。`koe-update` を追加し、TUF 風の署名付き update metadata（role/version/expiry/`platform`/hash-bound target）と回帰安全な store を実装した。
+
+- `koe-release-sign` (bin) が release artifact directory を SHA-256/size で hash し、署名 metadata 内の単一 `install_target` を指定する。`koe update apply` は binary に埋め込んだ publisher public key（通常操作で差替不可）で検証して side-by-side に install し、`koe update launch` が署名・binding・at-rest digest を再検証して active executable を起動する。rollback も同じ検証後に previous executable を再選択する。
+- expired / replay / tampered / foreign-platform / unsupported-schema はすべて安定 error code（`KOE-UPDATE-*`）で拒否し、quarantine note を残す。store は network を触らない。
+- CLI は `koe update status|apply|rollback` を提供し、`apply` は fresh consent を要求する。
+- `tools/release/` に SBOM（CycloneDX）、third-party notices、SHA256SUMS、署名 wrapper を追加した。
+- `packaging/` に macOS Info.plist / entitlements / notarize、Windows MSIX manifest / package、Linux AppImage を追加した。Flatpak は CPAL が portal 返却 PipeWire FD/node を消費できないため非 production prototype とし、直接 device access を与えず配布しない。
+- `.github/workflows/release.yaml` は各 OS の native test、build・署名・notarization・attestation・update metadata 署名を実行する。reusable `release-hil.yaml` は同じ run の immutable package を download し、必須 install/launch/uninstall と mic/system waveform gate を self-hosted runner で実行する。
+- `docs/release-checklist.md`（privacy/security/release gate）と `docs/release-hil-matrix.md` を追加した。
+
+未達: 実機での signing/notarization/staple、MSIX 署名、portal denial、HIL matrix の実測値はリリース時に `docs/release-checklist.md` / `docs/release-hil-matrix.md` で記録する。
+
 ## 優先する設計原則
 
 1. 取得済み model による推論中は、明示的操作なしに network を使用しない。
@@ -44,8 +59,8 @@ artifact の暗号学的検証方法は公開資料だけでは確定できな�
 
 ## 現在の repository
 
-現在は Milestone 6 までの基盤として `koe-core`、`koe-audio`、`koe-recording`、
-`koe-app`、`koe-model`、`koe-transcript`、`koe-cli`、`koe-desktop`、`koe-mcp` が存在する。Milestone 1/2 の
+現在は Milestone 7 の production candidate まで実装した基盤として `koe-core`、`koe-audio`、`koe-recording`、
+`koe-app`、`koe-model`、`koe-transcript`、`koe-update`、`koe-cli`、`koe-desktop`、`koe-mcp` が存在する。Milestone 1/2 の
 domain state machine、bounded callback handoff、segmented WAV と crash recovery、
 単一所有 coordinator、capability/doctor CLI、system audio と同期、manifest v2、
 Milestone 3 の Foundry Local モデル管理、Milestone 4 の CLI reference product に
