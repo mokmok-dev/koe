@@ -44,6 +44,7 @@
             strictDeps = true;
             CARGO_BUILD_TARGET = windowsTarget;
             CARGO_TARGET_X86_64_PC_WINDOWS_GNU_LINKER = "${windowsCross.stdenv.cc}/bin/${windowsCross.stdenv.cc.targetPrefix}cc";
+            TARGET_CC = "${windowsCross.stdenv.cc}/bin/${windowsCross.stdenv.cc.targetPrefix}cc";
             buildInputs = [ windowsCross.windows.pthreads ];
             nativeBuildInputs = [ windowsCross.stdenv.cc ];
             cargoExtraArgs = "--workspace";
