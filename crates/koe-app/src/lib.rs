@@ -1,5 +1,7 @@
 //! Application coordinator shared by CLI, desktop and MCP adapters.
 
+pub mod desktop;
+
 use std::{
     sync::mpsc::{self, Receiver, SyncSender},
     thread::{self, JoinHandle},

@@ -42,8 +42,10 @@
             version = "0.0.0";
             src = config.rust-project.src;
             strictDeps = true;
+            inherit cargoVendorDir;
             CARGO_BUILD_TARGET = windowsTarget;
             CARGO_TARGET_X86_64_PC_WINDOWS_GNU_LINKER = "${windowsCross.stdenv.cc}/bin/${windowsCross.stdenv.cc.targetPrefix}cc";
+            TARGET_CC = "${windowsCross.stdenv.cc}/bin/${windowsCross.stdenv.cc.targetPrefix}cc";
             buildInputs = [ windowsCross.windows.pthreads ];
             nativeBuildInputs = [ windowsCross.stdenv.cc ];
             cargoExtraArgs = "--workspace";
@@ -67,6 +69,10 @@
               else if package.name == "pipewire-sys" && package.version == "0.10.0" then
                 drv.overrideAttrs {
                   patches = [ ./nix/patches/pipewire-sys-bindgen-out-dir.patch ];
+                }
+              else if package.name == "gpui" && package.version == "0.2.2" then
+                drv.overrideAttrs {
+                  patches = [ ./nix/patches/gpui-windows-runtime-shaders.patch ];
                 }
               else
                 drv;

@@ -44,12 +44,12 @@ artifact の暗号学的検証方法は公開資料だけでは確定できな�
 
 ## 現在の repository
 
-現在は Milestone 4 までの基盤として `koe-core`、`koe-audio`、`koe-recording`、
+現在は Milestone 5 までの基盤として `koe-core`、`koe-audio`、`koe-recording`、
 `koe-app`、`koe-model`、`koe-transcript`、`koe-cli` が存在する。Milestone 1/2 の
 domain state machine、bounded callback handoff、segmented WAV と crash recovery、
 単一所有 coordinator、capability/doctor CLI、system audio と同期、manifest v2、
-Milestone 3 の Foundry Local モデル管理に加えて、Milestone 4 で CLI reference
-product を完成させた。
+Milestone 3 の Foundry Local モデル管理、Milestone 4 の CLI reference product に
+加えて、Milestone 5 の GPUI desktop adapter を実装した。
 
 - `koe-model` で `FoundryAdapter`/`StreamingAsrSession` の port と
   `KoeModelManager` を実装し、list/resolve/install/load/unload/remove と model
@@ -70,6 +70,16 @@ product を完成させた。
 - すべてのコマンドで `--output-format json|jsonl` を提供し、stdout/stderr の
   機械可読 contract をテストで保証する。default log には audio 波形や transcript
   テキストは含まれない。
+- `koe-desktop` は setup、recorder、model manager、session library、privacy/
+  diagnostics settings を提供する。GPUI の state は `koe-app::desktop` の frontend
+  非依存 view model と shared `SessionSnapshot` に従う。
+- desktop 録音は CPAL callback を bounded ring へ渡し、background capture worker
+  から既存 `RecorderCoordinator` と segmented WAV store を利用する。fresh consent、
+  permission denied/revoked guidance、cooperative stop/finalize を CLI と共通化する。
+- すべての操作要素は Tab/Shift-Tab で移動できる。録音 indicator は page state と
+  分離し、window title にも反映して最小化中の OS surface に残す。
+- desktop privacy default は offline-only、diagnostics opt-in、retention forever で、
+  settings は app-owned data root へ atomic rename で保存する。
 - ネイティブ live-audio session は公開された foundry SDK に無いため、capability
   として報告する。E2E offline テストは fixture adapter で駆動する。
 - `unsafe_code`、panic、unwrap、unused などを deny する strict lint は維持する。
