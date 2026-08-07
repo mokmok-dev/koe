@@ -1,5 +1,6 @@
 mod config;
 mod sessions;
+mod updates;
 
 use std::{
     collections::VecDeque,
@@ -215,6 +216,14 @@ enum Command {
         #[command(subcommand)]
         command: ConfigCommand,
     },
+    /// Verify and manage signed app updates (offline by default).
+    Update {
+        /// App-owned data root that contains `updates/`.
+        #[arg(long)]
+        data_root: PathBuf,
+        #[command(subcommand)]
+        command: UpdateCommand,
+    },
     /// Record microphone PCM until Ctrl-C.
     Record {
         /// Opaque stable microphone ID from `devices list`.
@@ -233,6 +242,9 @@ enum Command {
         sample_rate: u32,
         #[arg(long, default_value_t = 1)]
         channels: u16,
+        /// Stop and finalize after this many seconds (useful for automation).
+        #[arg(long, value_parser = clap::value_parser!(u64).range(1..))]
+        duration_seconds: Option<u64>,
         /// Confirm this one recording after reviewing sources and destination.
         #[arg(long)]
         consent: bool,
@@ -315,6 +327,42 @@ enum ConfigCommand {
     ApplyRetention,
 }
 
+#[derive(Debug, Subcommand)]
+enum UpdateCommand {
+    /// Show the durable update state without network access.
+    Status,
+    /// Verify and install a signed release, keeping the previous version.
+    Apply {
+        /// Path to the signed metadata document (`koe-release-sign` output).
+        #[arg(long)]
+        metadata: PathBuf,
+        /// Path to the downloaded executable target designated by metadata.
+        #[arg(long)]
+        target: PathBuf,
+        /// Confirm this one update after reviewing the release.
+        #[arg(long)]
+        consent: bool,
+    },
+    /// Verify a named signed release artifact without installing it.
+    Verify {
+        #[arg(long)]
+        metadata: PathBuf,
+        #[arg(long)]
+        target: PathBuf,
+        /// Relative target path exactly as recorded in signed metadata.
+        #[arg(long)]
+        target_name: String,
+    },
+    /// Restore the previously installed version after verifying it.
+    Rollback,
+    /// Verify and run the active side-by-side executable.
+    Launch {
+        /// Arguments forwarded to the active executable (place after `--`).
+        #[arg(last = true)]
+        args: Vec<String>,
+    },
+}
+
 #[derive(Debug, Serialize)]
 struct DoctorReport {
     schema_version: u32,
@@ -388,6 +436,9 @@ fn execute(
         Command::Config { data_root, command } => {
             run_config_command(data_root, command, cli.output_format, output)?;
         },
+        Command::Update { data_root, command } => {
+            run_update_command(data_root, command, cli.output_format, output)?;
+        },
         Command::Record {
             mic,
             system,
@@ -395,6 +446,7 @@ fn execute(
             output: data_root,
             sample_rate,
             channels,
+            duration_seconds,
             consent,
         } => {
             record(
@@ -405,6 +457,7 @@ fn execute(
                 data_root,
                 *sample_rate,
                 *channels,
+                *duration_seconds,
                 *consent,
                 cli.output_format,
                 output,
@@ -812,6 +865,33 @@ fn run_config_command(
     }
 }
 
+/// Executes one `koe update` subcommand. All update operations are strictly
+/// offline; a release is verified from explicitly provided signed metadata
+/// and artifact files.
+fn run_update_command(
+    data_root: &Path,
+    command: &UpdateCommand,
+    format: OutputFormat,
+    output: &mut impl io::Write,
+) -> Result<(), CliError> {
+    match command {
+        UpdateCommand::Status => updates::status(data_root, format, output)?,
+        UpdateCommand::Apply {
+            metadata,
+            target,
+            consent,
+        } => updates::apply_update(data_root, metadata, target, *consent, format, output)?,
+        UpdateCommand::Verify {
+            metadata,
+            target,
+            target_name,
+        } => updates::verify_release_artifact(data_root, metadata, target, target_name)?,
+        UpdateCommand::Rollback => updates::rollback(data_root, format, output)?,
+        UpdateCommand::Launch { args } => updates::launch(data_root, args)?,
+    }
+    Ok(())
+}
+
 fn human_config(config: &config::Config) -> String {
     let retention = match config.retention {
         config::RetentionPolicy::Forever => "forever".to_owned(),
@@ -1001,6 +1081,7 @@ fn record<B: AudioBackend>(
     data_root: &PathBuf,
     sample_rate: u32,
     channels: u16,
+    duration_seconds: Option<u64>,
     consent: bool,
     format: OutputFormat,
     output: &mut impl io::Write,
@@ -1192,7 +1273,12 @@ fn record<B: AudioBackend>(
         interrupt_handler.fetch_add(1, Ordering::Relaxed);
     })
     .map_err(|_| CliError::Signal)?;
-    eprintln!("recording; press Ctrl-C to stop (press twice to cancel)");
+    if let Some(seconds) = duration_seconds {
+        eprintln!("recording for {seconds} second(s); press Ctrl-C to stop early");
+    } else {
+        eprintln!("recording; press Ctrl-C to stop (press twice to cancel)");
+    }
+    let stop_at = duration_seconds.map(|seconds| session_clock + Duration::from_secs(seconds));
 
     let mut samples = vec![0_i16; 16_384];
     let mut system_samples = vec![0_i16; 16_384];
@@ -1221,7 +1307,9 @@ fn record<B: AudioBackend>(
     let mut system_active = system_stream.is_some();
     let mut microphone_loss_started = None;
     let mut system_loss_started = None;
-    while interrupts.load(Ordering::Relaxed) == 0 {
+    while interrupts.load(Ordering::Relaxed) == 0
+        && stop_at.is_none_or(|deadline| Instant::now() < deadline)
+    {
         process_async_control(&consumer, &coordinator, TrackKind::Microphone)?;
         let dropped = consumer.take_dropped_frames();
         if dropped != 0 {
@@ -2080,6 +2168,8 @@ enum CliError {
     Config(#[from] config::ConfigError),
     #[error("{0}")]
     Session(#[from] sessions::SessionError),
+    #[error("{0}")]
+    Update(#[from] updates::UpdateCliError),
 }
 
 impl CliError {
@@ -2096,6 +2186,7 @@ impl CliError {
             Self::ConsentRequired => "KOE-POLICY-CONSENT-REQUIRED",
             Self::Config(error) => error.code(),
             Self::Session(error) => error.code(),
+            Self::Update(error) => error.code(),
         }
     }
 }

@@ -66,6 +66,15 @@ Linux sandbox では XDG portal によりユーザーが選択した PipeWire no
 - temp から final への publish は同一 filesystem 内 atomic rename とする。
 - archive/export 展開を実装する場合は path traversal と decompression bomb を防ぐ。
 
+update の download input と store 内 component は symlink/hard-link、open 前後の file
+identity、`O_NOFOLLOW`（Unix）、delete/write sharing denial（Windows）で検証する。launch
+は検証済み open handle（Unix は `/proc/self/fd` / `/dev/fd`、Windows は delete/write
+sharing を拒否した handle）を process 作成完了まで保持する。これが防ぐのは untrusted
+download と accidental/concurrent pathname replacement である。同一 OS account で既に
+arbitrary code を実行できる攻撃者は app data root 自体を rename/recreate でき、app
+binary/credential も操作できるため publisher update authenticity の threat model 外と
+する。この境界を sandbox/別 user/ACL による hostile-local-process 防御とは表現しない。
+
 `create_new(true)` は既存 file と dangling symlink を原子的に拒否する。
 [Rust OpenOptions](https://doc.rust-lang.org/std/fs/struct.OpenOptions.html#method.create_new)
 

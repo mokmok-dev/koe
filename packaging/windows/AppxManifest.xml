@@ -1,0 +1,57 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  MSIX package manifest for koe-desktop.
+
+  The microphone device capability is required for WASAPI capture (spec 01).
+  System audio loopback uses WASAPI shared-mode loopback on a render device,
+  which does not need an additional device capability, but denial handling is
+  exercised in the HIL matrix (spec 07).
+-->
+<Package
+  xmlns="http://schemas.microsoft.com/appx/manifest/foundation/windows10"
+  xmlns:uap="http://schemas.microsoft.com/appx/manifest/uap/windows10"
+  xmlns:rescap="http://schemas.microsoft.com/appx/manifest/foundation/windows10/restrictedcapabilities"
+  IgnorableNamespaces="uap rescap">
+
+  <Identity
+    Name="org.mokmok.koe"
+    Publisher="${KOE_MSIX_PUBLISHER}"
+    Version="${KOE_RELEASE_VERSION_WIN}" />
+
+  <Properties>
+    <DisplayName>koe</DisplayName>
+    <PublisherDisplayName>mokmok dev</PublisherDisplayName>
+    <Logo>Assets\StoreLogo.png</Logo>
+    <Description>Fully offline recording and transcription.</Description>
+  </Properties>
+
+  <Dependencies>
+    <TargetDeviceFamily Name="Windows.Desktop" MinVersion="10.0.17763.0" MaxVersionTested="10.0.26100.0" />
+  </Dependencies>
+
+  <Resources>
+    <Resource Language="en-us" />
+  </Resources>
+
+  <Applications>
+    <Application Id="koe" Executable="koe-desktop.exe" EntryPoint="Windows.FullTrustApplication">
+      <uap:VisualElements
+        DisplayName="koe"
+        Description="Fully offline recording and transcription."
+        BackgroundColor="transparent"
+        Square150x150Logo="Assets\Square150x150Logo.png"
+        Square44x44Logo="Assets\Square44x44Logo.png" />
+    </Application>
+  </Applications>
+
+  <Capabilities>
+    <!-- Required for microphone capture (spec 01). -->
+    <DeviceCapability Name="microphone" />
+    <!--
+      System audio loopback and PipeWire-class sinks are addressed at the
+      WASAPI/render level; DRM-protected content is expected to be silent and
+      is a normal state, not a failure (spec 01).
+    -->
+    <rescap:Capability Name="runFullTrust" />
+  </Capabilities>
+</Package>

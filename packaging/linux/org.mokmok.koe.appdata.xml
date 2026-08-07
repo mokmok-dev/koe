@@ -1,0 +1,38 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<component type="desktop-application">
+  <id>org.mokmok.koe</id>
+  <metadata_license>CC0-1.0</metadata_license>
+  <project_license>MIT OR Apache-2.0</project_license>
+  <name>koe</name>
+  <summary>Fully offline recording and transcription</summary>
+  <description>
+    <p>
+      koe records your microphone and system audio and transcribes speech
+      with a locally acquired ASR model. Everything — capture, inference and
+      storage — happens on your device with no network access during a
+      session.
+    </p>
+    <p>Features:</p>
+    <ul>
+      <li>Microphone and system audio capture (PipeWire/PulseAudio/ALSA)</li>
+      <li>Offline streaming transcription with Nemotron models via Foundry Local</li>
+      <li>Session library, segmentation, crash recovery and retention policy</li>
+      <li>CLI, GPUI desktop and MCP stdio interfaces</li>
+    </ul>
+  </description>
+  <launchable type="desktop-id">org.mokmok.koe.desktop</launchable>
+  <categories>
+    <category>AudioVideo</category>
+    <category>Audio</category>
+  </categories>
+  <keywords>
+    <keyword>recording</keyword>
+    <keyword>transcription</keyword>
+    <keyword>speech-to-text</keyword>
+    <keyword>offline</keyword>
+  </keywords>
+  <releases>
+    <release version="0.0.0" date="2026-08-04"/>
+  </releases>
+  <url type="homepage">https://github.com/mokmok-dev/koe</url>
+</component>

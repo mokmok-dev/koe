@@ -2,6 +2,7 @@
 name = "koe-recording"
 version.workspace = true
 edition.workspace = true
+publish = false
 
 [dependencies]
 cap-std.workspace = true

@@ -2,6 +2,7 @@
 name = "koe-model"
 version.workspace = true
 edition.workspace = true
+publish = false
 
 [features]
 default = ["foundry-local"]

@@ -1,0 +1,55 @@
+# Release supply-chain policy. Every temporary advisory waiver below records
+# the affected scope and a mandatory re-review/removal date. Release approval
+# requires reviewing this complete committed list; there are no hidden CI-only
+# exceptions.
+[graph]
+all-features = true
+
+[advisories]
+yanked = "deny"
+ignore = [
+  { id = "RUSTSEC-2025-0052", reason = "Transitive GPUI async-tar only; no replacement until pinned GPUI removes async-std. Re-review 2026-10-01." },
+  { id = "RUSTSEC-2024-0384", reason = "Transitive GPUI timing compatibility crate; no vulnerable security behavior. Re-review 2026-10-01." },
+  { id = "RUSTSEC-2025-0119", reason = "Foundry progress-display-only transitive crate; not security-sensitive. Re-review on Foundry SDK update or 2026-10-01." },
+  { id = "RUSTSEC-2024-0436", reason = "Compile-time transitive macro in GPUI graphics dependencies. Re-review 2026-10-01." },
+  { id = "RUSTSEC-2026-0173", reason = "Compile-time transitive macro in pinned GPUI. Re-review 2026-10-01." },
+  { id = "RUSTSEC-2025-0134", reason = "GPUI HTTP client transitive parser; koe recording remains network-denied. Re-review 2026-10-01." },
+  { id = "RUSTSEC-2026-0206", reason = "GPUI text/rendering dependency with no maintained drop-in at the pinned GPUI release. Re-review 2026-10-01." },
+  { id = "RUSTSEC-2026-0192", reason = "GPUI font parser dependency with no maintained drop-in at the pinned GPUI release. Re-review 2026-10-01." },
+]
+
+[licenses]
+confidence-threshold = 0.93
+allow = [
+  "Apache-2.0",
+  "Apache-2.0 WITH LLVM-exception",
+  "BSD-2-Clause",
+  "BSD-3-Clause",
+  "BSL-1.0",
+  "CC0-1.0",
+  "CDLA-Permissive-2.0",
+  "ISC",
+  "MIT",
+  "MPL-2.0",
+  "NCSA",
+  "Unicode-3.0",
+  "Unicode-DFS-2016",
+  "Zlib",
+]
+exceptions = []
+
+[licenses.private]
+ignore = true
+
+[bans]
+multiple-versions = "warn"
+# Workspace path dependencies have no registry version requirement and are
+# reported as wildcards; external wildcard dependencies remain visible.
+wildcards = "warn"
+highlight = "all"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []

@@ -2,6 +2,7 @@
 name = "koe-app"
 version.workspace = true
 edition.workspace = true
+publish = false
 
 [dependencies]
 koe-core.workspace = true

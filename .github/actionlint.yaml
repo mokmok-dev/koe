@@ -1,0 +1,7 @@
+self-hosted-runner:
+  labels:
+    - koe-hil-macos
+    - koe-hil-macos-intel
+    - koe-hil-windows
+    - koe-hil-linux
+    - koe-hil-linux-arm64
