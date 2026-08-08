@@ -442,6 +442,25 @@ impl KoeModelManager {
             .map_err(map_adapter_error)
     }
 
+    /// Checks whether the installed model's files still exist in the SDK cache.
+    ///
+    /// Returns `false` for a stale manifest whose cache was cleared externally.
+    ///
+    /// # Errors
+    ///
+    /// Returns a model error when the manifest cannot be loaded or the adapter fails.
+    pub async fn is_model_cached(
+        &self,
+        installed: &InstalledModelId,
+    ) -> Result<bool, ModelError> {
+        let manifest = self.store.load_manifest(installed)?;
+        let descriptor = descriptor_from_manifest(&manifest);
+        let mut adapter = self.adapter.lock().await;
+        // `inspect_local_artifact` calls `model.is_cached()` internally and
+        // returns `NotFound` when the SDK cache is empty.
+        Ok(adapter.inspect_local_artifact(&descriptor).await.is_ok())
+    }
+
     /// Runs a chunk-size benchmark and persists the baseline.
     ///
     /// # Errors
