@@ -501,6 +501,23 @@ where
     runtime.block_on(future)
 }
 
+/// Runs a future that returns a Foundry live session with a blocking push loop.
+fn run_blocking_with_live_tasks<F, T>(future: F) -> Result<T, CliError>
+where
+    F: std::future::Future<Output = Result<T, CliError>>,
+{
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|_| CliError::Model(koe_model::ModelError::Internal))?;
+    let result = runtime.block_on(future);
+    // A normal Runtime drop waits for spawn_blocking tasks, but Foundry's push
+    // loop cannot finish until recording later stops the returned session.
+    // Keep that loop alive; the ASR worker subsequently stops and joins it.
+    runtime.shutdown_background();
+    result
+}
+
 /// Executes one `koe models` subcommand.
 #[allow(clippy::too_many_lines)]
 fn run_models_command(
@@ -1305,9 +1322,19 @@ fn prepare_asr_with_manager(
         },
     };
     let settings = AsrSessionSettings::default();
+    report_diagnostic(
+        format,
+        "model_verification_started",
+        "preparing ASR: verifying installed model files",
+    );
     let loaded =
         run_blocking(async { manager.load(&installed_id).await.map_err(CliError::Model) })?;
-    let session = run_blocking(async {
+    report_diagnostic(
+        format,
+        "model_load_completed",
+        "preparing ASR: model loaded; starting streaming session",
+    );
+    let session = run_blocking_with_live_tasks(async {
         manager
             .create_asr_session(&installed_id, &settings)
             .await
@@ -3253,6 +3280,8 @@ mod tests {
                     "model_install_progress",
                     "model_install_progress",
                     "model_selected",
+                    "model_verification_started",
+                    "model_load_completed",
                 ]
             );
             assert_eq!(events[0]["license_id"], "fixture-license-apache-2.0");
