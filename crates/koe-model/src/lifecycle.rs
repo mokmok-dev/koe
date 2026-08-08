@@ -39,9 +39,7 @@ impl ModelState {
                 | (Downloading, Verifying | Failed)
                 | (Verifying, Installed | Failed)
                 | (Installed, Loading | Removing | Failed)
-                // A failed verification/runtime load leaves the immutable
-                // installed artifact available for a repaired retry.
-                | (Loading, Installed | Ready | Unloading | Failed)
+                | (Loading, Ready | Unloading | Failed)
                 | (Ready, InUse | Unloading | Failed)
                 | (InUse, InUse | Unloading | Failed)
                 | (Unloading, Installed | Failed)
@@ -66,11 +64,16 @@ impl ModelLifecycle {
         }
     }
 
-    /// Rehydrates a lifecycle from an immutable persisted manifest.
-    #[must_use]
+    /// Restores a lifecycle for an already validated persisted installation.
     pub(crate) const fn persisted_installed() -> Self {
         Self {
             state: ModelState::Installed,
+        }
+    }
+
+    pub(crate) const fn persisted_ready() -> Self {
+        Self {
+            state: ModelState::Ready,
         }
     }
 
@@ -161,16 +164,6 @@ mod tests {
             state: ModelState::Failed,
         };
         assert!(lifecycle.transition(ModelState::Absent).is_ok());
-    }
-
-    #[test]
-    fn failed_load_can_roll_back_to_installed_for_retry() {
-        let mut lifecycle = ModelLifecycle::persisted_installed();
-        lifecycle.transition(ModelState::Loading).expect("loading");
-        lifecycle
-            .transition(ModelState::Installed)
-            .expect("recover installed");
-        assert_eq!(lifecycle.state(), ModelState::Installed);
     }
 
     #[test]

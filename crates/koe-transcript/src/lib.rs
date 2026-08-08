@@ -9,9 +9,11 @@ mod store;
 mod timeline;
 mod types;
 
-pub use store::{TranscriptReport, TranscriptStore};
+pub use store::{MAX_EVENT_RECORD_BYTES, TranscriptReport, TranscriptStore};
 pub use timeline::{TimelineSnapshot, format_clock, format_plain_text};
-pub use types::{SegmentId, TranscriptError, TranscriptModel, TranscriptSegment};
+pub use types::{
+    SegmentId, TranscriptError, TranscriptModel, TranscriptSegment, TranscriptValidationError,
+};
 
 /// Export helpers for user-facing artifacts.
 pub mod export {

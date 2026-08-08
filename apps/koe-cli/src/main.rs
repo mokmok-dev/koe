@@ -1372,16 +1372,18 @@ fn record<B: AudioBackend>(
     let mut stream = backend.open(&OpenSource {
         device_id: microphone_id.to_owned(),
         kind: SourceKind::Microphone,
-        sample_rate,
-        channels,
+        preferred_sample_rate: sample_rate,
+        preferred_channels: channels,
+        negotiation: koe_audio::FormatNegotiation::Exact,
     })?;
     let mut system_stream = system_id
         .map(|device_id| {
             backend.open(&OpenSource {
                 device_id: device_id.to_owned(),
                 kind: SourceKind::System,
-                sample_rate,
-                channels,
+                preferred_sample_rate: sample_rate,
+                preferred_channels: channels,
+                negotiation: koe_audio::FormatNegotiation::Exact,
             })
         })
         .transpose()?;
@@ -1504,7 +1506,7 @@ fn record<B: AudioBackend>(
             if let Some(system) = &mut system_stream {
                 system.stop()?;
             }
-            task.shutdown(&coordinator)?;
+            task.shutdown()?;
             return Err(error.into());
         },
     };
@@ -1526,7 +1528,7 @@ fn record<B: AudioBackend>(
     };
     if let Err(error) = stream.start(Box::new(producer)) {
         let _failed = coordinator.fail(error.code())?;
-        task.shutdown(&coordinator)?;
+        task.shutdown()?;
         return Err(error.into());
     }
     coordinator.record_permission_result(TrackKind::Microphone, "granted")?;
@@ -1535,7 +1537,7 @@ fn record<B: AudioBackend>(
     {
         stream.stop()?;
         let _failed = coordinator.fail(error.code())?;
-        task.shutdown(&coordinator)?;
+        task.shutdown()?;
         return Err(error.into());
     }
     if system_stream.is_some() {
@@ -1591,8 +1593,9 @@ fn record<B: AudioBackend>(
                 &OpenSource {
                     device_id: microphone_id.to_owned(),
                     kind: SourceKind::Microphone,
-                    sample_rate: microphone_sample_rate,
-                    channels: microphone_channels,
+                    preferred_sample_rate: microphone_sample_rate,
+                    preferred_channels: microphone_channels,
+                    negotiation: koe_audio::FormatNegotiation::Exact,
                 },
                 stream.native_sample_format(),
                 queue_capacity,
@@ -1627,7 +1630,7 @@ fn record<B: AudioBackend>(
             }
             if no_capture_source_active(microphone_active, system_active) {
                 let _cancelled = coordinator.cancel()?;
-                task.shutdown(&coordinator)?;
+                task.shutdown()?;
                 return Err(CliError::Audio(AudioError::DeviceLost));
             }
         }
@@ -1652,7 +1655,7 @@ fn record<B: AudioBackend>(
             if metadata.device_lost {
                 stream.stop()?;
                 let _cancelled = coordinator.cancel()?;
-                task.shutdown(&coordinator)?;
+                task.shutdown()?;
                 return Err(CliError::Audio(AudioError::DeviceLost));
             }
             let timeline_ns = microphone_timeline.map(
@@ -1709,8 +1712,9 @@ fn record<B: AudioBackend>(
                     &OpenSource {
                         device_id: system_id.to_owned(),
                         kind: SourceKind::System,
-                        sample_rate: system_sample_rate,
-                        channels: system_channels,
+                        preferred_sample_rate: system_sample_rate,
+                        preferred_channels: system_channels,
+                        negotiation: koe_audio::FormatNegotiation::Exact,
                     },
                     system_native_format,
                     queue_capacity,
@@ -1742,7 +1746,7 @@ fn record<B: AudioBackend>(
             }
             if no_capture_source_active(microphone_active, system_active) {
                 let _cancelled = coordinator.cancel()?;
-                task.shutdown(&coordinator)?;
+                task.shutdown()?;
                 return Err(CliError::Audio(AudioError::DeviceLost));
             }
         }
@@ -1939,7 +1943,7 @@ fn record<B: AudioBackend>(
     } else {
         coordinator.stop()?
     };
-    task.shutdown(&coordinator)?;
+    task.shutdown()?;
     if let Some(asr) = asr.take() {
         // Drains remaining chunks, runs the model finalization and
         // materializes `events.jsonl` -> `final.json`/`final.txt`.
@@ -1969,8 +1973,8 @@ fn reopen_source<B: AudioBackend>(
         let Ok(mut candidate) = backend.open(request) else {
             continue;
         };
-        if candidate.sample_rate() != request.sample_rate
-            || candidate.channels() != request.channels
+        if candidate.sample_rate() != request.preferred_sample_rate
+            || candidate.channels() != request.preferred_channels
             || candidate.native_sample_format() != expected_format
         {
             continue;
@@ -2762,7 +2766,7 @@ mod tests {
         .expect("parse");
         let error = execute(&cli, &UnsupportedBackend, &mut Vec::new())
             .expect_err("catalog requires network consent");
-        assert_eq!(error.code(), "KOE-MODEL-OFFLINE-MISSING");
+        assert_eq!(error.code(), "KOE-MODEL-NETWORK-DENIED");
     }
 
     #[test]
@@ -2816,7 +2820,7 @@ mod tests {
                 panic!("missing consent or network permission must fail");
             };
             assert!(matches!(&error, super::CliError::Model(actual) if actual == &expected));
-            assert_eq!(error.code(), "KOE-MODEL-OFFLINE-MISSING");
+            assert_eq!(error.code(), expected.code());
             assert!(manager.installed_models().expect("installed").is_empty());
         }
     }
@@ -3069,7 +3073,7 @@ mod tests {
         .expect("parse");
         let error = execute(&cli, &UnsupportedBackend, &mut Vec::new())
             .expect_err("install requires network consent");
-        assert_eq!(error.code(), "KOE-MODEL-OFFLINE-MISSING");
+        assert_eq!(error.code(), "KOE-MODEL-NETWORK-DENIED");
     }
 
     #[test]

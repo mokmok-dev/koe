@@ -379,19 +379,26 @@ impl CoordinatorTask {
     ///
     /// # Errors
     ///
-    /// Returns an error if the task panicked.
-    pub fn shutdown(
-        mut self,
-        coordinator: &RecorderCoordinator,
-    ) -> Result<(), AppError> {
+    /// Returns [`AppError::CoordinatorStopped`] if command delivery or the
+    /// shutdown response channel fails, [`AppError::CoordinatorPanicked`] if
+    /// the worker panics, or propagates recorder finalization/shutdown errors
+    /// reported by the coordinator.
+    pub fn shutdown(mut self) -> Result<(), AppError> {
         let (response, receiver) = mpsc::sync_channel(1);
-        coordinator
+        let delivered = self
             .commands
             .send(Command::Shutdown {
                 response: Some(response),
             })
-            .map_err(|_| AppError::CoordinatorStopped)?;
-        let shutdown_result = receiver.recv().map_err(|_| AppError::CoordinatorStopped)?;
+            .is_ok();
+        let shutdown_result = if delivered {
+            receiver
+                .recv()
+                .map_err(|_| AppError::CoordinatorStopped)
+                .and_then(|result| result)
+        } else {
+            Err(AppError::CoordinatorStopped)
+        };
         if let Some(task) = self.task.take() {
             task.join().map_err(|_| AppError::CoordinatorPanicked)?;
         }
@@ -852,7 +859,7 @@ mod tests {
             .start(RecordingConsent::default())
             .expect_err("consent must fail");
         assert_eq!(error.code(), "KOE-POLICY-CONSENT-REQUIRED");
-        task.shutdown(&coordinator).expect("shutdown");
+        task.shutdown().expect("shutdown");
     }
 
     #[test]
@@ -878,7 +885,7 @@ mod tests {
             })
             .expect_err("system consent must fail");
         assert_eq!(error.code(), "KOE-POLICY-CONSENT-REQUIRED");
-        task.shutdown(&coordinator).expect("shutdown");
+        task.shutdown().expect("shutdown");
     }
 
     #[test]
@@ -916,7 +923,7 @@ mod tests {
             coordinator.stop().expect("stop").state,
             SessionState::Completed
         );
-        task.shutdown(&coordinator).expect("shutdown");
+        task.shutdown().expect("shutdown");
     }
 
     #[test]
@@ -937,7 +944,7 @@ mod tests {
             coordinator.snapshot().expect("snapshot").state,
             SessionState::Failed
         );
-        task.shutdown(&coordinator).expect("shutdown");
+        task.shutdown().expect("shutdown");
         let session = recording.session_id.expect("session");
         let manifest: serde_json::Value = serde_json::from_slice(
             &std::fs::read(
@@ -985,7 +992,7 @@ mod tests {
         let repeated = coordinator.stop().expect("repeated stop");
         assert_eq!(completed, repeated);
         assert_eq!(completed.state, SessionState::Completed);
-        task.shutdown(&coordinator).expect("shutdown");
+        task.shutdown().expect("shutdown");
     }
 
     #[test]
@@ -999,7 +1006,7 @@ mod tests {
                 storage: true,
             })
             .expect("start");
-        task.shutdown(&coordinator).expect("shutdown");
+        task.shutdown().expect("shutdown");
 
         let recovered = koe_recording::recover_sessions(root.path()).expect("recovery scan");
         assert!(
@@ -1037,7 +1044,7 @@ mod tests {
         );
         let repeated = coordinator.stop().expect_err("failure is stable");
         assert_eq!(repeated.code(), "KOE-STORE-FINALIZE-FAILED");
-        task.shutdown(&coordinator).expect("shutdown");
+        task.shutdown().expect("shutdown");
     }
 
     #[test]
@@ -1067,7 +1074,7 @@ mod tests {
             coordinator.snapshot().expect("snapshot").state,
             SessionState::Failed
         );
-        task.shutdown(&coordinator).expect("shutdown");
+        task.shutdown().expect("shutdown");
 
         let manifest: serde_json::Value = serde_json::from_slice(
             &std::fs::read(session_dir.join("session.json")).expect("manifest"),
@@ -1116,6 +1123,6 @@ mod tests {
             coordinator.snapshot().expect("snapshot").state,
             SessionState::Failed
         );
-        task.shutdown(&coordinator).expect("shutdown");
+        task.shutdown().expect("shutdown");
     }
 }

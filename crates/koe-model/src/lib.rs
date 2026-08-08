@@ -19,20 +19,25 @@ mod store;
 mod types;
 
 pub use adapter::{
-    AsrError, AsrEvent, AsrSessionSettings, FinalTranscript, FoundryAdapter, InstalledArtifact,
-    InstalledFile, Pcm16Mono16k, StreamingAsrSession,
+    AdapterError, ArtifactValidationError, AsrError, AsrEvent, AsrSessionSettings, FinalTranscript,
+    FoundryAdapter, InstalledArtifact, InstalledArtifactParts, InstalledFile,
+    MAX_ARTIFACT_INVENTORY_BYTES, Pcm16Mono16k, StreamingAsrSession,
 };
 pub use benchmark::{BenchmarkBaseline, BenchmarkReport, word_error_rate};
 pub use fixture::{FixtureAsrSession, FixtureFoundryAdapter, fixture_transcribe};
 #[cfg(feature = "foundry-local")]
 pub use foundry::FoundryLocalAdapter;
 pub use lifecycle::{ModelLifecycle, ModelState};
-pub use manager::{KoeModelManager, ModelManager};
-pub use store::{AllowlistEntry, DigestAllowlist, ModelStore};
+pub use manager::{InstalledModelDiagnostic, KoeModelManager, ModelManager};
+pub use store::{
+    AllowlistEntry, DigestAllowlist, FileDigest, InstalledManifestEntry, MAX_MANIFEST_BYTES,
+    MAX_MANIFEST_FILES, MAX_MANIFEST_PATH_BYTES, MAX_MANIFEST_TEXT_BYTES, ModelStore,
+};
 pub use types::{
     Alias, InstallOptions, InstalledModel, InstalledModelId, LoadedModel, LoadedModelId,
-    ModelDescriptor, ModelError, ModelFile, ModelId, ModelManifest, ModelProgress, ModelScope,
-    ModelSelector, ModelVersion, Verification,
+    ManifestValidationError, ModelArtifactFailure, ModelDescriptor, ModelError, ModelFile, ModelId,
+    ModelManifest, ModelProgress, ModelScope, ModelSelector, ModelVersion, RemovalFailure,
+    ReplacementFailure, Verification,
 };
 
 /// Pinned SDK version recorded in every model manifest.
