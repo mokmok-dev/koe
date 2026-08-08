@@ -12,7 +12,8 @@ mod types;
 pub use store::{MAX_EVENT_RECORD_BYTES, TranscriptReport, TranscriptStore};
 pub use timeline::{TimelineSnapshot, format_clock, format_plain_text};
 pub use types::{
-    SegmentId, TranscriptError, TranscriptModel, TranscriptSegment, TranscriptValidationError,
+    SegmentId, TRANSCRIPT_SCHEMA_VERSION, TranscriptError, TranscriptModel, TranscriptSegment,
+    TranscriptSegmentBuilder, TranscriptSegmentState, TranscriptValidationError,
 };
 
 /// Export helpers for user-facing artifacts.

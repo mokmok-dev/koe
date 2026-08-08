@@ -1,0 +1,22 @@
+name: windows
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+permissions:
+  contents: read
+jobs:
+  rust:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Toolchain
+        run: rustup show
+      - name: Check Windows build
+        run: cargo check --workspace --locked
+      - name: Test platform-independent behavior
+        run: cargo test --workspace --locked

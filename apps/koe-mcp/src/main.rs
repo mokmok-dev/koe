@@ -20,14 +20,19 @@ use std::{
 
 use clap::Parser;
 use koe_app::{RecorderCoordinator, RecordingConsent};
-use koe_audio::{AudioBackend, AudioStream, CpalBackend, OpenSource, frame_ring};
+use koe_audio::{
+    AudioBackend, AudioStream, CanonicalNormalizer, CpalBackend, OpenSource, frame_ring,
+};
 use koe_core::{NetworkPolicy, OperationId, SessionId, SessionState, SourceKind};
 use koe_model::{
-    DigestAllowlist, FoundryLocalAdapter, InstallOptions, KoeModelManager, ModelError,
-    ModelManager, ModelProgress, ModelSelector,
+    AsrSessionSettings, DigestAllowlist, FoundryLocalAdapter, InstallOptions, KoeModelManager,
+    ModelError, ModelManager, ModelProgress, ModelSelector,
 };
 use koe_recording::{RecordingConfig, SessionManifest, TimelineBlock, TrackKind};
-use serde::Serialize;
+use koe_transcript::{
+    SegmentId, TranscriptModel, TranscriptSegment, TranscriptSegmentState, TranscriptStore,
+};
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use thiserror::Error;
 
@@ -53,7 +58,7 @@ struct Args {
     export_root: Option<PathBuf>,
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 enum OperationState {
     Running,
@@ -62,13 +67,13 @@ enum OperationState {
     Failed,
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 struct OperationSnapshot {
     operation_id: OperationId,
     session_id: Option<SessionId>,
     state: OperationState,
     progress: u8,
-    error_code: Option<&'static str>,
+    error_code: Option<String>,
 }
 
 enum RecordingControl {
@@ -81,8 +86,6 @@ struct Operation {
     recording_control: Option<Sender<RecordingControl>>,
     cancellation: tokio_util::sync::CancellationToken,
     task: Option<JoinHandle<()>>,
-    progress_token: Option<Value>,
-    last_notified_progress: u8,
 }
 
 #[derive(Debug, Error)]
@@ -103,8 +106,14 @@ enum McpError {
     ResponseTooLarge,
     #[error("path or session authorization failed")]
     Unauthorized,
+    #[error("session not found")]
+    SessionNotFound,
+    #[error("model not found")]
+    ModelNotFound,
+    #[error("operation not found")]
+    OperationNotFound,
     #[error("resource not found")]
-    NotFound,
+    ResourceNotFound,
     #[error("operation capacity reached")]
     Capacity,
     #[error("operation failed")]
@@ -118,7 +127,10 @@ impl McpError {
             Self::InvalidRequest | Self::RequestTooLarge => -32600,
             Self::MethodNotFound => -32601,
             Self::InvalidParams => -32602,
-            Self::NotFound => -32004,
+            Self::SessionNotFound
+            | Self::ModelNotFound
+            | Self::OperationNotFound
+            | Self::ResourceNotFound => -32004,
             Self::ConsentRequired | Self::Unauthorized => -32003,
             Self::Capacity => -32008,
             Self::OperationFailed | Self::ResponseTooLarge => -32603,
@@ -129,7 +141,10 @@ impl McpError {
         match self {
             Self::ConsentRequired => "KOE-POLICY-CONSENT-REQUIRED",
             Self::Unauthorized => "KOE-STORE-PATH-REJECTED",
-            Self::NotFound => "KOE-SESSION-NOT-FOUND",
+            Self::SessionNotFound => "KOE-SESSION-NOT-FOUND",
+            Self::ModelNotFound => "KOE-MODEL-NOT-FOUND",
+            Self::OperationNotFound => "KOE-MCP-OPERATION-NOT-FOUND",
+            Self::ResourceNotFound => "KOE-MCP-RESOURCE-NOT-FOUND",
             Self::Capacity => "KOE-SESSION-CONFLICT",
             Self::RequestTooLarge => "KOE-MCP-REQUEST-TOO-LARGE",
             Self::ResponseTooLarge => "KOE-MCP-RESPONSE-TOO-LARGE",
@@ -139,6 +154,31 @@ impl McpError {
             Self::MethodNotFound => "KOE-MCP-METHOD-NOT-FOUND",
             Self::OperationFailed => "KOE-MCP-OPERATION-FAILED",
         }
+    }
+
+    const fn remedy(&self) -> &'static str {
+        match self {
+            Self::ConsentRequired => "repeat the tool call with explicit consent after user review",
+            Self::Unauthorized => "request and authorize an app-owned session resource first",
+            Self::SessionNotFound => "list sessions and retry with an existing session ID",
+            Self::ModelNotFound => "install the model explicitly, then retry offline",
+            Self::OperationNotFound => "start an operation and retry with its operation ID",
+            Self::ResourceNotFound => "list resources and retry with an advertised URI",
+            Self::Capacity => "wait for a running operation to finish, then retry",
+            Self::InvalidParams | Self::InvalidRequest | Self::ParseError => {
+                "correct the request using the advertised tool schema"
+            },
+            Self::MethodNotFound => "use a method advertised during MCP initialization",
+            _ => "poll the operation resource and retry after correcting the stable error code",
+        }
+    }
+
+    const fn retryable(&self) -> bool {
+        // A generic operation failure covers validation, storage corruption,
+        // and permanent runtime errors as well as transient failures. Claiming
+        // all of those are retryable causes blind retry loops; only the typed
+        // capacity condition is unambiguously transient here.
+        matches!(self, Self::Capacity)
     }
 }
 
@@ -152,6 +192,7 @@ enum LifecycleState {
 struct Server {
     data_root: PathBuf,
     sessions_root: PathBuf,
+    operations_root: PathBuf,
     export_root: Option<PathBuf>,
     backend: CpalBackend,
     model_manager: Arc<KoeModelManager>,
@@ -164,6 +205,7 @@ impl Server {
     fn new(args: &Args) -> Result<Self, McpError> {
         let data_root = authorize_root(&args.data_root, true)?;
         let sessions_root = authorize_root(&data_root.join("sessions"), true)?;
+        let operations_root = authorize_root(&data_root.join("operations"), true)?;
         let export_root = args
             .export_root
             .as_deref()
@@ -184,13 +226,18 @@ impl Server {
             )
             .map_err(|_| McpError::OperationFailed)?,
         );
+        // Reconcile abandoned recording manifests before reconstructing their
+        // operation snapshots so both durable views describe the same outcome.
+        koe_recording::recover_sessions(&data_root).map_err(|_| McpError::OperationFailed)?;
+        let operations = load_operations(&operations_root, &sessions_root)?;
         Ok(Self {
             data_root,
             sessions_root,
+            operations_root,
             export_root,
             backend: CpalBackend::default(),
             model_manager,
-            operations: HashMap::new(),
+            operations,
             authorized_resources: HashSet::new(),
             lifecycle: LifecycleState::Uninitialized,
         })
@@ -230,7 +277,6 @@ impl Server {
                     Ok(Err(error)) => return Err(error),
                     Err(mpsc::RecvTimeoutError::Timeout) => self.reap_operations(),
                 }
-                self.emit_progress(&mut output)?;
             }
             Ok(())
         });
@@ -390,29 +436,10 @@ impl Server {
             "koe_delete_session" => self.delete_session(arguments)?,
             _ => return Err(McpError::MethodNotFound),
         };
-        if matches!(name, "koe_install_model" | "koe_start_recording")
-            && let Some(token) = params
-                .get("_meta")
-                .and_then(|meta| meta.get("progressToken"))
-                .cloned()
-        {
-            if !matches!(token, Value::String(_) | Value::Number(_))
-                || self
-                    .operations
-                    .values()
-                    .any(|operation| operation.progress_token.as_ref() == Some(&token))
-            {
-                return Err(McpError::InvalidParams);
-            }
-            let id = value
-                .get("operation_id")
-                .and_then(Value::as_str)
-                .ok_or(McpError::OperationFailed)?;
-            self.operations
-                .get_mut(id)
-                .ok_or(McpError::OperationFailed)?
-                .progress_token = Some(token);
-        }
+        // These tools return detached, pollable operations immediately. A
+        // request-scoped progressToken expires with this response and must not
+        // be retained for later notifications. Clients poll koe_get_operation
+        // or read koe://operations/<id> instead.
         tool_result(value)
     }
 
@@ -489,11 +516,11 @@ impl Server {
                     TimedOperation::Completed(Err(ModelError::Cancelled))
                     | TimedOperation::Cancelled => OperationState::Cancelled,
                     TimedOperation::DeadlineExceeded => {
-                        state.error_code = Some(OPERATION_DEADLINE_ERROR);
+                        state.error_code = Some(OPERATION_DEADLINE_ERROR.to_owned());
                         OperationState::Failed
                     },
                     TimedOperation::Completed(Err(error)) => {
-                        state.error_code = Some(error.code());
+                        state.error_code = Some(error.code().to_owned());
                         OperationState::Failed
                     },
                 };
@@ -507,8 +534,6 @@ impl Server {
                 recording_control: None,
                 cancellation,
                 task: Some(task),
-                progress_token: None,
-                last_notified_progress: 0,
             },
         );
         serde_json::to_value(self.operation_snapshot(&operation_id.to_string())?)
@@ -529,6 +554,8 @@ impl Server {
             args,
             &[
                 "device_id",
+                "model",
+                "language",
                 "sample_rate",
                 "channels",
                 "max_duration_seconds",
@@ -543,6 +570,42 @@ impl Server {
             return Err(McpError::InvalidParams);
         }
         let device_id = device_id.to_owned();
+        let model_selector = args.get("model").and_then(Value::as_str).unwrap_or("none");
+        let language = args.get("language").and_then(Value::as_str).unwrap_or("en");
+        if model_selector.len() > 256 || language.len() > 32 {
+            return Err(McpError::InvalidParams);
+        }
+        let prepared_asr = if model_selector == "none" {
+            None
+        } else {
+            let selector = model_selector
+                .parse::<ModelSelector>()
+                .map_err(|_| McpError::InvalidParams)?;
+            let installed = self
+                .model_manager
+                .installed_id_for(&selector)
+                .map_err(|_| McpError::OperationFailed)?
+                .ok_or(McpError::ModelNotFound)?;
+            let loaded = block_on(self.model_manager.load(&installed))
+                .map_err(|_| McpError::OperationFailed)?;
+            let session = block_on(self.model_manager.create_asr_session(
+                &installed,
+                &AsrSessionSettings {
+                    language: Some(language.to_owned()),
+                    ..AsrSessionSettings::default()
+                },
+            ))
+            .map_err(|_| McpError::OperationFailed)?;
+            Some((
+                session,
+                TranscriptModel::new(
+                    loaded.descriptor.id.0,
+                    loaded.descriptor.version.0,
+                    loaded.descriptor.variant,
+                )
+                .map_err(|_| McpError::OperationFailed)?,
+            ))
+        };
         let sample_rate = u32_arg(args, "sample_rate", 48_000)?;
         let channels = u16_arg(args, "channels", 1)?;
         let max_duration_seconds = u32_arg(args, "max_duration_seconds", 14_400)?;
@@ -581,6 +644,15 @@ impl Server {
             })
             .map_err(|_| McpError::OperationFailed)?;
         let session_id = started.session_id.ok_or(McpError::OperationFailed)?;
+        let asr = prepared_asr.map(|(session, model)| {
+            McpAsrBridge::spawn(
+                session,
+                model,
+                self.sessions_root
+                    .join(session_id.to_string())
+                    .join("transcript"),
+            )
+        });
         let (producer, consumer) =
             frame_ring(config.queue_capacity, 16_384).map_err(|_| McpError::OperationFailed)?;
         if stream.start(Box::new(producer)).is_err() {
@@ -622,6 +694,9 @@ impl Server {
                 &thread_cancellation,
                 &thread_snapshot,
                 &mut samples,
+                asr,
+                config.sample_rate,
+                config.channels,
             );
         });
         self.operations.insert(
@@ -631,8 +706,6 @@ impl Server {
                 recording_control: Some(control),
                 cancellation,
                 task: Some(task),
-                progress_token: None,
-                last_notified_progress: 0,
             },
         );
         serde_json::to_value(self.operation_snapshot(&operation_id.to_string())?)
@@ -650,7 +723,7 @@ impl Server {
         let operation = self
             .operations
             .get(operation_id)
-            .ok_or(McpError::NotFound)?;
+            .ok_or(McpError::OperationNotFound)?;
         let state = operation
             .snapshot
             .lock()
@@ -694,13 +767,16 @@ impl Server {
         &self,
         id: &str,
     ) -> Result<OperationSnapshot, McpError> {
-        self.operations
+        let snapshot = self
+            .operations
             .get(id)
-            .ok_or(McpError::NotFound)?
+            .ok_or(McpError::OperationNotFound)?
             .snapshot
             .lock()
             .map_err(|_| McpError::OperationFailed)
-            .map(|snapshot| snapshot.clone())
+            .map(|snapshot| snapshot.clone())?;
+        persist_operation(&self.operations_root, &snapshot)?;
+        Ok(snapshot)
     }
 
     fn active_operations(&self) -> usize {
@@ -734,7 +810,8 @@ impl Server {
                         "operation worker stopped without a terminal state"
                     );
                     snapshot.state = OperationState::Failed;
-                    snapshot.error_code = Some(error_code);
+                    snapshot.error_code = Some(error_code.to_owned());
+                    let _ignored = persist_operation(&self.operations_root, &snapshot);
                 }
             }
             let terminal = operation
@@ -743,6 +820,9 @@ impl Server {
                 .is_ok_and(|snapshot| !matches!(snapshot.state, OperationState::Running));
             if terminal && let Some(task) = operation.task.take() {
                 let _ignored = task.join();
+            }
+            if let Ok(snapshot) = operation.snapshot.lock() {
+                let _ignored = persist_operation(&self.operations_root, &snapshot);
             }
         }
         while self.operations.len() > MAX_RETAINED_OPERATIONS {
@@ -757,40 +837,8 @@ impl Server {
                 break;
             };
             self.operations.remove(&id);
+            let _ignored = fs::remove_file(operation_path(&self.operations_root, &id));
         }
-    }
-
-    fn emit_progress(
-        &mut self,
-        output: &mut impl Write,
-    ) -> io::Result<()> {
-        for operation in self.operations.values_mut() {
-            let Some(token) = operation.progress_token.clone() else {
-                continue;
-            };
-            let Ok(snapshot) = operation.snapshot.lock() else {
-                continue;
-            };
-            let progress = snapshot.progress;
-            let terminal = !matches!(snapshot.state, OperationState::Running);
-            let state = format!("{:?}", snapshot.state).to_lowercase();
-            drop(snapshot);
-            if progress > operation.last_notified_progress || terminal {
-                write_message(
-                    output,
-                    &json!({
-                        "jsonrpc": "2.0",
-                        "method": "notifications/progress",
-                        "params": {"progressToken": token, "progress": progress, "total": 100, "message": state}
-                    }),
-                )?;
-                operation.last_notified_progress = progress;
-            }
-            if terminal {
-                operation.progress_token = None;
-            }
-        }
-        Ok(())
     }
 
     fn resources(&self) -> Vec<Value> {
@@ -833,7 +881,7 @@ impl Server {
                 self.session_value(id_text)?
             }
         } else {
-            return Err(McpError::NotFound);
+            return Err(McpError::ResourceNotFound);
         };
         let text = serde_json::to_string(&value).map_err(|_| McpError::OperationFailed)?;
         Ok(json!({"contents": [{"uri": uri, "mimeType": "application/json", "text": text}]}))
@@ -862,7 +910,7 @@ impl Server {
         let session = SessionId::parse(id).map_err(|_| McpError::Unauthorized)?;
         let directory = self.session_dir(session)?;
         let path = directory.join("session.json");
-        let canonical = path.canonicalize().map_err(|_| McpError::NotFound)?;
+        let canonical = path.canonicalize().map_err(|_| McpError::SessionNotFound)?;
         if canonical.parent() != Some(directory.as_path()) {
             return Err(McpError::Unauthorized);
         }
@@ -877,7 +925,7 @@ impl Server {
         let session = SessionId::parse(id).map_err(|_| McpError::Unauthorized)?;
         let directory = self.session_dir(session)?;
         let path = directory.join("transcript/final.json");
-        let canonical = path.canonicalize().map_err(|_| McpError::NotFound)?;
+        let canonical = path.canonicalize().map_err(|_| McpError::SessionNotFound)?;
         if !canonical.starts_with(&directory) {
             return Err(McpError::Unauthorized);
         }
@@ -940,7 +988,7 @@ impl Server {
         id: SessionId,
     ) -> Result<PathBuf, McpError> {
         let path = self.sessions_root.join(id.to_string());
-        let canonical = path.canonicalize().map_err(|_| McpError::NotFound)?;
+        let canonical = path.canonicalize().map_err(|_| McpError::SessionNotFound)?;
         if canonical.parent() != Some(self.sessions_root.as_path())
             || fs::symlink_metadata(&path).is_ok_and(|m| m.file_type().is_symlink())
         {
@@ -960,14 +1008,292 @@ impl Server {
             if let Some(task) = operation.task.take() {
                 let _ignored = task.join();
             }
+            if let Ok(snapshot) = operation.snapshot.lock() {
+                let _ignored = persist_operation(&self.operations_root, &snapshot);
+            }
         }
     }
+}
+
+fn operation_path(
+    root: &Path,
+    id: &str,
+) -> PathBuf {
+    root.join(format!("{id}.json"))
+}
+
+fn persist_operation(
+    root: &Path,
+    snapshot: &OperationSnapshot,
+) -> Result<(), McpError> {
+    let id = snapshot.operation_id.to_string();
+    let destination = operation_path(root, &id);
+    let staging = root.join(format!(".{id}.{}.tmp", uuid::Uuid::new_v4()));
+    let bytes = serde_json::to_vec(snapshot).map_err(|_| McpError::OperationFailed)?;
+    fs::write(&staging, bytes).map_err(|_| McpError::OperationFailed)?;
+    replace_file(&staging, &destination).map_err(|_| {
+        let _ignored = fs::remove_file(&staging);
+        McpError::OperationFailed
+    })
+}
+
+/// Replaces a regular file without relying on Unix rename-over-existing
+/// semantics. The backup makes the operation work on Windows and permits a
+/// best-effort rollback if publishing the staging file fails.
+fn replace_file(
+    staging: &Path,
+    destination: &Path,
+) -> io::Result<()> {
+    if fs::symlink_metadata(destination).is_err() {
+        return fs::rename(staging, destination);
+    }
+    let backup = destination.with_extension(format!("json.{}.bak", uuid::Uuid::new_v4()));
+    fs::rename(destination, &backup)?;
+    match fs::rename(staging, destination) {
+        Ok(()) => fs::remove_file(backup),
+        Err(error) => {
+            let _ignored = fs::rename(&backup, destination);
+            Err(error)
+        },
+    }
+}
+
+fn load_operations(
+    root: &Path,
+    sessions_root: &Path,
+) -> Result<HashMap<String, Operation>, McpError> {
+    let mut operations = HashMap::new();
+    for entry in fs::read_dir(root).map_err(|_| McpError::OperationFailed)? {
+        let entry = entry.map_err(|_| McpError::OperationFailed)?;
+        if !entry
+            .file_type()
+            .map_err(|_| McpError::OperationFailed)?
+            .is_file()
+            || entry.path().extension().and_then(|value| value.to_str()) != Some("json")
+        {
+            continue;
+        }
+        let mut snapshot: OperationSnapshot =
+            serde_json::from_slice(&read_limited_file(&entry.path(), MAX_OUTPUT_BYTES)?)
+                .map_err(|_| McpError::OperationFailed)?;
+        if matches!(snapshot.state, OperationState::Running) {
+            snapshot.state = OperationState::Failed;
+            snapshot.progress = 100;
+            snapshot.error_code = Some(
+                snapshot
+                    .session_id
+                    .and_then(|id| read_manifest(&sessions_root.join(id.to_string())).ok())
+                    .map_or("KOE-MCP-OPERATION-INTERRUPTED", |manifest| {
+                        if manifest.state == SessionState::RecoveredPartial {
+                            "KOE-STORE-RECOVERED-PARTIAL"
+                        } else {
+                            "KOE-MCP-OPERATION-INTERRUPTED"
+                        }
+                    })
+                    .to_owned(),
+            );
+            persist_operation(root, &snapshot)?;
+        }
+        let id = snapshot.operation_id.to_string();
+        operations.insert(
+            id,
+            Operation {
+                snapshot: Arc::new(Mutex::new(snapshot)),
+                recording_control: None,
+                cancellation: tokio_util::sync::CancellationToken::new(),
+                task: None,
+            },
+        );
+    }
+    Ok(operations)
 }
 
 impl Drop for Server {
     fn drop(&mut self) {
         self.cancel_all();
     }
+}
+
+enum McpAsrCommand {
+    Chunk { samples: Vec<i16>, start_us: u64 },
+    Stop,
+}
+
+struct McpAsrBridge {
+    sender: std::sync::mpsc::SyncSender<McpAsrCommand>,
+    worker: Option<JoinHandle<Result<(), &'static str>>>,
+    dropped: usize,
+    transcript_dir: PathBuf,
+    staging_dir: PathBuf,
+}
+
+impl McpAsrBridge {
+    fn spawn(
+        session: Box<dyn koe_model::StreamingAsrSession>,
+        model: TranscriptModel,
+        transcript_dir: PathBuf,
+    ) -> Self {
+        let (sender, receiver) = mpsc::sync_channel(64);
+        let staging_dir =
+            transcript_dir.with_file_name(format!(".transcript.{}.tmp", uuid::Uuid::new_v4()));
+        let worker_staging_dir = staging_dir.clone();
+        let worker = thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .map_err(|_| "KOE-MODEL-INTERNAL")?;
+            let mut session = session;
+            let mut store = TranscriptStore::open(worker_staging_dir)
+                .map_err(koe_transcript::TranscriptError::code)?;
+            for command in receiver {
+                match command {
+                    McpAsrCommand::Chunk { samples, start_us } => {
+                        runtime
+                            .block_on(session.append(koe_model::Pcm16Mono16k {
+                                samples,
+                                session_start_us: start_us,
+                            }))
+                            .map_err(koe_model::AsrError::code)?;
+                        while let Some(event) = runtime
+                            .block_on(session.poll_results())
+                            .map_err(koe_model::AsrError::code)?
+                        {
+                            append_mcp_asr_event(&mut store, &model, &event)?;
+                        }
+                    },
+                    McpAsrCommand::Stop => break,
+                }
+            }
+            let transcript = runtime
+                .block_on(session.finish())
+                .map_err(koe_model::AsrError::code)?;
+            for event in transcript.events {
+                append_mcp_asr_event(&mut store, &model, &event)?;
+            }
+            store
+                .finalize()
+                .map_err(koe_transcript::TranscriptError::code)?;
+            Ok(())
+        });
+        Self {
+            sender,
+            worker: Some(worker),
+            dropped: 0,
+            transcript_dir,
+            staging_dir,
+        }
+    }
+
+    fn feed(
+        &mut self,
+        samples: Vec<i16>,
+        start_us: u64,
+    ) -> Result<(), &'static str> {
+        match self
+            .sender
+            .try_send(McpAsrCommand::Chunk { samples, start_us })
+        {
+            Ok(()) => Ok(()),
+            Err(std::sync::mpsc::TrySendError::Full(_)) => {
+                self.dropped = self.dropped.saturating_add(1);
+                Ok(())
+            },
+            Err(std::sync::mpsc::TrySendError::Disconnected(_)) => Err("KOE-ASR-WORKER-STOPPED"),
+        }
+    }
+
+    fn finish(self) -> Result<(), &'static str> {
+        self.finish_with_timeout(CANCELLATION_GRACE)
+    }
+
+    fn finish_with_timeout(
+        mut self,
+        timeout: Duration,
+    ) -> Result<(), &'static str> {
+        let deadline = std::time::Instant::now() + timeout;
+        let mut stop = McpAsrCommand::Stop;
+        let mut stop_failure = None;
+        loop {
+            match self.sender.try_send(stop) {
+                Ok(()) => break,
+                Err(std::sync::mpsc::TrySendError::Disconnected(_)) => {
+                    stop_failure = Some("KOE-ASR-WORKER-STOPPED");
+                    break;
+                },
+                Err(std::sync::mpsc::TrySendError::Full(command)) => {
+                    stop = command;
+                    if std::time::Instant::now() >= deadline {
+                        stop_failure = Some("KOE-ASR-FINALIZE-TIMEOUT");
+                        break;
+                    }
+                    thread::sleep(Duration::from_millis(2));
+                },
+            }
+        }
+        // Closing the channel guarantees a worker blocked on receive can
+        // proceed even when a Stop command could not be queued.
+        drop(self.sender);
+        let worker = self.worker.take().ok_or("KOE-ASR-WORKER-STOPPED")?;
+        while !worker.is_finished() {
+            if std::time::Instant::now() >= deadline {
+                return Err("KOE-ASR-FINALIZE-TIMEOUT");
+            }
+            thread::sleep(Duration::from_millis(2));
+        }
+        let worker_result = worker.join().map_err(|_| "KOE-ASR-WORKER-PANICKED")?;
+        if self.dropped != 0 {
+            let _ignored = fs::remove_dir_all(&self.staging_dir);
+            return Err("KOE-ASR-RETRANSCRIPTION-REQUIRED");
+        }
+        if let Some(error) = stop_failure {
+            let _ignored = fs::remove_dir_all(&self.staging_dir);
+            return Err(error);
+        }
+        if let Err(error) = worker_result {
+            let _ignored = fs::remove_dir_all(&self.staging_dir);
+            return Err(error);
+        }
+        // Only publish after the worker is joined. A timed-out detached worker
+        // can therefore never mutate the canonical transcript after the
+        // operation becomes terminal.
+        match fs::remove_dir(&self.transcript_dir) {
+            Ok(()) => {},
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {},
+            Err(_) => return Err("KOE-TRANSCRIPT-WRITE-FAILED"),
+        }
+        fs::rename(&self.staging_dir, &self.transcript_dir)
+            .map_err(|_| "KOE-TRANSCRIPT-WRITE-FAILED")
+    }
+}
+
+fn append_mcp_asr_event(
+    store: &mut TranscriptStore,
+    model: &TranscriptModel,
+    event: &koe_model::AsrEvent,
+) -> Result<(), &'static str> {
+    if event.text.is_empty() {
+        return Ok(());
+    }
+    let segment = TranscriptSegment::builder(
+        event.start_us / 1_000,
+        event.end_us / 1_000,
+        event.text.clone(),
+    )
+    .segment_id(SegmentId::from(event.segment_id))
+    .state(if event.is_final {
+        TranscriptSegmentState::Final
+    } else {
+        TranscriptSegmentState::Interim
+    })
+    .model(model.clone())
+    .build()
+    .map_err(|_| "KOE-TRANSCRIPT-INVALID-SEGMENT")?;
+    store
+        .append(segment)
+        .map_err(koe_transcript::TranscriptError::code)?;
+    store
+        .checkpoint()
+        .map_err(koe_transcript::TranscriptError::code)
 }
 
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
@@ -981,15 +1307,19 @@ fn recording_loop<S: AudioStream>(
     cancellation: &tokio_util::sync::CancellationToken,
     snapshot: &Arc<Mutex<OperationSnapshot>>,
     samples: &mut [i16],
+    mut asr: Option<McpAsrBridge>,
+    sample_rate: u32,
+    channels: u16,
 ) {
     let mut terminal = None;
     let mut failure_code = None;
     let mut callback_anchor_ns = None;
     let mut capture_epoch_id = 0_u64;
     let deadline = std::time::Instant::now() + max_duration;
+    let mut normalizer = CanonicalNormalizer::new(sample_rate, channels).ok();
     'capture: loop {
         if std::time::Instant::now() >= deadline {
-            terminal = Some(true);
+            terminal = Some(false);
             break;
         }
         if cancellation.is_cancelled() {
@@ -1049,6 +1379,10 @@ fn recording_loop<S: AudioStream>(
                     }
                     continue;
                 }
+                if !frame_format_matches(&metadata, sample_rate, channels) {
+                    failure_code = Some("KOE-AUDIO-FORMAT-CHANGED");
+                    break 'capture;
+                }
                 let count = usize::try_from(metadata.sample_count)
                     .unwrap_or(0)
                     .min(samples.len());
@@ -1074,6 +1408,34 @@ fn recording_loop<S: AudioStream>(
                     failure_code = Some(error.code());
                     break 'capture;
                 }
+                if let (Some(asr), Some(normalizer)) = (asr.as_mut(), normalizer.as_mut()) {
+                    let frames = count / usize::from(metadata.channels.max(1));
+                    let capacity = frames.saturating_mul(2).saturating_add(8);
+                    let mut canonical = vec![0_i16; capacity];
+                    match normalizer.process(&samples[..count], &mut canonical) {
+                        Ok(canonical_count) => {
+                            for (index, chunk) in
+                                canonical[..canonical_count].chunks(2_560).enumerate()
+                            {
+                                let offset = u64::try_from(index.saturating_mul(2_560))
+                                    .unwrap_or(u64::MAX)
+                                    .saturating_mul(1_000_000)
+                                    / 16_000;
+                                if let Err(code) = asr.feed(
+                                    chunk.to_vec(),
+                                    timeline.session_start_us.saturating_add(offset),
+                                ) {
+                                    failure_code = Some(code);
+                                    break 'capture;
+                                }
+                            }
+                        },
+                        Err(error) => {
+                            failure_code = Some(error.code());
+                            break 'capture;
+                        },
+                    }
+                }
             },
             Ok(None) => thread::sleep(Duration::from_millis(5)),
             Err(error) => {
@@ -1083,7 +1445,12 @@ fn recording_loop<S: AudioStream>(
         }
     }
     let stream_failure = stream.stop().err().map(koe_audio::AudioError::code);
-    let result = failure_code.map_or_else(
+    // Every terminal path owns the ASR bridge until its bounded finish/join.
+    // This prevents final.json from being written after the operation is
+    // already observable as terminal.
+    let asr_failure = asr.take().and_then(|asr| asr.finish().err());
+    let operation_failure = failure_code.or(stream_failure).or(asr_failure);
+    let result = operation_failure.map_or_else(
         || {
             if terminal == Some(false) {
                 coordinator.stop()
@@ -1094,12 +1461,12 @@ fn recording_loop<S: AudioStream>(
         |code| coordinator.fail(code),
     );
     let shutdown_failure = task.shutdown().err().map(|error| error.code());
-    let terminal_failure = failure_code.or(stream_failure).or(shutdown_failure);
+    let terminal_failure = operation_failure.or(shutdown_failure);
     if let Ok(mut state) = snapshot.lock() {
         state.progress = 100;
         if let Some(code) = terminal_failure {
             state.state = OperationState::Failed;
-            state.error_code = Some(code);
+            state.error_code = Some(code.to_owned());
         } else {
             match result {
                 Ok(final_state) => {
@@ -1111,11 +1478,19 @@ fn recording_loop<S: AudioStream>(
                 },
                 Err(error) => {
                     state.state = OperationState::Failed;
-                    state.error_code = Some(error.code());
+                    state.error_code = Some(error.code().to_owned());
                 },
             }
         }
     }
+}
+
+const fn frame_format_matches(
+    metadata: &koe_audio::FrameMetadata,
+    sample_rate: u32,
+    channels: u16,
+) -> bool {
+    metadata.sample_rate == sample_rate && metadata.channels == channels
 }
 
 enum Frame {
@@ -1207,14 +1582,14 @@ fn read_limited_file(
     path: &Path,
     limit: usize,
 ) -> Result<Vec<u8>, McpError> {
-    let metadata = fs::symlink_metadata(path).map_err(|_| McpError::NotFound)?;
+    let metadata = fs::symlink_metadata(path).map_err(|_| McpError::ResourceNotFound)?;
     if metadata.file_type().is_symlink() || !metadata.is_file() || has_multiple_links(&metadata) {
         return Err(McpError::Unauthorized);
     }
     if metadata.len() > u64::try_from(limit).unwrap_or(u64::MAX) {
         return Err(McpError::ResponseTooLarge);
     }
-    let file = fs::File::open(path).map_err(|_| McpError::NotFound)?;
+    let file = fs::File::open(path).map_err(|_| McpError::ResourceNotFound)?;
     let mut bytes = Vec::with_capacity(usize::try_from(metadata.len()).unwrap_or(limit).min(limit));
     file.take(u64::try_from(limit).unwrap_or(u64::MAX).saturating_add(1))
         .read_to_end(&mut bytes)
@@ -1414,7 +1789,14 @@ fn u16_arg(
 
 #[allow(clippy::needless_pass_by_value)]
 fn tool_error(error: &McpError) -> Value {
-    let value = json!({"code": error.koe_code(), "message": error.to_string()});
+    let value = json!({
+        "code": error.koe_code(),
+        "message": error.to_string(),
+        "remedy": error.remedy(),
+        "retryable": error.retryable(),
+        "operation_id": Value::Null,
+        "diagnostic_id": uuid::Uuid::new_v4().to_string()
+    });
     json!({
         "content": [{"type": "text", "text": value.to_string()}],
         "structuredContent": value,
@@ -1463,10 +1845,21 @@ fn error_response(
     id: Value,
     error: &McpError,
 ) -> Value {
+    let diagnostic_id = uuid::Uuid::new_v4().to_string();
     json!({
         "jsonrpc": "2.0",
         "id": id,
-        "error": {"code": error.rpc_code(), "message": error.to_string(), "data": {"koe_code": error.koe_code()}}
+        "error": {
+            "code": error.rpc_code(),
+            "message": error.to_string(),
+            "data": {
+                "koe_code": error.koe_code(),
+                "remedy": error.remedy(),
+                "retryable": error.retryable(),
+                "operation_id": Value::Null,
+                "diagnostic_id": diagnostic_id
+            }
+        }
     })
 }
 
@@ -1495,8 +1888,8 @@ fn tool_descriptors() -> Vec<Value> {
         ),
         tool(
             "koe_start_recording",
-            "Start microphone recording; requires fresh host consent",
-            json!({"type":"object","additionalProperties":false,"required":["device_id","consent"],"properties":{"device_id":{"type":"string","maxLength":512},"sample_rate":{"type":"integer","minimum":8000,"maximum":192_000},"channels":{"type":"integer","minimum":1,"maximum":8},"max_duration_seconds":{"type":"integer","minimum":1,"maximum":86_400},"consent":{"const":true}}}),
+            "Start microphone recording with optional installed-model transcription; requires fresh host consent",
+            json!({"type":"object","additionalProperties":false,"required":["device_id","consent"],"properties":{"device_id":{"type":"string","maxLength":512},"model":{"type":"string","maxLength":256,"default":"none"},"language":{"type":"string","maxLength":32,"default":"en"},"sample_rate":{"type":"integer","minimum":8000,"maximum":192_000},"channels":{"type":"integer","minimum":1,"maximum":8},"max_duration_seconds":{"type":"integer","minimum":1,"maximum":86_400},"consent":{"const":true}}}),
         ),
         tool(
             "koe_stop_recording",
@@ -1596,15 +1989,16 @@ mod tests {
 
     use std::{
         future::pending,
-        sync::{Arc, Mutex},
+        sync::{Arc, Condvar, Mutex},
         time::Duration,
     };
 
     use koe_core::{OperationId, SessionId};
 
     use super::{
-        Args, LifecycleState, Operation, OperationSnapshot, OperationState, Server, TimedOperation,
-        run_with_deadline,
+        Args, LifecycleState, McpAsrBridge, McpError, Operation, OperationSnapshot, OperationState,
+        Server, TimedOperation, error_response, frame_format_matches, persist_operation,
+        run_with_deadline, tool_error,
     };
 
     fn request(
@@ -1752,7 +2146,7 @@ mod tests {
     }
 
     #[test]
-    fn progress_notifications_are_monotonic_and_stop_at_terminal() {
+    fn detached_operations_are_polled_without_request_scoped_progress() {
         let root = TempDir::new().expect("temp");
         let mut server = initialized_server(&root);
         let id = OperationId::new();
@@ -1770,32 +2164,20 @@ mod tests {
                 recording_control: None,
                 cancellation: tokio_util::sync::CancellationToken::new(),
                 task: None,
-                progress_token: Some(serde_json::json!("progress-1")),
-                last_notified_progress: 0,
             },
         );
-        let mut output = Vec::new();
-        server.emit_progress(&mut output).expect("running progress");
         {
             let mut state = snapshot.lock().expect("snapshot");
             state.progress = 100;
             state.state = OperationState::Completed;
         }
-        server
-            .emit_progress(&mut output)
-            .expect("terminal progress");
-        let terminal_len = output.len();
-        server
-            .emit_progress(&mut output)
-            .expect("no post-terminal progress");
-        assert_eq!(output.len(), terminal_len);
-        let messages = String::from_utf8(output).expect("utf8");
-        let progress = messages
-            .lines()
-            .map(|line| serde_json::from_str::<serde_json::Value>(line).expect("json"))
-            .map(|message| message["params"]["progress"].as_u64().expect("progress"))
-            .collect::<Vec<_>>();
-        assert_eq!(progress, vec![25, 100]);
+        assert_eq!(
+            server
+                .operation_snapshot(&id.to_string())
+                .expect("poll snapshot")
+                .progress,
+            100
+        );
     }
 
     #[test]
@@ -1816,8 +2198,6 @@ mod tests {
                 recording_control: None,
                 cancellation: tokio_util::sync::CancellationToken::new(),
                 task: None,
-                progress_token: None,
-                last_notified_progress: 0,
             },
         );
         let arguments = serde_json::json!({"operation_id": id, "consent": true});
@@ -1834,5 +2214,356 @@ mod tests {
                 .state,
             OperationState::Completed
         ));
+    }
+
+    #[test]
+    fn cancelling_a_running_operation_signals_control_and_token() {
+        let root = TempDir::new().expect("temp");
+        let mut server = server(&root);
+        let id = OperationId::new();
+        let (control, receiver) = std::sync::mpsc::channel();
+        let cancellation = tokio_util::sync::CancellationToken::new();
+        server.operations.insert(
+            id.to_string(),
+            Operation {
+                snapshot: Arc::new(Mutex::new(OperationSnapshot {
+                    operation_id: id,
+                    session_id: None,
+                    state: OperationState::Running,
+                    progress: 1,
+                    error_code: None,
+                })),
+                recording_control: Some(control),
+                cancellation: cancellation.clone(),
+                task: None,
+            },
+        );
+        server
+            .stop_recording(
+                &serde_json::json!({"operation_id": id, "consent": true}),
+                true,
+            )
+            .expect("cancel");
+        assert!(cancellation.is_cancelled());
+        assert!(matches!(
+            receiver
+                .recv_timeout(Duration::from_millis(50))
+                .expect("control"),
+            super::RecordingControl::Cancel
+        ));
+    }
+
+    #[test]
+    fn operations_survive_restart_and_running_work_is_reconciled() {
+        let root = TempDir::new().expect("temp");
+        let id = OperationId::new();
+        {
+            let mut server = server(&root);
+            server.operations.insert(
+                id.to_string(),
+                Operation {
+                    snapshot: Arc::new(Mutex::new(OperationSnapshot {
+                        operation_id: id,
+                        session_id: None,
+                        state: OperationState::Running,
+                        progress: 37,
+                        error_code: None,
+                    })),
+                    recording_control: None,
+                    cancellation: tokio_util::sync::CancellationToken::new(),
+                    task: None,
+                },
+            );
+            server.operation_snapshot(&id.to_string()).expect("persist");
+        }
+
+        let restarted = server(&root);
+        let snapshot = restarted
+            .operation_snapshot(&id.to_string())
+            .expect("reload");
+        assert_eq!(snapshot.state, OperationState::Failed);
+        assert_eq!(snapshot.progress, 100);
+        assert_eq!(
+            snapshot.error_code.as_deref(),
+            Some("KOE-MCP-OPERATION-INTERRUPTED")
+        );
+    }
+
+    #[test]
+    fn restart_reconciles_the_associated_recording_manifest_and_operation() {
+        let root = TempDir::new().expect("temp");
+        let mut initial = server(&root);
+        let session_id = {
+            let mut recorder = koe_recording::SessionRecorder::start(
+                koe_recording::RecordingConfig::microphone(root.path(), 16_000, 1),
+            )
+            .expect("recorder");
+            recorder.write_samples(&[1, 2, 3, 4]).expect("audio");
+            recorder.checkpoint().expect("checkpoint");
+            recorder.session_id()
+        };
+        let operation_id = OperationId::new();
+        initial.operations.insert(
+            operation_id.to_string(),
+            Operation {
+                snapshot: Arc::new(Mutex::new(OperationSnapshot {
+                    operation_id,
+                    session_id: Some(session_id),
+                    state: OperationState::Running,
+                    progress: 50,
+                    error_code: None,
+                })),
+                recording_control: None,
+                cancellation: tokio_util::sync::CancellationToken::new(),
+                task: None,
+            },
+        );
+        initial
+            .operation_snapshot(&operation_id.to_string())
+            .expect("persist operation");
+        drop(initial);
+
+        let restarted = server(&root);
+        let snapshot = restarted
+            .operation_snapshot(&operation_id.to_string())
+            .expect("reconciled operation");
+        assert_eq!(snapshot.state, OperationState::Failed);
+        assert_eq!(
+            snapshot.error_code.as_deref(),
+            Some("KOE-STORE-RECOVERED-PARTIAL")
+        );
+        let manifest: koe_recording::SessionManifest = serde_json::from_slice(
+            &std::fs::read(
+                root.path()
+                    .join("sessions")
+                    .join(session_id.to_string())
+                    .join("session.json"),
+            )
+            .expect("manifest"),
+        )
+        .expect("json");
+        assert_eq!(manifest.state, koe_core::SessionState::RecoveredPartial);
+    }
+
+    #[test]
+    fn generic_operation_failure_is_not_blindly_retryable() {
+        assert!(!McpError::OperationFailed.retryable());
+        assert!(McpError::Capacity.retryable());
+        let envelope = error_response(serde_json::Value::Null, &McpError::OperationFailed);
+        assert_eq!(envelope["error"]["data"]["retryable"], false);
+        let tool_envelope = tool_error(&McpError::OperationFailed);
+        let data = &tool_envelope["structuredContent"];
+        assert_eq!(data["retryable"], false);
+        assert!(data["remedy"].is_string());
+        assert!(data["diagnostic_id"].is_string());
+        assert!(data["operation_id"].is_null());
+    }
+
+    #[test]
+    fn not_found_errors_identify_the_resource_kind() {
+        assert_eq!(
+            McpError::SessionNotFound.koe_code(),
+            "KOE-SESSION-NOT-FOUND"
+        );
+        assert_eq!(McpError::ModelNotFound.koe_code(), "KOE-MODEL-NOT-FOUND");
+        assert_eq!(
+            McpError::OperationNotFound.koe_code(),
+            "KOE-MCP-OPERATION-NOT-FOUND"
+        );
+        assert_ne!(
+            McpError::ModelNotFound.remedy(),
+            McpError::SessionNotFound.remedy()
+        );
+    }
+
+    #[test]
+    fn repeated_operation_persistence_replaces_the_previous_snapshot() {
+        let root = TempDir::new().expect("temp");
+        let operations = root.path().join("operations");
+        std::fs::create_dir(&operations).expect("operations");
+        let mut snapshot = OperationSnapshot {
+            operation_id: OperationId::new(),
+            session_id: None,
+            state: OperationState::Running,
+            progress: 1,
+            error_code: None,
+        };
+        persist_operation(&operations, &snapshot).expect("initial persist");
+        snapshot.state = OperationState::Completed;
+        snapshot.progress = 100;
+        persist_operation(&operations, &snapshot).expect("replacement persist");
+        let bytes = std::fs::read(operations.join(format!("{}.json", snapshot.operation_id)))
+            .expect("snapshot");
+        let loaded: OperationSnapshot = serde_json::from_slice(&bytes).expect("json");
+        assert_eq!(loaded.state, OperationState::Completed);
+        assert_eq!(loaded.progress, 100);
+    }
+
+    #[test]
+    fn shutdown_persists_worker_terminal_state() {
+        let root = TempDir::new().expect("temp");
+        let id = OperationId::new();
+        {
+            let mut server = server(&root);
+            let snapshot = Arc::new(Mutex::new(OperationSnapshot {
+                operation_id: id,
+                session_id: None,
+                state: OperationState::Running,
+                progress: 1,
+                error_code: None,
+            }));
+            let worker_snapshot = Arc::clone(&snapshot);
+            let cancellation = tokio_util::sync::CancellationToken::new();
+            let worker_cancellation = cancellation.clone();
+            let task = std::thread::spawn(move || {
+                while !worker_cancellation.is_cancelled() {
+                    std::thread::yield_now();
+                }
+                let mut state = worker_snapshot.lock().expect("snapshot");
+                state.state = OperationState::Cancelled;
+                state.progress = 100;
+            });
+            server.operations.insert(
+                id.to_string(),
+                Operation {
+                    snapshot,
+                    recording_control: None,
+                    cancellation,
+                    task: Some(task),
+                },
+            );
+            server.cancel_all();
+        }
+        let restarted = server(&root);
+        let snapshot = restarted
+            .operation_snapshot(&id.to_string())
+            .expect("reload");
+        assert_eq!(snapshot.state, OperationState::Cancelled);
+        assert_eq!(snapshot.progress, 100);
+    }
+
+    #[test]
+    fn protocol_progress_tokens_do_not_create_request_scoped_notifications() {
+        let root = TempDir::new().expect("temp");
+        let mut server = server(&root);
+        let input = concat!(
+            "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{\"protocolVersion\":\"2025-06-18\",\"capabilities\":{},\"clientInfo\":{\"name\":\"test\",\"version\":\"1\"}}}\n",
+            "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/call\",\"params\":{\"name\":\"koe_capabilities\",\"arguments\":{},\"_meta\":{\"progressToken\":\"request-token\"}}}\n"
+        );
+        let mut output = Vec::new();
+        server.run(input.as_bytes(), &mut output).expect("run");
+        let messages: Vec<serde_json::Value> = output
+            .split(|byte| *byte == b'\n')
+            .filter(|line| !line.is_empty())
+            .map(|line| serde_json::from_slice(line).expect("json"))
+            .collect();
+        assert_eq!(messages.len(), 2);
+        assert!(messages.iter().all(|message| {
+            message.get("method").and_then(serde_json::Value::as_str)
+                != Some("notifications/progress")
+        }));
+    }
+
+    #[test]
+    fn live_asr_bridge_materializes_pcm_results_before_completion() {
+        let root = TempDir::new().expect("temp");
+        let transcript_dir = root.path().join("transcript");
+        let session = koe_model::FixtureAsrSession::new(&koe_model::AsrSessionSettings::default());
+        let model = koe_transcript::TranscriptModel::new("fixture", "1", "cpu").expect("model");
+        let mut bridge = McpAsrBridge::spawn(Box::new(session), model, transcript_dir.clone());
+        bridge
+            .feed(vec![1_000; 2_560], 0)
+            .expect("feed canonical PCM");
+        bridge.finish().expect("finish and join");
+        let final_segments: Vec<koe_transcript::TranscriptSegment> = serde_json::from_slice(
+            &std::fs::read(transcript_dir.join("final.json")).expect("final transcript"),
+        )
+        .expect("valid transcript");
+        assert!(!final_segments.is_empty());
+        assert!(
+            final_segments
+                .iter()
+                .all(koe_transcript::TranscriptSegment::is_final)
+        );
+    }
+
+    #[test]
+    fn runtime_frame_format_must_match_the_negotiated_stream() {
+        let metadata = koe_audio::FrameMetadata {
+            sample_rate: 48_000,
+            channels: 2,
+            ..koe_audio::FrameMetadata::default()
+        };
+        assert!(frame_format_matches(&metadata, 48_000, 2));
+        assert!(!frame_format_matches(&metadata, 16_000, 2));
+        assert!(!frame_format_matches(&metadata, 48_000, 1));
+    }
+
+    #[test]
+    fn stalled_asr_finish_is_bounded_and_never_publishes_after_timeout() {
+        struct StalledAsr {
+            gate: Arc<(Mutex<(bool, bool)>, Condvar)>,
+        }
+        #[async_trait::async_trait]
+        impl koe_model::StreamingAsrSession for StalledAsr {
+            async fn append(
+                &mut self,
+                _chunk: koe_model::Pcm16Mono16k,
+            ) -> Result<(), koe_model::AsrError> {
+                let (lock, signal) = &*self.gate;
+                let mut state = lock.lock().expect("gate");
+                state.0 = true;
+                signal.notify_all();
+                while !state.1 {
+                    state = signal.wait(state).expect("wait");
+                }
+                drop(state);
+                Ok(())
+            }
+            async fn poll_results(
+                &mut self
+            ) -> Result<Option<koe_model::AsrEvent>, koe_model::AsrError> {
+                Ok(None)
+            }
+            async fn finish(
+                self: Box<Self>
+            ) -> Result<koe_model::FinalTranscript, koe_model::AsrError> {
+                Ok(koe_model::FinalTranscript::default())
+            }
+        }
+
+        let root = TempDir::new().expect("temp");
+        let transcript_dir = root.path().join("transcript");
+        let gate = Arc::new((Mutex::new((false, false)), Condvar::new()));
+        let mut bridge = McpAsrBridge::spawn(
+            Box::new(StalledAsr {
+                gate: Arc::clone(&gate),
+            }),
+            koe_transcript::TranscriptModel::new("fixture", "1", "cpu").expect("model"),
+            transcript_dir.clone(),
+        );
+        bridge.feed(vec![1], 0).expect("first");
+        {
+            let (lock, signal) = &*gate;
+            let mut state = lock.lock().expect("gate");
+            while !state.0 {
+                state = signal.wait(state).expect("wait");
+            }
+            drop(state);
+        }
+        for index in 0..65 {
+            bridge.feed(vec![2], index).expect("bounded feed");
+        }
+        let started = std::time::Instant::now();
+        assert_eq!(
+            bridge.finish_with_timeout(Duration::from_millis(20)),
+            Err("KOE-ASR-FINALIZE-TIMEOUT")
+        );
+        assert!(started.elapsed() < Duration::from_millis(200));
+        let (lock, signal) = &*gate;
+        lock.lock().expect("gate").1 = true;
+        signal.notify_all();
+        std::thread::sleep(Duration::from_millis(50));
+        assert!(!transcript_dir.join("final.json").exists());
     }
 }

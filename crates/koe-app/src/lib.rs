@@ -1,8 +1,9 @@
 //! Application coordinator shared by CLI and MCP adapters.
 
 use std::{
-    sync::mpsc::{self, Receiver, SyncSender},
+    sync::mpsc::{self, Receiver, RecvTimeoutError, SyncSender, TrySendError},
     thread::{self, JoinHandle},
+    time::{Duration, Instant},
 };
 
 use koe_core::{CoreError, OperationId, SessionId, SessionState};
@@ -14,6 +15,9 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 const COMMAND_CAPACITY: usize = 32;
+const DEFAULT_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
+const DROP_SHUTDOWN_TIMEOUT: Duration = Duration::from_millis(100);
+const SHUTDOWN_POLL_INTERVAL: Duration = Duration::from_millis(1);
 
 /// Consent is separate from an OS permission grant and scoped to one start call.
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
@@ -375,44 +379,103 @@ pub struct CoordinatorTask {
 }
 
 impl CoordinatorTask {
-    /// Requests shutdown and joins the worker.
+    /// Requests shutdown and joins the worker within the default timeout.
     ///
     /// # Errors
     ///
     /// Returns [`AppError::CoordinatorStopped`] if command delivery or the
     /// shutdown response channel fails, [`AppError::CoordinatorPanicked`] if
-    /// the worker panics, or propagates recorder finalization/shutdown errors
-    /// reported by the coordinator.
+    /// the worker panics, [`AppError::CoordinatorTimedOut`] if orderly shutdown
+    /// does not complete before the deadline, or propagates recorder
+    /// finalization/shutdown errors reported by the coordinator.
     pub fn shutdown(mut self) -> Result<(), AppError> {
+        self.shutdown_before(Instant::now() + DEFAULT_SHUTDOWN_TIMEOUT)
+    }
+
+    /// Requests shutdown and waits at most `timeout` for recorder finalization
+    /// and worker termination.
+    ///
+    /// The worker is detached if the deadline expires. This bounds application
+    /// shutdown even when storage or another worker operation is stuck.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same errors as [`Self::shutdown`], including
+    /// [`AppError::CoordinatorTimedOut`] when `timeout` elapses.
+    pub fn shutdown_with_timeout(
+        mut self,
+        timeout: Duration,
+    ) -> Result<(), AppError> {
+        self.shutdown_before(Instant::now() + timeout)
+    }
+
+    fn shutdown_before(
+        &mut self,
+        deadline: Instant,
+    ) -> Result<(), AppError> {
         let (response, receiver) = mpsc::sync_channel(1);
-        let delivered = self
-            .commands
-            .send(Command::Shutdown {
-                response: Some(response),
-            })
-            .is_ok();
-        let shutdown_result = if delivered {
+        let delivery_result = send_shutdown_before(&self.commands, Some(response), deadline);
+        let shutdown_result = delivery_result.and_then(|()| {
+            let wait = remaining(deadline)?;
             receiver
-                .recv()
-                .map_err(|_| AppError::CoordinatorStopped)
+                .recv_timeout(wait)
+                .map_err(|error| match error {
+                    RecvTimeoutError::Timeout => AppError::CoordinatorTimedOut,
+                    RecvTimeoutError::Disconnected => AppError::CoordinatorStopped,
+                })
                 .and_then(|result| result)
-        } else {
-            Err(AppError::CoordinatorStopped)
-        };
-        if let Some(task) = self.task.take() {
-            task.join().map_err(|_| AppError::CoordinatorPanicked)?;
-        }
+        });
+
+        let join_result = self.join_before(deadline);
+        join_result?;
         shutdown_result
+    }
+
+    fn join_before(
+        &mut self,
+        deadline: Instant,
+    ) -> Result<(), AppError> {
+        let Some(task) = self.task.take() else {
+            return Ok(());
+        };
+        while !task.is_finished() {
+            let wait = remaining(deadline)?;
+            thread::sleep(wait.min(SHUTDOWN_POLL_INTERVAL));
+        }
+        task.join().map_err(|_| AppError::CoordinatorPanicked)
     }
 }
 
 impl Drop for CoordinatorTask {
     fn drop(&mut self) {
-        let _ignored = self.commands.send(Command::Shutdown { response: None });
-        if let Some(task) = self.task.take() {
-            let _ignored = task.join();
+        let _ignored = self.shutdown_before(Instant::now() + DROP_SHUTDOWN_TIMEOUT);
+    }
+}
+
+fn send_shutdown_before(
+    commands: &SyncSender<Command>,
+    response: Option<SyncSender<Result<(), AppError>>>,
+    deadline: Instant,
+) -> Result<(), AppError> {
+    let mut command = Command::Shutdown { response };
+    loop {
+        match commands.try_send(command) {
+            Ok(()) => return Ok(()),
+            Err(TrySendError::Disconnected(_)) => return Err(AppError::CoordinatorStopped),
+            Err(TrySendError::Full(returned)) => {
+                command = returned;
+                let wait = remaining(deadline)?;
+                thread::sleep(wait.min(SHUTDOWN_POLL_INTERVAL));
+            },
         }
     }
+}
+
+fn remaining(deadline: Instant) -> Result<Duration, AppError> {
+    deadline
+        .checked_duration_since(Instant::now())
+        .filter(|remaining| !remaining.is_zero())
+        .ok_or(AppError::CoordinatorTimedOut)
 }
 
 #[allow(clippy::too_many_lines)]
@@ -807,6 +870,8 @@ pub enum AppError {
     CoordinatorStopped,
     #[error("recorder coordinator failed")]
     CoordinatorPanicked,
+    #[error("recorder coordinator shutdown timed out")]
+    CoordinatorTimedOut,
     #[error("recording finalization previously failed")]
     FinalizationFailed,
 }
@@ -822,6 +887,7 @@ impl AppError {
             Self::CoordinatorPanicked | Self::CoordinatorStopped => {
                 "KOE-SESSION-COORDINATOR-STOPPED"
             },
+            Self::CoordinatorTimedOut => "KOE-SESSION-COORDINATOR-TIMEOUT",
         }
     }
 }
@@ -829,11 +895,17 @@ impl AppError {
 #[cfg(test)]
 #[allow(clippy::expect_used)]
 mod tests {
+    use std::{
+        sync::{Arc, Barrier, mpsc},
+        thread,
+        time::{Duration, Instant},
+    };
+
     use koe_core::{NetworkPolicy, SessionState};
     use koe_recording::{AudioGap, RecordingConfig, TrackConfig, TrackKind};
     use tempfile::TempDir;
 
-    use super::{RecorderCoordinator, RecordingConsent};
+    use super::{AppError, Command, CoordinatorTask, RecorderCoordinator, RecordingConsent};
 
     fn config(root: &TempDir) -> RecordingConfig {
         RecordingConfig {
@@ -1124,5 +1196,88 @@ mod tests {
             SessionState::Failed
         );
         task.shutdown().expect("shutdown");
+    }
+
+    #[test]
+    fn explicit_shutdown_timeout_does_not_wait_for_a_stuck_worker() {
+        let (commands, receiver) = mpsc::sync_channel(1);
+        let ready = Arc::new(Barrier::new(2));
+        let worker_ready = Arc::clone(&ready);
+        let worker = thread::spawn(move || {
+            worker_ready.wait();
+            thread::sleep(Duration::from_secs(2));
+            drop(receiver);
+        });
+        let task = CoordinatorTask {
+            commands,
+            task: Some(worker),
+        };
+
+        ready.wait();
+        let error = task
+            .shutdown_with_timeout(Duration::from_millis(10))
+            .expect_err("stuck worker must time out");
+
+        assert!(matches!(error, AppError::CoordinatorTimedOut));
+        assert_eq!(error.code(), "KOE-SESSION-COORDINATOR-TIMEOUT");
+    }
+
+    #[test]
+    fn dropping_task_is_bounded_when_worker_is_stuck() {
+        let (commands, receiver) = mpsc::sync_channel(1);
+        let ready = Arc::new(Barrier::new(2));
+        let worker_ready = Arc::clone(&ready);
+        let worker = thread::spawn(move || {
+            worker_ready.wait();
+            thread::sleep(Duration::from_secs(2));
+            drop(receiver);
+        });
+        let task = CoordinatorTask {
+            commands,
+            task: Some(worker),
+        };
+
+        ready.wait();
+        let started = Instant::now();
+        drop(task);
+
+        assert!(started.elapsed() < Duration::from_secs(1));
+    }
+
+    #[test]
+    fn shutdown_timeout_is_bounded_when_command_queue_is_full() {
+        let (commands, receiver) = mpsc::sync_channel(1);
+        commands
+            .send(Command::Shutdown { response: None })
+            .expect("fill queue");
+        let worker = thread::spawn(move || {
+            thread::sleep(Duration::from_secs(2));
+            drop(receiver);
+        });
+        let task = CoordinatorTask {
+            commands,
+            task: Some(worker),
+        };
+        assert!(matches!(
+            task.shutdown_with_timeout(Duration::from_millis(10)),
+            Err(AppError::CoordinatorTimedOut)
+        ));
+    }
+
+    #[test]
+    fn worker_panic_is_reported_without_panicking_the_caller() {
+        let (commands, receiver) = mpsc::sync_channel(1);
+        let worker = thread::spawn(move || {
+            drop(receiver);
+            panic!("fixture panic");
+        });
+        let task = CoordinatorTask {
+            commands,
+            task: Some(worker),
+        };
+        assert!(matches!(
+            task.shutdown(),
+            Err(AppError::CoordinatorPanicked)
+        ));
     }
 }
