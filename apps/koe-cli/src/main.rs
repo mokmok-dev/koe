@@ -260,6 +260,10 @@ enum Command {
         sample_rate: u32,
         #[arg(long, default_value_t = 1)]
         channels: u16,
+        /// BCP-47 language hint for the ASR model (e.g. "en", "ja", "auto").
+        /// The multilingual model requires this; English-only models ignore it.
+        #[arg(long, default_value = "auto")]
+        language: String,
         /// Confirm this one recording after reviewing sources and destination.
         #[arg(long)]
         consent: bool,
@@ -434,6 +438,7 @@ fn execute_with_model_manager(
             network,
             expect_model_license,
             accept_model_license,
+            language,
             output: data_root,
             sample_rate,
             channels,
@@ -456,6 +461,7 @@ fn execute_with_model_manager(
                 expect_model_license
                     .as_deref()
                     .or(accept_model_license.as_deref()),
+                language,
                 data_root,
                 *sample_rate,
                 *channels,
@@ -1241,6 +1247,7 @@ fn prepare_asr(
     install_missing: bool,
     network: bool,
     expected_license: Option<&str>,
+    language: &str,
     format: OutputFormat,
     cancel: &tokio_util::sync::CancellationToken,
     manager_override: Option<&KoeModelManager>,
@@ -1261,6 +1268,7 @@ fn prepare_asr(
         install_missing,
         network,
         expected_license,
+        language,
         format,
         cancel,
     )
@@ -1268,12 +1276,48 @@ fn prepare_asr(
 }
 
 #[allow(clippy::type_complexity)]
+fn install_model_fresh(
+    manager: &KoeModelManager,
+    selector: &koe_model::ModelSelector,
+    expected_license: Option<&str>,
+    format: OutputFormat,
+    cancel: &tokio_util::sync::CancellationToken,
+) -> Result<koe_model::InstalledModelId, CliError> {
+    let descriptor = run_blocking(async {
+        manager
+            .resolve_for_install(selector, NetworkPolicy::ModelInstallOnly, cancel)
+            .await
+            .map_err(CliError::Model)
+    })?;
+    report_model_descriptor(
+        format,
+        "model_install_candidate",
+        &descriptor,
+        expected_license.is_some(),
+    );
+    if expected_license.is_some_and(|license| license != descriptor.license_id.as_str()) {
+        return Err(koe_model::ModelError::LicenseMismatch.into());
+    }
+    let installed = run_blocking(install_model_with_progress(
+        manager,
+        selector,
+        false,
+        format,
+        cancel.clone(),
+        Some(descriptor),
+    ))?;
+    report_installed_model(format, &installed);
+    Ok(installed.id)
+}
+
+#[allow(clippy::too_many_arguments, clippy::type_complexity)]
 fn prepare_asr_with_manager(
     manager: &KoeModelManager,
     model: &str,
     install_missing: bool,
     network: bool,
     expected_license: Option<&str>,
+    language: &str,
     format: OutputFormat,
     cancel: &tokio_util::sync::CancellationToken,
 ) -> Result<(Box<dyn koe_model::StreamingAsrSession>, TranscriptModel), CliError> {
@@ -1282,46 +1326,42 @@ fn prepare_asr_with_manager(
         Some(installed_id) => {
             let installed = manager.installed_model(&installed_id)?;
             report_installed_model(format, &installed);
-            installed_id
+            // Verify the model is actually cached in the SDK before attempting
+            // load. A stale manifest from a previous install where the SDK
+            // cache was cleared would fail with NotFound at load time.
+            let is_cached = run_blocking(async {
+                manager
+                    .is_model_cached(&installed_id)
+                    .await
+                    .map_err(CliError::Model)
+            })
+            .unwrap_or(false);
+            if is_cached {
+                installed_id
+            } else if !install_missing || !network {
+                return Err(koe_model::ModelError::NotFound.into());
+            } else {
+                report_diagnostic(
+                    format,
+                    "model_reinstall_required",
+                    "SDK model cache was cleared; reinstalling…",
+                );
+                let _ = run_blocking(async {
+                    manager.remove(&installed_id).await.map_err(CliError::Model)
+                });
+                install_model_fresh(manager, &selector, expected_license, format, cancel)?
+            }
         },
         None if !install_missing => {
             return Err(koe_model::ModelError::OfflineArtifactMissing.into());
         },
         None if !network => return Err(koe_model::ModelError::NetworkDenied.into()),
-        None => {
-            let descriptor = run_blocking(async {
-                manager
-                    .resolve_for_install(&selector, NetworkPolicy::ModelInstallOnly, cancel)
-                    .await
-                    .map_err(CliError::Model)
-            })?;
-            // The explicit recording consent, install request, and narrow
-            // network permission authorize this selected model's displayed
-            // license. An optional license argument pins the expected license
-            // ID. In both cases the reported descriptor is bound across the
-            // install's second catalog resolution and checked before download.
-            report_model_descriptor(
-                format,
-                "model_install_candidate",
-                &descriptor,
-                expected_license.is_some(),
-            );
-            if expected_license.is_some_and(|license| license != descriptor.license_id.as_str()) {
-                return Err(koe_model::ModelError::LicenseMismatch.into());
-            }
-            let installed = run_blocking(install_model_with_progress(
-                manager,
-                &selector,
-                false,
-                format,
-                cancel.clone(),
-                Some(descriptor),
-            ))?;
-            report_installed_model(format, &installed);
-            installed.id
-        },
+        None => install_model_fresh(manager, &selector, expected_license, format, cancel)?,
     };
-    let settings = AsrSessionSettings::default();
+    let settings = AsrSessionSettings {
+        language: Some(language.to_owned()),
+        ..AsrSessionSettings::default()
+    };
     report_diagnostic(
         format,
         "model_verification_started",
@@ -1429,6 +1469,7 @@ fn record<B: AudioBackend>(
     install_missing_model: bool,
     network: bool,
     expected_model_license: Option<&str>,
+    language: &str,
     data_root: &PathBuf,
     sample_rate: u32,
     channels: u16,
@@ -1481,6 +1522,7 @@ fn record<B: AudioBackend>(
         install_missing_model,
         network,
         expected_model_license,
+        language,
         format,
         &install_cancel,
         model_manager_override,
@@ -1934,6 +1976,15 @@ fn record<B: AudioBackend>(
                 !system_active,
                 asr.as_ref(),
             )?;
+        } else if asr.is_some() {
+            write_available_mix(
+                &mut microphone_mix,
+                &mut system_mix,
+                &coordinator,
+                !microphone_active,
+                true,
+                asr.as_ref(),
+            )?;
         }
         thread::sleep(Duration::from_millis(5));
     }
@@ -2046,6 +2097,15 @@ fn record<B: AudioBackend>(
         if dropped != 0 {
             coordinator.record_overflow(TrackKind::System, dropped)?;
         }
+    } else if asr.is_some() {
+        write_available_mix(
+            &mut microphone_mix,
+            &mut system_mix,
+            &coordinator,
+            true,
+            true,
+            asr.as_ref(),
+        )?;
     }
     let dropped = consumer.take_dropped_frames();
     if dropped != 0 {
@@ -2926,6 +2986,7 @@ mod tests {
                 true,
                 true,
                 None,
+                "auto",
                 OutputFormat::Json,
                 &cancel,
                 None,
@@ -2960,6 +3021,7 @@ mod tests {
                 install,
                 network,
                 None,
+                "auto",
                 OutputFormat::Jsonl,
                 &cancel,
             ) else {
@@ -3082,6 +3144,7 @@ mod tests {
                 true,
                 true,
                 Some(expected_license),
+                "auto",
                 OutputFormat::Json,
                 &cancel,
             ) else {
@@ -3117,6 +3180,7 @@ mod tests {
             true,
             true,
             None,
+            "auto",
             OutputFormat::Json,
             &cancel,
         ) else {
@@ -3152,6 +3216,7 @@ mod tests {
             true,
             true,
             None,
+            "auto",
             OutputFormat::Jsonl,
             &cancel,
         )
@@ -3172,6 +3237,7 @@ mod tests {
             false,
             false,
             None,
+            "auto",
             OutputFormat::Json,
             &cancel,
         )
@@ -3255,6 +3321,7 @@ mod tests {
                     true,
                     true,
                     Some("fixture-license-apache-2.0"),
+                    "auto",
                     format,
                     &cancel,
                 )
@@ -3339,6 +3406,7 @@ mod tests {
                 true,
                 true,
                 Some("fixture-license-apache-2.0"),
+                "auto",
                 OutputFormat::Human,
                 &cancel,
             )
