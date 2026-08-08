@@ -1,5 +1,6 @@
 [package]
 name = "koe-app"
+description = "Application services for koe"
 version.workspace = true
 edition.workspace = true
 

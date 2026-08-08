@@ -1,5 +1,6 @@
 [package]
 name = "koe-core"
+description = "Core types and interfaces for koe"
 version.workspace = true
 edition.workspace = true
 

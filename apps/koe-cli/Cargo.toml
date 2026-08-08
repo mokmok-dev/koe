@@ -1,5 +1,6 @@
 [package]
 name = "koe-cli"
+description = "Command-line interface for koe"
 version.workspace = true
 edition.workspace = true
 

@@ -1,5 +1,6 @@
 [package]
 name = "koe-audio"
+description = "Audio capture support for koe"
 version.workspace = true
 edition.workspace = true
 

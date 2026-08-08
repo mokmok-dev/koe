@@ -1,5 +1,6 @@
 [package]
 name = "koe-model"
+description = "Local model runtime support for koe"
 version.workspace = true
 edition.workspace = true
 
