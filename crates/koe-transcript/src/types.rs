@@ -19,6 +19,12 @@ impl SegmentId {
     }
 }
 
+impl From<Uuid> for SegmentId {
+    fn from(id: Uuid) -> Self {
+        Self(id)
+    }
+}
+
 impl Default for SegmentId {
     fn default() -> Self {
         Self::new()
