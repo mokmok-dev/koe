@@ -3,12 +3,14 @@ mod sessions;
 
 use std::{
     collections::VecDeque,
-    io::{self, IsTerminal as _},
+    fs,
+    io::{self, IsTerminal as _, Write as _},
     path::{Path, PathBuf},
     process::ExitCode,
     sync::{
         Arc,
-        atomic::{AtomicU8, AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering},
+        mpsc,
     },
     thread,
     time::{Duration, Instant},
@@ -18,13 +20,12 @@ use clap::{Parser, Subcommand, ValueEnum};
 use koe_app::{AppError, RecorderCoordinator, RecordingConsent};
 use koe_audio::{
     AudioBackend, AudioCapability, AudioDevice, AudioError, AudioStream, CanonicalNormalizer,
-    CpalBackend, DriftEstimator, FrameConsumer, OpenSource, frame_ring, mix_canonical,
-    process_timeline_now_ns,
+    CpalBackend, DriftEstimator, FrameConsumer, OpenSource, frame_ring, process_timeline_now_ns,
 };
-use koe_core::{CapabilityState, NetworkPolicy, SourceKind};
+use koe_core::{CapabilityState, NetworkPolicy, SessionId, SourceKind};
 use koe_model::{
     AsrSessionSettings, DigestAllowlist, FoundryLocalAdapter, InstallOptions, KoeModelManager,
-    ModelDescriptor, ModelManager,
+    ModelDescriptor, ModelManager, Verification,
 };
 use koe_recording::{
     AudioGap, DriftCorrection, RecordingConfig, RecordingError, TimelineBlock, TrackConfig,
@@ -32,11 +33,16 @@ use koe_recording::{
 };
 use koe_transcript::{SegmentId, TranscriptModel, TranscriptSegment, TranscriptStore};
 use serde::Serialize;
+use unicode_width::UnicodeWidthStr as _;
 
 const MIX_JITTER_CAPACITY: usize = 32_000;
 const CANONICAL_SAMPLE_RATE: u64 = 16_000;
 const INTERRUPT_EXIT_CODE: i32 = 130;
 const INTERRUPT_GRACE_PERIOD: Duration = Duration::from_secs(10);
+#[cfg(not(test))]
+const SETUP_PROBE_TIMEOUT: Duration = Duration::from_secs(2);
+#[cfg(test)]
+const SETUP_PROBE_TIMEOUT: Duration = Duration::from_millis(100);
 const PHASE_PREPARING: u8 = 0;
 const PHASE_RECORDING: u8 = 1;
 
@@ -167,7 +173,19 @@ impl From<SourceArgument> for SourceKind {
 }
 
 #[derive(Debug, Parser)]
-#[command(name = "koe", version, about = "Offline recording and transcription")]
+#[command(
+    name = "koe",
+    version,
+    about = "Offline, private audio recording with on-device transcription.",
+    long_about = "koe records microphone (and optionally system) audio and transcribes it \
+                  entirely on your machine. Nothing is uploaded: the network is only ever \
+                  used for an explicitly consented model install.\n\n\
+                  New here? Try:\n  \
+                  koe doctor                 check your setup\n  \
+                  koe devices list           see your microphones\n  \
+                  koe record --output ./data start a guided recording",
+    after_help = "Run `koe <command> --help` for details on any command."
+)]
 struct Cli {
     #[arg(long, value_enum, default_value_t)]
     output_format: OutputFormat,
@@ -177,6 +195,25 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
+    /// Prepare a data root, validate audio access, recover interrupted work,
+    /// and save verified defaults. Safe to run again.
+    Setup {
+        /// App-owned data root to initialize.
+        #[arg(long)]
+        data_root: PathBuf,
+        /// Microphone device ID to save as the default.
+        #[arg(long)]
+        mic: Option<String>,
+        /// Model alias/ID to verify, or `none` for audio-only use.
+        #[arg(long, default_value = "none")]
+        model: String,
+        /// Install the selected model when it is not already available.
+        #[arg(long)]
+        install_model: bool,
+        /// Permit network access only for the requested model install.
+        #[arg(long, requires = "install_model")]
+        network: bool,
+    },
     /// Show machine-detected audio capabilities.
     Capabilities,
     /// Inspect audio devices.
@@ -194,6 +231,19 @@ enum Command {
         /// App-owned data root to inspect. Defaults to the current directory.
         #[arg(long)]
         data_root: Option<PathBuf>,
+    },
+    /// Recover interrupted recordings without loading an ASR model.
+    Recover {
+        /// App-owned data root containing sessions.
+        #[arg(long)]
+        data_root: PathBuf,
+    },
+    /// Print the materialized final transcript for a completed session.
+    Transcript {
+        session_id: String,
+        /// App-owned data root containing sessions.
+        #[arg(long)]
+        data_root: PathBuf,
     },
     /// Inspect and manage locally installed ASR models.
     Models {
@@ -219,17 +269,23 @@ enum Command {
         #[command(subcommand)]
         command: ConfigCommand,
     },
-    /// Record microphone PCM until Ctrl-C.
+    /// Record audio and transcribe it live, until you press Ctrl-C.
+    ///
+    /// On an interactive terminal you can omit --mic and --model to pick them
+    /// from a menu, and omit --consent to confirm interactively. In
+    /// non-interactive or JSON/JSONL mode every selector must be explicit.
     Record {
-        /// Opaque stable microphone ID from `devices list`.
+        /// Microphone device ID from `devices list`. Omit on a terminal to
+        /// choose from a menu.
         #[arg(long)]
-        mic: String,
+        mic: Option<String>,
         /// Optional system-audio device ID from `devices list --source system`.
         #[arg(long)]
         system: Option<String>,
-        /// Installed model selector, or `none` for audio-only recording.
+        /// Installed model selector, or `none` for audio-only recording. Omit
+        /// on a terminal to choose from a menu.
         #[arg(long)]
-        model: String,
+        model: Option<String>,
         /// Consent to install `--model` when it is not available locally.
         /// This never enables updates or other network fallback.
         #[arg(long)]
@@ -344,8 +400,12 @@ enum ConfigCommand {
         #[arg(long)]
         days: Option<u32>,
     },
-    /// Apply retention policy now and return deleted session IDs.
-    ApplyRetention,
+    /// Preview retention candidates; pass --confirm to delete them.
+    ApplyRetention {
+        /// Confirm deletion after reviewing the preview.
+        #[arg(long)]
+        confirm: bool,
+    },
 }
 
 #[derive(Debug, Serialize)]
@@ -364,9 +424,29 @@ struct DoctorReport {
 }
 
 #[derive(Debug, Serialize)]
+struct SetupReport {
+    schema_version: u32,
+    data_root_ready: bool,
+    microphone: String,
+    permission: String,
+    model: String,
+    model_verified: bool,
+    offline_smoke_test: bool,
+    recovered_sessions: usize,
+    /// Structured argv is safe for automation and does not rely on shell
+    /// quoting conventions.
+    next_command_argv: Vec<String>,
+}
+
+#[derive(Debug, Serialize)]
 struct ErrorEnvelope {
     code: &'static str,
     message: String,
+    remedy: &'static str,
+    retryable: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    operation_id: Option<String>,
+    diagnostic_id: String,
 }
 
 fn main() -> ExitCode {
@@ -378,6 +458,10 @@ fn main() -> ExitCode {
             let envelope = ErrorEnvelope {
                 code: error.code(),
                 message: error.to_string(),
+                remedy: error.remedy(),
+                retryable: error.retryable(),
+                operation_id: None,
+                diagnostic_id: uuid::Uuid::new_v4().to_string(),
             };
             match serde_json::to_string(&envelope) {
                 Ok(line) => eprintln!("{line}"),
@@ -404,10 +488,13 @@ fn init_tracing() {
 
 const fn command_name(command: &Command) -> &'static str {
     match command {
+        Command::Setup { .. } => "setup",
         Command::Capabilities => "capabilities",
         Command::Devices { .. } => "devices",
         Command::Permissions { .. } => "permissions",
         Command::Doctor { .. } => "doctor",
+        Command::Recover { .. } => "recover",
+        Command::Transcript { .. } => "transcript",
         Command::Models { .. } => "models",
         Command::Sessions { .. } => "sessions",
         Command::Config { .. } => "config",
@@ -415,22 +502,78 @@ const fn command_name(command: &Command) -> &'static str {
     }
 }
 
-fn execute(
+fn execute<B: AudioBackend>(
     cli: &Cli,
-    backend: &impl AudioBackend,
+    backend: &B,
     output: &mut impl io::Write,
-) -> Result<(), CliError> {
+) -> Result<(), CliError>
+where
+    B::Stream: Send + 'static,
+{
     execute_with_model_manager(cli, backend, output, None)
 }
 
-fn execute_with_model_manager(
+fn execute_with_model_manager<B: AudioBackend>(
     cli: &Cli,
-    backend: &impl AudioBackend,
+    backend: &B,
     output: &mut impl io::Write,
     record_model_manager: Option<&KoeModelManager>,
-) -> Result<(), CliError> {
+) -> Result<(), CliError>
+where
+    B::Stream: Send + 'static,
+{
+    execute_with_runtime(cli, backend, output, record_model_manager, None)
+}
+
+#[cfg(test)]
+fn execute_with_model_manager_and_interrupts<B: AudioBackend>(
+    cli: &Cli,
+    backend: &B,
+    output: &mut impl io::Write,
+    record_model_manager: &KoeModelManager,
+    interrupts: Arc<AtomicUsize>,
+) -> Result<(), CliError>
+where
+    B::Stream: Send + 'static,
+{
+    execute_with_runtime(
+        cli,
+        backend,
+        output,
+        Some(record_model_manager),
+        Some(interrupts),
+    )
+}
+
+#[allow(clippy::too_many_lines)]
+fn execute_with_runtime<B: AudioBackend>(
+    cli: &Cli,
+    backend: &B,
+    output: &mut impl io::Write,
+    record_model_manager: Option<&KoeModelManager>,
+    record_interrupts: Option<Arc<AtomicUsize>>,
+) -> Result<(), CliError>
+where
+    B::Stream: Send + 'static,
+{
     tracing::debug!(command = command_name(&cli.command), "dispatching command");
     match &cli.command {
+        Command::Setup {
+            data_root,
+            mic,
+            model,
+            install_model,
+            network,
+        } => run_setup_command(
+            backend,
+            data_root,
+            mic.as_deref(),
+            model,
+            *install_model,
+            *network,
+            cli.output_format,
+            output,
+        )?,
         Command::Capabilities => {
             let capabilities = backend.capabilities()?;
             render_capabilities(&capabilities, cli.output_format, output)?;
@@ -449,6 +592,29 @@ fn execute_with_model_manager(
         },
         Command::Doctor { data_root } => {
             run_doctor_command(backend, data_root.as_deref(), cli.output_format, output)?;
+        },
+        Command::Recover { data_root } => {
+            let recovered = recover_sessions_and_transcripts(data_root)?;
+            render_collection(&recovered, cli.output_format, output, || {
+                if recovered.is_empty() {
+                    "No interrupted sessions needed recovery.".to_owned()
+                } else {
+                    format!("recovered {} partial session(s)", recovered.len())
+                }
+            })?;
+        },
+        Command::Transcript {
+            session_id,
+            data_root,
+        } => {
+            let transcript = sessions::transcript(data_root, session_id)?;
+            render_collection(&transcript, cli.output_format, output, || {
+                transcript
+                    .iter()
+                    .map(|segment| terminal_safe(segment.text()))
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            })?;
         },
         Command::Models { data_root, command } => {
             run_models_command(data_root, command, cli.output_format, output)?;
@@ -480,11 +646,20 @@ fn execute_with_model_manager(
                     "--accept-model-license is deprecated; use --expect-model-license (this checks a license ID and does not record acceptance)",
                 );
             }
+            let selection = resolve_record_inputs(
+                backend,
+                data_root,
+                mic.as_deref(),
+                system.as_deref(),
+                model.as_deref(),
+                *consent,
+                cli.output_format,
+            )?;
             record(
                 backend,
-                mic,
-                system.as_deref(),
-                model,
+                &selection.microphone_id,
+                selection.system_id.as_deref(),
+                &selection.model,
                 *install_model,
                 *network,
                 expect_model_license
@@ -494,10 +669,11 @@ fn execute_with_model_manager(
                 data_root,
                 *sample_rate,
                 *channels,
-                *consent,
+                selection.consent,
                 cli.output_format,
                 output,
                 record_model_manager,
+                record_interrupts,
             )?;
         },
     }
@@ -692,6 +868,188 @@ fn run_models_command(
     }
 }
 
+/// Idempotently prepares the local-only recording environment. Model network
+/// access is possible only when both install and network flags are explicit.
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+fn run_setup_command<B: AudioBackend>(
+    backend: &B,
+    data_root: &PathBuf,
+    microphone: Option<&str>,
+    model: &str,
+    install_model: bool,
+    network: bool,
+    format: OutputFormat,
+    output: &mut impl io::Write,
+) -> Result<(), CliError>
+where
+    B::Stream: Send + 'static,
+{
+    fs::create_dir_all(data_root)?;
+    let permissions = backend.permissions()?;
+    let microphone_permission = permissions
+        .iter()
+        .find(|capability| capability.source == SourceKind::Microphone)
+        .map_or_else(
+            || "unknown".to_owned(),
+            |capability| format!("{:?}", capability.permission),
+        );
+    if permissions.iter().any(|capability| {
+        capability.source == SourceKind::Microphone
+            && matches!(
+                capability.permission,
+                koe_core::PermissionState::Denied
+                    | koe_core::PermissionState::Restricted
+                    | koe_core::PermissionState::Revoked
+            )
+    }) {
+        return Err(CliError::Audio(AudioError::PermissionDenied));
+    }
+    let devices = backend.enumerate(SourceKind::Microphone)?;
+    let microphone = match microphone {
+        Some(id) if devices.iter().any(|device| device.id == id) => id.to_owned(),
+        Some(id) => {
+            return Err(CliError::SelectionRequired(format!(
+                "microphone `{}` is not available; run `koe devices list` and retry setup",
+                terminal_safe(id)
+            )));
+        },
+        None if devices.len() == 1 => devices[0].id.clone(),
+        None => {
+            return Err(CliError::SelectionRequired(
+                "setup needs --mic when zero or multiple microphones are available".to_owned(),
+            ));
+        },
+    };
+    probe_microphone(backend, &microphone)?;
+
+    // Recovery deliberately runs before touching model state, so a broken or
+    // absent runtime can never prevent durable audio salvage.
+    let recovered = recover_sessions_and_transcripts(data_root)?;
+    if model != "none" {
+        let manager = model_manager(data_root, network)?;
+        let selector = model.parse::<koe_model::ModelSelector>()?;
+        let mut installed_id = manager.installed_id_for(&selector)?;
+        if installed_id.is_none() && install_model {
+            if !network {
+                return Err(CliError::Model(koe_model::ModelError::NetworkDenied));
+            }
+            let installed = run_blocking(install_model_with_progress(
+                &manager,
+                &selector,
+                false,
+                format,
+                tokio_util::sync::CancellationToken::new(),
+                None,
+            ))?;
+            installed_id = Some(installed.id);
+        }
+        let installed_id = installed_id.ok_or(CliError::Model(koe_model::ModelError::NotFound))?;
+        let installed = manager.installed_model(&installed_id)?;
+        let model_verified = !matches!(installed.manifest.verification, Verification::Quarantined);
+        if !model_verified {
+            return Err(CliError::Model(koe_model::ModelError::VerifyFailed));
+        }
+        let _baseline = run_blocking(async {
+            manager
+                .run_benchmark(
+                    &installed_id,
+                    &AsrSessionSettings::default(),
+                    BENCHMARK_AUDIO,
+                    "",
+                )
+                .await
+                .map_err(CliError::Model)
+        })?;
+    }
+
+    let mut config = config::load_or_migrate(data_root)?;
+    config.defaults.microphone_id = Some(microphone.clone());
+    config.defaults.model_selector = Some(model.to_owned());
+    config::save(data_root, &config)?;
+    let next_command_argv = vec![
+        "koe".to_owned(),
+        "record".to_owned(),
+        "--mic".to_owned(),
+        microphone.clone(),
+        "--model".to_owned(),
+        model.to_owned(),
+        "--output".to_owned(),
+        data_root.display().to_string(),
+        "--consent".to_owned(),
+    ];
+    let report = SetupReport {
+        schema_version: 1,
+        data_root_ready: true,
+        microphone,
+        permission: microphone_permission,
+        model: model.to_owned(),
+        model_verified: true,
+        offline_smoke_test: model != "none",
+        recovered_sessions: recovered.len(),
+        next_command_argv,
+    };
+    render(&report, format, output, || {
+        format!(
+            "setup ready\nmicrophone: {} ({})\nmodel: {} (verified={}, smoke-test={})\nrecovered: {}\nnext: {}",
+            terminal_safe(&report.microphone),
+            report.permission,
+            terminal_safe(&report.model),
+            report.model_verified,
+            report.offline_smoke_test,
+            report.recovered_sessions,
+            render_argv(&report.next_command_argv)
+        )
+    })
+}
+
+/// Opens and starts a short capture to distinguish an enumerable device from
+/// one that is actually usable by the current process. The probe is bounded so
+/// a silent input cannot hang setup.
+fn probe_microphone<B: AudioBackend>(
+    backend: &B,
+    microphone: &str,
+) -> Result<(), CliError>
+where
+    B::Stream: Send + 'static,
+{
+    let stream = backend.open(&OpenSource {
+        device_id: microphone.to_owned(),
+        kind: SourceKind::Microphone,
+        preferred_sample_rate: 48_000,
+        preferred_channels: 1,
+        negotiation: koe_audio::FormatNegotiation::Nearest,
+    })?;
+    let (completion, completed) = mpsc::sync_channel(1);
+    thread::spawn(move || {
+        let mut stream = stream;
+        let result = (|| {
+            let (producer, consumer) = frame_ring(4, 16_384)?;
+            stream.start(Box::new(producer))?;
+            // Starting the stream is the permission/device negotiation probe.
+            // A muted but valid device need not deliver non-empty audio.
+            thread::sleep(Duration::from_millis(25));
+            let capture = consumer.take_runtime_failure().map_or_else(
+                || {
+                    if consumer.take_device_lost() {
+                        Err(AudioError::DeviceLost)
+                    } else {
+                        Ok(())
+                    }
+                },
+                |failure| Err(failure.audio_error()),
+            );
+            let stop = stream.stop();
+            capture?;
+            stop
+        })();
+        let _ignored = completion.send(result);
+    });
+    completed
+        .recv_timeout(SETUP_PROBE_TIMEOUT)
+        .map_err(|_| CliError::SetupProbeTimedOut)??;
+    Ok(())
+}
+
 fn run_doctor_command(
     backend: &impl AudioBackend,
     data_root: Option<&Path>,
@@ -789,23 +1147,32 @@ fn run_sessions_command(
             let summaries = sessions::list_sessions(data_root)?;
             render_collection(&summaries, format, output, || {
                 if summaries.is_empty() {
-                    "No sessions.".to_owned()
+                    "No sessions yet. Start one with `koe record`.".to_owned()
                 } else {
-                    summaries
+                    let rows = summaries
                         .iter()
                         .map(|summary| {
-                            format!(
-                                "{}\t{}\t{}\t{}ms\t{} files\ttranscript={}",
-                                summary.session_id,
-                                summary.state,
-                                summary.started_at_ms,
-                                summary.duration_ms,
-                                summary.audio_files,
-                                summary.has_transcript,
-                            )
+                            vec![
+                                terminal_safe(&summary.session_id),
+                                format_timestamp_ms(summary.started_at_ms),
+                                format_duration_ms(summary.duration_ms),
+                                terminal_safe(&summary.state),
+                                summary.audio_files.to_string(),
+                                if summary.has_transcript { "yes" } else { "no" }.to_owned(),
+                            ]
                         })
-                        .collect::<Vec<_>>()
-                        .join("\n")
+                        .collect::<Vec<_>>();
+                    render_table(
+                        &[
+                            "SESSION",
+                            "STARTED",
+                            "DURATION",
+                            "STATE",
+                            "AUDIO",
+                            "TRANSCRIPT",
+                        ],
+                        &rows,
+                    )
                 }
             })
         },
@@ -849,15 +1216,15 @@ fn human_session_detail(detail: &sessions::SessionDetail) -> String {
         u64::try_from(ended.saturating_sub(manifest.started_unix_ms)).unwrap_or(u64::MAX)
     });
     format!(
-        "session: {}\nstate: {}\nstarted: {}\nended: {}\nduration: {}ms\nsource: {}\naudio files: {}\ntranscript: {}\n",
-        detail.session_id,
+        "session:      {}\nstate:        {}\nstarted:      {}\nended:        {}\nduration:     {}\nsource:       {}\naudio files:  {}\ntranscript:   {}",
+        terminal_safe(&detail.session_id),
         format!("{:?}", manifest.state).to_lowercase(),
-        manifest.started_unix_ms,
+        format_timestamp_ms(manifest.started_unix_ms),
         manifest
             .ended_unix_ms
-            .map_or_else(|| "n/a".to_owned(), |ms| ms.to_string()),
-        duration_ms,
-        &manifest.source_device_id,
+            .map_or_else(|| "n/a".to_owned(), format_timestamp_ms),
+        format_duration_ms(duration_ms),
+        terminal_safe(&manifest.source_device_id),
         manifest.audio_files.len(),
         transcript,
     )
@@ -882,17 +1249,23 @@ fn run_config_command(
             config::save(data_root, &config)?;
             render(&config, format, output, || human_config(&config))
         },
-        ConfigCommand::ApplyRetention => {
+        ConfigCommand::ApplyRetention { confirm } => {
             let config = config::load_or_migrate(data_root)?;
-            let deleted = config::apply_retention(data_root, &config)?;
-            render_collection(&deleted, format, output, || {
-                if deleted.is_empty() {
-                    "No sessions deleted by retention policy.".to_owned()
+            let candidates = if *confirm {
+                config::apply_retention(data_root, &config)?
+            } else {
+                config::retention_candidates(data_root, &config)?
+            };
+            render_collection(&candidates, format, output, || {
+                if candidates.is_empty() {
+                    "No sessions eligible under the retention policy.".to_owned()
+                } else if *confirm {
+                    format!("deleted {} session(s)", candidates.len())
                 } else {
                     format!(
-                        "deleted {} session(s): {}",
-                        deleted.len(),
-                        deleted
+                        "{} session(s) eligible; review IDs and rerun with --confirm: {}",
+                        candidates.len(),
+                        candidates
                             .iter()
                             .map(koe_core::SessionId::to_string)
                             .collect::<Vec<_>>()
@@ -935,20 +1308,19 @@ fn render_model_descriptors(
         if descriptors.is_empty() {
             "No models available.".to_owned()
         } else {
-            descriptors
+            let rows = descriptors
                 .iter()
                 .map(|descriptor| {
-                    format!(
-                        "{}\t{}\t{}\t{} ({})",
-                        descriptor.alias.0,
-                        descriptor.id.0,
-                        descriptor.version.0,
-                        descriptor.variant,
-                        descriptor.provider,
-                    )
+                    vec![
+                        terminal_safe(&descriptor.alias.0),
+                        terminal_safe(&descriptor.version.0),
+                        terminal_safe(&descriptor.variant),
+                        terminal_safe(&descriptor.provider),
+                        terminal_safe(&descriptor.id.0),
+                    ]
                 })
-                .collect::<Vec<_>>()
-                .join("\n")
+                .collect::<Vec<_>>();
+            render_table(&["MODEL", "VERSION", "VARIANT", "PROVIDER", "ID"], &rows)
         }
     })
 }
@@ -1413,11 +1785,12 @@ fn prepare_asr_with_manager(
     tracing::info!(model = %selector.key(), "ASR session ready");
     Ok((
         session,
-        TranscriptModel {
-            id: loaded.descriptor.id.0,
-            version: loaded.descriptor.version.0,
-            variant: loaded.descriptor.variant,
-        },
+        TranscriptModel::new(
+            loaded.descriptor.id.0,
+            loaded.descriptor.version.0,
+            loaded.descriptor.variant,
+        )
+        .map_err(koe_transcript::TranscriptError::from)?,
     ))
 }
 
@@ -1454,23 +1827,23 @@ fn render_devices(
         if values.is_empty() {
             "No devices available.".to_owned()
         } else {
-            values
+            let rows = values
                 .iter()
                 .map(|value| {
                     let persistence = if value.persistent {
                         "persistent"
                     } else {
-                        "reselect-after-restart"
+                        "re-select after restart"
                     };
-                    format!(
-                        "{}\t{}\t{}\t{persistence}",
-                        terminal_safe(&value.id),
+                    vec![
                         terminal_safe(&value.display_name),
-                        terminal_safe(&value.backend)
-                    )
+                        terminal_safe(&value.id),
+                        terminal_safe(&value.backend),
+                        persistence.to_owned(),
+                    ]
                 })
-                .collect::<Vec<_>>()
-                .join("\n")
+                .collect::<Vec<_>>();
+            render_table(&["NAME", "ID", "BACKEND", "PERSISTENCE"], &rows)
         }
     })
 }
@@ -1491,6 +1864,412 @@ fn render_collection<T: Serialize>(
     render(values, format, output, human)
 }
 
+/// Renders left-aligned, header-labeled columns for human output. Callers pass
+/// already-escaped cells; this only pads and joins them.
+fn render_table(
+    headers: &[&str],
+    rows: &[Vec<String>],
+) -> String {
+    let mut widths: Vec<usize> = headers.iter().map(|header| header.width()).collect();
+    for row in rows {
+        for (index, cell) in row.iter().enumerate() {
+            if let Some(width) = widths.get_mut(index) {
+                *width = (*width).max(cell.as_str().width());
+            }
+        }
+    }
+    let format_row = |cells: &[String]| -> String {
+        cells
+            .iter()
+            .enumerate()
+            .map(|(index, cell)| {
+                let width = widths.get(index).copied().unwrap_or(0);
+                let padding = width.saturating_sub(cell.as_str().width());
+                if index + 1 == cells.len() {
+                    cell.clone()
+                } else {
+                    format!("{cell}{}", " ".repeat(padding + 2))
+                }
+            })
+            .collect::<String>()
+    };
+    let header_cells: Vec<String> = headers.iter().map(|header| (*header).to_owned()).collect();
+    let underline_cells: Vec<String> = widths.iter().map(|width| "-".repeat(*width)).collect();
+    let mut lines = vec![format_row(&header_cells), format_row(&underline_cells)];
+    for row in rows {
+        lines.push(format_row(row));
+    }
+    lines.join("\n")
+}
+
+/// Formats an epoch-millisecond timestamp as a human-readable UTC datetime.
+#[allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_possible_wrap,
+    clippy::cast_sign_loss
+)]
+fn format_timestamp_ms(unix_ms: u128) -> String {
+    let total_seconds = (unix_ms / 1_000) as i64;
+    let days = total_seconds.div_euclid(86_400);
+    let seconds_of_day = total_seconds.rem_euclid(86_400);
+    let (hour, minute, second) = (
+        seconds_of_day / 3_600,
+        (seconds_of_day % 3_600) / 60,
+        seconds_of_day % 60,
+    );
+    let (year, month, day) = civil_from_days(days);
+    format!("{year:04}-{month:02}-{day:02} {hour:02}:{minute:02}:{second:02} UTC")
+}
+
+/// Converts days since the Unix epoch into a proleptic Gregorian calendar date
+/// using Howard Hinnant's algorithm.
+#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+const fn civil_from_days(days: i64) -> (i64, u32, u32) {
+    let z = days + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let day_of_era = z - era * 146_097;
+    let year_of_era =
+        (day_of_era - day_of_era / 1_460 + day_of_era / 36_524 - day_of_era / 146_096) / 365;
+    let year = year_of_era + era * 400;
+    let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
+    let month_position = (5 * day_of_year + 2) / 153;
+    let day = (day_of_year - (153 * month_position + 2) / 5 + 1) as u32;
+    let month = if month_position < 10 {
+        month_position + 3
+    } else {
+        month_position - 9
+    } as u32;
+    (if month <= 2 { year + 1 } else { year }, month, day)
+}
+
+/// Formats a millisecond duration as a compact, human-friendly string.
+fn format_duration_ms(duration_ms: u64) -> String {
+    if duration_ms < 1_000 {
+        return format!("{duration_ms}ms");
+    }
+    let total_seconds = duration_ms / 1_000;
+    let (hours, minutes, seconds) = (
+        total_seconds / 3_600,
+        (total_seconds % 3_600) / 60,
+        total_seconds % 60,
+    );
+    if hours > 0 {
+        format!("{hours}h {minutes}m {seconds}s")
+    } else if minutes > 0 {
+        format!("{minutes}m {seconds}s")
+    } else {
+        format!("{seconds}s")
+    }
+}
+
+/// True only when interactive prompts are safe: human output on a real TTY for
+/// both stdin and stdout. JSON/JSONL and any redirected stream stay silent so a
+/// machine invocation is never blocked waiting on input.
+fn stdio_is_interactive(format: OutputFormat) -> bool {
+    matches!(format, OutputFormat::Human) && io::stdin().is_terminal() && io::stdout().is_terminal()
+}
+
+/// Presents a numbered menu on stderr and returns the chosen zero-based index.
+fn prompt_choice(
+    prompt: &str,
+    options: &[String],
+    default_index: Option<usize>,
+) -> Result<usize, CliError> {
+    loop {
+        eprintln!("{prompt}:");
+        for (index, option) in options.iter().enumerate() {
+            let marker = if Some(index) == default_index {
+                "  (current default)"
+            } else {
+                ""
+            };
+            eprintln!("  {}) {option}{marker}", index + 1);
+        }
+        match default_index {
+            Some(index) => eprint!(
+                "Enter a number [1-{}], or press Enter for {}: ",
+                options.len(),
+                index + 1
+            ),
+            None => eprint!("Enter a number [1-{}]: ", options.len()),
+        }
+        let _ignored = io::stderr().flush();
+        let mut line = String::new();
+        if io::stdin().read_line(&mut line)? == 0 {
+            if let Some(index) = default_index {
+                return Ok(index);
+            }
+            return Err(CliError::SelectionRequired(
+                "no selection was provided".to_owned(),
+            ));
+        }
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            if let Some(index) = default_index {
+                return Ok(index);
+            }
+            continue;
+        }
+        if let Ok(number) = trimmed.parse::<usize>()
+            && (1..=options.len()).contains(&number)
+        {
+            return Ok(number - 1);
+        }
+        eprintln!("Please enter a number between 1 and {}.", options.len());
+    }
+}
+
+/// Asks a yes/no question on stderr, honoring a default for empty input.
+fn prompt_yes_no(
+    prompt: &str,
+    default: bool,
+) -> Result<bool, CliError> {
+    let hint = if default { "[Y/n]" } else { "[y/N]" };
+    loop {
+        eprint!("{prompt} {hint}: ");
+        let _ignored = io::stderr().flush();
+        let mut line = String::new();
+        if io::stdin().read_line(&mut line)? == 0 {
+            return Ok(default);
+        }
+        match line.trim().to_ascii_lowercase().as_str() {
+            "" => return Ok(default),
+            "y" | "yes" => return Ok(true),
+            "n" | "no" => return Ok(false),
+            _ => eprintln!("Please answer 'y' or 'n'."),
+        }
+    }
+}
+
+/// Fully-resolved record inputs after applying flags, stored defaults, and any
+/// interactive selection.
+struct RecordSelection {
+    microphone_id: String,
+    system_id: Option<String>,
+    model: String,
+    consent: bool,
+}
+
+/// Resolves the microphone, optional system device, model, and consent for a
+/// `record` invocation. Interactive menus and confirmation only run on a TTY in
+/// human mode; otherwise the same explicit flags and clear errors are required.
+#[allow(clippy::too_many_lines)]
+fn resolve_record_inputs(
+    backend: &impl AudioBackend,
+    data_root: &Path,
+    mic: Option<&str>,
+    system: Option<&str>,
+    model: Option<&str>,
+    consent: bool,
+    format: OutputFormat,
+) -> Result<RecordSelection, CliError> {
+    let interactive = stdio_is_interactive(format);
+    let config = config::load_or_migrate(data_root)?;
+    let defaults = config.defaults.clone();
+
+    let mut selection_changed = false;
+
+    // Microphone (required).
+    let microphone_id = if let Some(mic) = mic {
+        mic.to_owned()
+    } else if interactive {
+        let devices = backend.enumerate(SourceKind::Microphone)?;
+        if devices.is_empty() {
+            return Err(CliError::SelectionRequired(
+                "no microphones were found; connect one and try again".to_owned(),
+            ));
+        }
+        let default_index = defaults
+            .microphone_id
+            .as_deref()
+            .and_then(|id| devices.iter().position(|device| device.id == id));
+        let labels: Vec<String> = devices
+            .iter()
+            .map(|device| {
+                format!(
+                    "{}  [{}]",
+                    terminal_safe(&device.display_name),
+                    terminal_safe(&device.backend)
+                )
+            })
+            .collect();
+        let choice = prompt_choice("Select a microphone", &labels, default_index)?;
+        let chosen = devices[choice].id.clone();
+        selection_changed |= defaults.microphone_id.as_deref() != Some(chosen.as_str());
+        chosen
+    } else {
+        return Err(CliError::SelectionRequired(
+            "--mic is required; run `koe devices list` to find an ID, or run in a terminal to pick from a menu".to_owned(),
+        ));
+    };
+
+    // System audio (optional).
+    let system_id = if let Some(system) = system {
+        Some(system.to_owned())
+    } else if interactive {
+        let devices = backend.enumerate(SourceKind::System)?;
+        if devices.is_empty() {
+            None
+        } else {
+            let mut labels: Vec<String> = vec!["No system audio (microphone only)".to_owned()];
+            labels.extend(devices.iter().map(|device| {
+                format!(
+                    "{}  [{}]",
+                    terminal_safe(&device.display_name),
+                    terminal_safe(&device.backend)
+                )
+            }));
+            let default_index = defaults
+                .system_audio_id
+                .as_deref()
+                .and_then(|id| devices.iter().position(|device| device.id == id))
+                .map_or(0, |index| index + 1);
+            let choice = prompt_choice("Also capture system audio?", &labels, Some(default_index))?;
+            let chosen = if choice == 0 {
+                None
+            } else {
+                Some(devices[choice - 1].id.clone())
+            };
+            selection_changed |= defaults.system_audio_id.as_deref() != chosen.as_deref();
+            chosen
+        }
+    } else {
+        None
+    };
+
+    // Model (required; `none` means audio-only).
+    let model = if let Some(model) = model {
+        model.to_owned()
+    } else if interactive {
+        let manager = model_manager(&data_root.to_path_buf(), false)?;
+        let installed = run_blocking(async {
+            manager
+                .list(koe_model::ModelScope::Installed)
+                .await
+                .map_err(CliError::Model)
+        })
+        .unwrap_or_default();
+        let mut labels: Vec<String> = installed
+            .iter()
+            .map(|descriptor| {
+                format!(
+                    "{} ({})",
+                    terminal_safe(&descriptor.alias.0),
+                    terminal_safe(&descriptor.version.0)
+                )
+            })
+            .collect();
+        labels.push("No model — record audio only".to_owned());
+        let default_index = defaults
+            .model_selector
+            .as_deref()
+            .and_then(|selector| {
+                installed
+                    .iter()
+                    .position(|descriptor| descriptor.alias.0 == selector)
+            })
+            .unwrap_or(installed.len());
+        if installed.is_empty() {
+            report_diagnostic(
+                format,
+                "no_models_installed",
+                "no models are installed; choose audio-only, or install one with `koe models install`",
+            );
+        }
+        let choice = prompt_choice("Select a transcription model", &labels, Some(default_index))?;
+        let chosen = if choice == installed.len() {
+            "none".to_owned()
+        } else {
+            installed[choice].alias.0.clone()
+        };
+        selection_changed |= defaults.model_selector.as_deref() != Some(chosen.as_str());
+        chosen
+    } else {
+        return Err(CliError::SelectionRequired(
+            "--model is required (use `none` for audio-only); run `koe models list --installed` to see options, or run in a terminal to pick from a menu".to_owned(),
+        ));
+    };
+
+    // Offer to remember interactive picks for next time.
+    if interactive && selection_changed && prompt_yes_no("Save these as your defaults?", false)? {
+        let mut updated = config;
+        updated.defaults.microphone_id = Some(microphone_id.clone());
+        updated.defaults.system_audio_id.clone_from(&system_id);
+        updated.defaults.model_selector = Some(model.clone());
+        match config::save(data_root, &updated) {
+            Ok(()) => report_diagnostic(
+                format,
+                "defaults_saved",
+                "saved your selections as defaults",
+            ),
+            Err(error) => report_diagnostic(
+                format,
+                "defaults_save_failed",
+                &format!("could not save defaults: {error}"),
+            ),
+        }
+    }
+
+    // Consent.
+    let consent = if consent {
+        true
+    } else if interactive {
+        confirm_recording_interactively(&microphone_id, system_id.as_deref(), &model, data_root)?
+    } else {
+        return Err(CliError::ConsentRequired);
+    };
+    if !consent {
+        return Err(CliError::ConsentRequired);
+    }
+
+    Ok(RecordSelection {
+        microphone_id,
+        system_id,
+        model,
+        consent,
+    })
+}
+
+/// Shows the resolved recording plan and asks the user to confirm.
+fn confirm_recording_interactively(
+    microphone_id: &str,
+    system_id: Option<&str>,
+    model: &str,
+    data_root: &Path,
+) -> Result<bool, CliError> {
+    let transcription = if model == "none" {
+        "audio only — no transcription"
+    } else {
+        "on-device transcription"
+    };
+    eprintln!();
+    eprintln!("Ready to record:");
+    eprintln!("  microphone:   {}", terminal_safe(microphone_id));
+    eprintln!(
+        "  system audio: {}",
+        system_id.map_or_else(|| "none".to_owned(), terminal_safe)
+    );
+    eprintln!("  model:        {} ({transcription})", terminal_safe(model));
+    eprintln!(
+        "  saved to:     {}",
+        terminal_safe(&data_root.display().to_string())
+    );
+    let retention = config::load_or_migrate(data_root).map_or_else(
+        |_| "until explicitly deleted".to_owned(),
+        |config| retention_label(config.retention),
+    );
+    eprintln!("  privacy:      stays on this machine; retained {retention}");
+    eprintln!();
+    prompt_yes_no("Start recording now?", true)
+}
+
+fn retention_label(policy: config::RetentionPolicy) -> String {
+    match policy {
+        config::RetentionPolicy::Forever => "until explicitly deleted".to_owned(),
+        config::RetentionPolicy::Days(days) => format!("for {days} day(s) after completion"),
+    }
+}
+
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 fn record<B: AudioBackend>(
     backend: &B,
@@ -1508,12 +2287,13 @@ fn record<B: AudioBackend>(
     format: OutputFormat,
     output: &mut impl io::Write,
     model_manager_override: Option<&KoeModelManager>,
+    interrupts_override: Option<Arc<AtomicUsize>>,
 ) -> Result<(), CliError> {
     if !consent {
         return Err(CliError::ConsentRequired);
     }
     let asr_enabled = model != "none";
-    let interrupts = Arc::new(AtomicUsize::new(0));
+    let interrupts = interrupts_override.unwrap_or_else(|| Arc::new(AtomicUsize::new(0)));
     let interrupt_phase = Arc::new(AtomicU8::new(PHASE_PREPARING));
     let install_cancel = tokio_util::sync::CancellationToken::new();
     let interrupt_handler = Arc::clone(&interrupts);
@@ -1544,6 +2324,9 @@ fn record<B: AudioBackend>(
         })
         .map_err(|_| CliError::Signal)?;
     }
+    // Recovery is independent of model availability and must happen before a
+    // consented install/load can fail.
+    report_recovered_sessions(data_root, format)?;
     // A consented install, model load and session creation all finish before
     // capture. Network permission is scoped to the missing-model install;
     // inference remains under the manager's frozen `Denied` policy.
@@ -1558,7 +2341,6 @@ fn record<B: AudioBackend>(
         &install_cancel,
         model_manager_override,
     )?;
-    report_recovered_sessions(data_root, format)?;
     let mut stream = backend.open(&OpenSource {
         device_id: microphone_id.to_owned(),
         kind: SourceKind::Microphone,
@@ -1662,6 +2444,10 @@ fn record<B: AudioBackend>(
     };
     let safe_microphone_id = terminal_safe(microphone_id);
     let safe_model = terminal_safe(model);
+    let retention = config::load_or_migrate(data_root).map_or_else(
+        |_| "until explicitly deleted".to_owned(),
+        |config| retention_label(config.retention),
+    );
     let asr_note = if asr_enabled {
         "offline ASR; transcript saved to the session transcript dir"
     } else {
@@ -1669,17 +2455,19 @@ fn record<B: AudioBackend>(
     };
     let confirmation = if system_id.is_some() {
         format!(
-            "confirmed recording: microphone={}, system={}, scope=system-wide, destination={}, retention=until explicitly deleted, model={} ({asr_note}), sharing=none",
+            "confirmed recording: microphone={}, system={}, scope=system-wide, destination={}, retention={}, model={} ({asr_note}), sharing=none",
             safe_microphone_id,
             terminal_safe(system_id.unwrap_or("none")),
             terminal_safe(&data_root.display().to_string()),
+            retention,
             safe_model,
         )
     } else {
         format!(
-            "confirmed recording: microphone={}, system=none, destination={}, retention=until explicitly deleted, model={} ({asr_note}), sharing=none",
+            "confirmed recording: microphone={}, system=none, destination={}, retention={}, model={} ({asr_note}), sharing=none",
             safe_microphone_id,
             terminal_safe(&data_root.display().to_string()),
+            retention,
             safe_model,
         )
     };
@@ -2163,7 +2951,32 @@ fn record<B: AudioBackend>(
     if let Some(start_ns) = system_loss_started {
         record_device_loss_gap(&coordinator, TrackKind::System, start_ns, ended_ns)?;
     }
-    let terminal = if interrupts.load(Ordering::Relaxed) >= 2 {
+    let cancelled = interrupts.load(Ordering::Relaxed) >= 2;
+    if let Some(asr) = asr.take() {
+        // Drains remaining chunks, runs the model finalization and
+        // materializes `events.jsonl` -> `final.json`/`final.txt`.
+        let dropped_chunks = match asr.finish() {
+            Ok(dropped_chunks) => dropped_chunks,
+            Err(error) => {
+                // The durable WAV remains available, but a session must not be
+                // advertised as completed when its requested transcript could
+                // not be materialized. Recovery/retranscription can retry it.
+                let _failed = coordinator.fail(error.code())?;
+                task.shutdown()?;
+                return Err(error);
+            },
+        };
+        if dropped_chunks != 0 {
+            report_diagnostic(
+                format,
+                "asr_overrun",
+                &format!(
+                    "live transcription skipped {dropped_chunks} chunk(s) to protect durable recording; retranscribe from the saved WAV"
+                ),
+            );
+        }
+    }
+    let terminal = if cancelled {
         tracing::info!("recording cancelled by interrupt");
         coordinator.cancel()?
     } else {
@@ -2171,11 +2984,6 @@ fn record<B: AudioBackend>(
     };
     task.shutdown()?;
     tracing::info!(state = ?terminal.state, "recording finished");
-    if let Some(asr) = asr.take() {
-        // Drains remaining chunks, runs the model finalization and
-        // materializes `events.jsonl` -> `final.json`/`final.txt`.
-        asr.finish()?;
-    }
     render(&terminal, format, output, || {
         format!(
             "session: {}\nstate: {:?}",
@@ -2399,6 +3207,8 @@ enum AsrCommand {
 struct AsrBridge {
     sender: std::sync::mpsc::SyncSender<AsrCommand>,
     worker: Option<std::thread::JoinHandle<Result<(), CliError>>>,
+    dropped_chunks: Arc<AtomicUsize>,
+    cancellation: Arc<AtomicBool>,
 }
 
 impl AsrBridge {
@@ -2408,12 +3218,34 @@ impl AsrBridge {
         directory: PathBuf,
         format: OutputFormat,
     ) -> Self {
-        let (sender, receiver) = std::sync::mpsc::sync_channel(64);
-        let worker =
-            std::thread::spawn(move || asr_worker(session, &model, &directory, receiver, format));
+        Self::spawn_with_capacity(session, model, directory, format, 64)
+    }
+
+    fn spawn_with_capacity(
+        session: Box<dyn koe_model::StreamingAsrSession>,
+        model: TranscriptModel,
+        directory: PathBuf,
+        format: OutputFormat,
+        capacity: usize,
+    ) -> Self {
+        let (sender, receiver) = std::sync::mpsc::sync_channel(capacity);
+        let cancellation = Arc::new(AtomicBool::new(false));
+        let worker_cancellation = Arc::clone(&cancellation);
+        let worker = std::thread::spawn(move || {
+            asr_worker(
+                session,
+                &model,
+                &directory,
+                &receiver,
+                format,
+                &worker_cancellation,
+            )
+        });
         Self {
             sender,
             worker: Some(worker),
+            dropped_chunks: Arc::new(AtomicUsize::new(0)),
+            cancellation,
         }
     }
 
@@ -2422,23 +3254,65 @@ impl AsrBridge {
         samples: Vec<i16>,
         start_us: u64,
     ) -> Result<(), CliError> {
-        self.sender
-            .send(AsrCommand::Chunk { samples, start_us })
-            .map_err(|_| CliError::Model(koe_model::ModelError::Internal))
+        match self
+            .sender
+            .try_send(AsrCommand::Chunk { samples, start_us })
+        {
+            Ok(()) => Ok(()),
+            // Persisted WAV is authoritative. Under inference overload we
+            // drop live-ASR work instead of ever stalling the capture path;
+            // the durable audio remains available for later transcription.
+            Err(std::sync::mpsc::TrySendError::Full(_)) => {
+                self.dropped_chunks.fetch_add(1, Ordering::Relaxed);
+                Ok(())
+            },
+            Err(std::sync::mpsc::TrySendError::Disconnected(_)) => {
+                Err(CliError::Model(koe_model::ModelError::Internal))
+            },
+        }
     }
 
     /// Stops the feed and waits for the materialized transcript.
-    fn finish(mut self) -> Result<(), CliError> {
-        self.sender
-            .send(AsrCommand::Stop)
-            .map_err(|_| CliError::Model(koe_model::ModelError::Internal))?;
+    fn finish(self) -> Result<usize, CliError> {
+        self.finish_with_timeout(Duration::from_secs(5))
+    }
+
+    fn finish_with_timeout(
+        mut self,
+        timeout: Duration,
+    ) -> Result<usize, CliError> {
+        let dropped = self.dropped_chunks.load(Ordering::Relaxed);
+        let deadline = Instant::now() + timeout;
+        let mut stop = AsrCommand::Stop;
+        loop {
+            match self.sender.try_send(stop) {
+                Ok(()) => break,
+                Err(std::sync::mpsc::TrySendError::Disconnected(_)) => {
+                    return Err(CliError::Model(koe_model::ModelError::Internal));
+                },
+                Err(std::sync::mpsc::TrySendError::Full(command)) => {
+                    stop = command;
+                    if Instant::now() >= deadline {
+                        self.cancellation.store(true, Ordering::Release);
+                        return Err(CliError::AsrShutdownTimedOut);
+                    }
+                    thread::sleep(Duration::from_millis(2));
+                },
+            }
+        }
         if let Some(worker) = self.worker.take() {
+            while !worker.is_finished() {
+                if Instant::now() >= deadline {
+                    self.cancellation.store(true, Ordering::Release);
+                    return Err(CliError::AsrShutdownTimedOut);
+                }
+                thread::sleep(Duration::from_millis(2));
+            }
             worker
                 .join()
-                .map_err(|_| CliError::Model(koe_model::ModelError::Internal))?
-        } else {
-            Ok(())
+                .map_err(|_| CliError::Model(koe_model::ModelError::Internal))??;
         }
+        Ok(dropped)
     }
 }
 
@@ -2446,8 +3320,9 @@ fn asr_worker(
     session: Box<dyn koe_model::StreamingAsrSession>,
     model: &TranscriptModel,
     directory: &Path,
-    receiver: std::sync::mpsc::Receiver<AsrCommand>,
+    receiver: &std::sync::mpsc::Receiver<AsrCommand>,
     format: OutputFormat,
+    cancellation: &AtomicBool,
 ) -> Result<(), CliError> {
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -2459,7 +3334,15 @@ fn asr_worker(
         append_asr_event(&mut store, model, event)
     };
     let processing = (|| -> Result<(), CliError> {
-        for command in receiver {
+        loop {
+            if cancellation.load(Ordering::Acquire) {
+                return Err(CliError::AsrShutdownTimedOut);
+            }
+            let command = match receiver.recv_timeout(Duration::from_millis(25)) {
+                Ok(command) => command,
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+            };
             match command {
                 AsrCommand::Chunk { samples, start_us } => {
                     runtime.block_on(session.append(koe_model::Pcm16Mono16k {
@@ -2505,17 +3388,18 @@ fn append_asr_event(
     if event.text.is_empty() {
         return Ok(());
     }
-    store.append(TranscriptSegment {
-        schema_version: 1,
-        segment_id: SegmentId::from(event.segment_id),
-        source: "mixed".to_owned(),
-        start_ms: event.start_us / 1_000,
-        end_ms: event.end_us / 1_000,
-        text: event.text.clone(),
-        is_final: event.is_final,
-        model: Some(model.clone()),
-        audio_discontinuities: Vec::new(),
-    })?;
+    let segment = TranscriptSegment::new(
+        SegmentId::from(event.segment_id),
+        "mixed",
+        event.start_us / 1_000,
+        event.end_us / 1_000,
+        event.text.clone(),
+        event.is_final.into(),
+        Some(model.clone()),
+        Vec::new(),
+    )
+    .map_err(koe_transcript::TranscriptError::from)?;
+    store.append(segment)?;
     store.checkpoint().map_err(CliError::from)
 }
 
@@ -2574,26 +3458,28 @@ fn take_available_mix(
     let count = usize::try_from(horizon - cursor)
         .unwrap_or(usize::MAX)
         .min(16_384);
-    let microphone_chunk = (0..count)
-        .map(|offset| microphone.sample_at(cursor.saturating_add(offset as u64)))
+    // Mix directly into one owned buffer. The previous path allocated two
+    // temporary source vectors plus an output vector and then copied it again.
+    let mixed = (0..count)
+        .map(|offset| {
+            let sample = cursor.saturating_add(offset as u64);
+            microphone
+                .sample_at(sample)
+                .saturating_add(system.sample_at(sample))
+        })
         .collect::<Vec<_>>();
-    let system_chunk = (0..count)
-        .map(|offset| system.sample_at(cursor.saturating_add(offset as u64)))
-        .collect::<Vec<_>>();
-    let mut mixed = vec![0_i16; count];
-    let produced = mix_canonical(&microphone_chunk, &system_chunk, &mut mixed);
     let start_us = cursor.saturating_mul(1_000_000) / CANONICAL_SAMPLE_RATE;
     cursor = cursor.saturating_add(count as u64);
     microphone.consume_before(cursor);
     system.consume_before(cursor);
-    Some((mixed[..produced].to_vec(), start_us))
+    Some((mixed, start_us))
 }
 
 fn report_recovered_sessions(
     data_root: &Path,
     format: OutputFormat,
 ) -> Result<(), CliError> {
-    let recovered = recover_sessions(data_root)?;
+    let recovered = recover_sessions_and_transcripts(data_root)?;
     for manifest in recovered {
         report_diagnostic(
             format,
@@ -2606,6 +3492,37 @@ fn report_recovered_sessions(
         );
     }
     Ok(())
+}
+
+/// Reconciles recording checkpoints and then lets the transcript store remove
+/// only an incomplete trailing JSONL record. Complete malformed records remain
+/// an error and original WAVs are preserved by recording recovery artifacts.
+fn recover_sessions_and_transcripts(
+    data_root: &Path
+) -> Result<Vec<koe_recording::SessionManifest>, CliError> {
+    let recovered = recover_sessions(data_root)?;
+    let sessions_root = data_root.join("sessions");
+    let entries = match fs::read_dir(&sessions_root) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(recovered),
+        Err(error) => return Err(error.into()),
+    };
+    // Transcript repair is intentionally independent from WAV recovery.
+    // This makes retries compose: a prior run may already have repaired the
+    // recording checkpoint while leaving a torn transcript tail behind.
+    for entry in entries {
+        let entry = entry?;
+        if !entry.file_type()?.is_dir()
+            || SessionId::parse(&entry.file_name().to_string_lossy()).is_err()
+        {
+            continue;
+        }
+        let transcript_dir = entry.path().join("transcript");
+        if transcript_dir.is_dir() {
+            drop(TranscriptStore::open(transcript_dir)?);
+        }
+    }
+    Ok(recovered)
 }
 
 fn render<T: Serialize + ?Sized>(
@@ -2640,6 +3557,18 @@ fn terminal_safe(value: &str) -> String {
         }
     }
     escaped
+}
+
+/// Produces a copy/paste-safe POSIX-shell rendering for human output. Machine
+/// output uses `next_command_argv` directly and never has to parse this string.
+fn render_argv(argv: &[String]) -> String {
+    argv.iter()
+        .map(|argument| {
+            let safe = terminal_safe(argument);
+            format!("'{}'", safe.replace('\'', "'\\''"))
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 const fn is_default_ignorable(character: char) -> bool {
@@ -2685,10 +3614,16 @@ enum CliError {
     Asr(#[from] koe_model::AsrError),
     #[error("failed to install Ctrl-C handler")]
     Signal,
+    #[error("ASR finalization timed out; saved audio can be retranscribed")]
+    AsrShutdownTimedOut,
+    #[error("microphone setup probe timed out")]
+    SetupProbeTimedOut,
     #[error(
         "fresh recording consent is required; review the sources and destination, then pass --consent"
     )]
     ConsentRequired,
+    #[error("{0}")]
+    SelectionRequired(String),
     #[error("{0}")]
     Config(#[from] config::ConfigError),
     #[error("{0}")]
@@ -2706,10 +3641,51 @@ impl CliError {
             Self::Asr(error) => error.code(),
             Self::Io(_) | Self::Json(_) => "KOE-OUTPUT-FAILED",
             Self::Signal => "KOE-SIGNAL-HANDLER-FAILED",
+            Self::AsrShutdownTimedOut => "KOE-ASR-FINALIZE-TIMEOUT",
+            Self::SetupProbeTimedOut => "KOE-AUDIO-PROBE-TIMEOUT",
             Self::ConsentRequired => "KOE-POLICY-CONSENT-REQUIRED",
+            Self::SelectionRequired(_) => "KOE-POLICY-SELECTION-REQUIRED",
             Self::Config(error) => error.code(),
             Self::Session(error) => error.code(),
         }
+    }
+
+    const fn remedy(&self) -> &'static str {
+        match self {
+            Self::ConsentRequired => "review the recording plan and pass --consent",
+            Self::SelectionRequired(_) => "select an available device/model and retry",
+            Self::Model(koe_model::ModelError::NetworkDenied) => {
+                "retry the explicit model install with --network"
+            },
+            Self::Model(
+                koe_model::ModelError::OfflineArtifactMissing | koe_model::ModelError::NotFound,
+            ) => "install the model explicitly, then retry offline",
+            Self::Audio(_) => "run `koe doctor` and `koe permissions status`, then retry",
+            Self::Session(sessions::SessionError::NotFound(_)) => {
+                "run `koe sessions list` and use an existing session ID"
+            },
+            Self::Recording(_) => "run `koe recover --data-root <path>` before retrying",
+            Self::AsrShutdownTimedOut => {
+                "retry transcription from the saved WAV; the recording is preserved"
+            },
+            Self::SetupProbeTimedOut => {
+                "disconnect the stalled device, run `koe doctor`, and retry setup"
+            },
+            _ => "inspect the stable error code and retry after correcting the reported condition",
+        }
+    }
+
+    const fn retryable(&self) -> bool {
+        matches!(
+            self,
+            Self::Audio(_)
+                | Self::Io(_)
+                | Self::App(_)
+                | Self::Recording(_)
+                | Self::AsrShutdownTimedOut
+                | Self::SetupProbeTimedOut
+                | Self::Model(koe_model::ModelError::Busy | koe_model::ModelError::Conflict)
+        )
     }
 }
 
@@ -2717,7 +3693,11 @@ impl CliError {
 mod tests {
     use std::{
         fs,
-        sync::atomic::{AtomicUsize, Ordering},
+        sync::{
+            Arc,
+            atomic::{AtomicBool, AtomicUsize, Ordering},
+        },
+        time::{Duration, Instant},
     };
 
     use clap::Parser;
@@ -2731,11 +3711,12 @@ mod tests {
     use tempfile::TempDir;
 
     use super::{
-        Cli, OutputFormat, TimelineMapper, TimelineTrack, all_requested_sources_active,
-        capture_stderr, execute, execute_with_model_manager, model_progress_line,
-        no_capture_source_active, prepare_asr, prepare_asr_with_manager, render_collection,
-        report_recovered_sessions, reset_source_pipeline, run_blocking, take_available_mix,
-        terminal_safe,
+        Cli, OutputFormat, TimelineMapper, TimelineTrack, TranscriptSegment,
+        all_requested_sources_active, capture_stderr, execute, execute_with_model_manager,
+        execute_with_model_manager_and_interrupts, model_progress_line, no_capture_source_active,
+        prepare_asr, prepare_asr_with_manager, render_argv, render_collection, render_table,
+        report_recovered_sessions, reset_source_pipeline, resolve_record_inputs, run_blocking,
+        take_available_mix, terminal_safe,
     };
 
     fn adapter_outbound_attempts(manager: &KoeModelManager) -> usize {
@@ -2866,6 +3847,48 @@ mod tests {
     }
 
     #[test]
+    fn machine_record_requires_explicit_selectors_even_with_saved_defaults() {
+        let root = TempDir::new().expect("temp");
+        let mut stored = super::config::Config::default();
+        stored.defaults.microphone_id = Some("saved-mic".to_owned());
+        stored.defaults.system_audio_id = Some("saved-system".to_owned());
+        stored.defaults.model_selector = Some("saved-model".to_owned());
+        super::config::save(root.path(), &stored).expect("save defaults");
+        let backend = CountingUnsupportedBackend::default();
+
+        for arguments in [vec!["--model", "none"], vec!["--mic", "explicit-mic"]] {
+            let mut command = vec![
+                "koe",
+                "--output-format",
+                "json",
+                "record",
+                "--output",
+                root.path().to_str().expect("UTF-8 root"),
+                "--consent",
+            ];
+            command.extend(arguments);
+            let cli = Cli::try_parse_from(command).expect("record CLI");
+            let error = execute(&cli, &backend, &mut Vec::new()).expect_err("explicit selector");
+            assert_eq!(error.code(), "KOE-POLICY-SELECTION-REQUIRED");
+        }
+        assert_eq!(backend.opens.load(Ordering::SeqCst), 0);
+
+        let selection = resolve_record_inputs(
+            &UnsupportedBackend,
+            root.path(),
+            Some("explicit-mic"),
+            None,
+            Some("none"),
+            true,
+            OutputFormat::Json,
+        )
+        .expect("explicit machine selection");
+        assert_eq!(selection.microphone_id, "explicit-mic");
+        assert_eq!(selection.model, "none");
+        assert_eq!(selection.system_id, None);
+    }
+
+    #[test]
     fn timeline_is_anchored_at_callback_arrival_not_queue_drain() {
         let mut mapper = TimelineMapper::default();
         assert_eq!(mapper.map(1_000, 25_000, false), 25_000);
@@ -2910,6 +3933,10 @@ mod tests {
             terminal_safe("safe\u{202E}txt\u{200B}\u{FEFF}"),
             "safe\\u{202E}txt\\u{200B}\\u{FEFF}"
         );
+        assert_eq!(
+            render_argv(&["koe".to_owned(), "a b'c".to_owned()]),
+            "'koe' 'a b'\\''c'"
+        );
     }
 
     #[test]
@@ -2924,6 +3951,18 @@ mod tests {
                 .unwrap_or_else(|error| panic!("{error}"));
             assert_eq!(String::from_utf8_lossy(&output), expected);
         }
+    }
+
+    #[test]
+    fn human_table_uses_terminal_display_width() {
+        let rows = vec![
+            vec!["日本語".to_owned(), "a".to_owned()],
+            vec!["Cafe\u{301}".to_owned(), "bb".to_owned()],
+        ];
+        assert_eq!(
+            render_table(&["NAME", "ID"], &rows),
+            "NAME    ID\n------  --\n日本語  a\nCafe\u{301}    bb"
+        );
     }
 
     #[test]
@@ -2985,6 +4024,129 @@ mod tests {
             manifest["state"],
             serde_json::json!(SessionState::RecoveredPartial)
         );
+    }
+
+    #[test]
+    fn transcript_recovery_retries_after_wav_is_already_terminal() {
+        let root = TempDir::new().expect("temp");
+        let session_id = {
+            let mut recorder =
+                SessionRecorder::start(RecordingConfig::microphone(root.path(), 16_000, 1))
+                    .expect("recorder");
+            recorder.write_samples(&[1, 2, 3]).expect("audio");
+            recorder.checkpoint().expect("checkpoint");
+            recorder.session_id()
+        };
+        super::recover_sessions_and_transcripts(root.path()).expect("wav recovery");
+
+        let transcript_dir = root
+            .path()
+            .join("sessions")
+            .join(session_id.to_string())
+            .join("transcript");
+        {
+            let mut store = koe_transcript::TranscriptStore::open(&transcript_dir).expect("store");
+            store
+                .append(
+                    TranscriptSegment::final_segment(0, 1, "kept", None, Vec::new())
+                        .expect("segment"),
+                )
+                .expect("append");
+            store.checkpoint().expect("checkpoint");
+        }
+        {
+            use std::io::Write as _;
+            let mut events = std::fs::OpenOptions::new()
+                .append(true)
+                .open(transcript_dir.join("events.jsonl"))
+                .expect("events");
+            events
+                .write_all(b"{\"schema_version\":")
+                .expect("torn tail");
+        }
+
+        let second = super::recover_sessions_and_transcripts(root.path())
+            .expect("independent transcript retry");
+        assert!(second.is_empty(), "WAV was already terminal");
+        let events = fs::read_to_string(transcript_dir.join("events.jsonl")).expect("events");
+        assert!(!events.ends_with("{\"schema_version\":"));
+    }
+
+    #[test]
+    fn asr_overload_counts_drops_and_finish_is_bounded() {
+        use std::sync::{Condvar, Mutex};
+
+        struct StalledAsr {
+            gate: Arc<(Mutex<(bool, bool)>, Condvar)>,
+        }
+
+        #[async_trait::async_trait]
+        impl koe_model::StreamingAsrSession for StalledAsr {
+            async fn append(
+                &mut self,
+                _chunk: koe_model::Pcm16Mono16k,
+            ) -> Result<(), koe_model::AsrError> {
+                let (lock, signal) = &*self.gate;
+                let mut state = lock.lock().expect("gate");
+                state.0 = true;
+                signal.notify_all();
+                while !state.1 {
+                    state = signal.wait(state).expect("wait");
+                }
+                drop(state);
+                Ok(())
+            }
+
+            async fn poll_results(
+                &mut self
+            ) -> Result<Option<koe_model::AsrEvent>, koe_model::AsrError> {
+                Ok(None)
+            }
+
+            async fn finish(
+                self: Box<Self>
+            ) -> Result<koe_model::FinalTranscript, koe_model::AsrError> {
+                Ok(koe_model::FinalTranscript::default())
+            }
+        }
+
+        let root = TempDir::new().expect("temp");
+        let gate = Arc::new((Mutex::new((false, false)), Condvar::new()));
+        let bridge = super::AsrBridge::spawn_with_capacity(
+            Box::new(StalledAsr {
+                gate: Arc::clone(&gate),
+            }),
+            koe_transcript::TranscriptModel::new("fixture", "1", "cpu").expect("model"),
+            root.path().join("transcript"),
+            OutputFormat::Json,
+            1,
+        );
+        bridge.feed(vec![1], 0).expect("first");
+        {
+            let (lock, signal) = &*gate;
+            let mut state = lock.lock().expect("gate");
+            while !state.0 {
+                state = signal.wait(state).expect("wait");
+            }
+            drop(state);
+        }
+        bridge.feed(vec![2], 1).expect("queued");
+        bridge
+            .feed(vec![3], 2)
+            .expect("dropped without blocking capture");
+        assert_eq!(bridge.dropped_chunks.load(Ordering::Relaxed), 1);
+        let started = Instant::now();
+        let error = bridge
+            .finish_with_timeout(Duration::from_millis(20))
+            .expect_err("full queue must time out");
+        assert!(matches!(error, super::CliError::AsrShutdownTimedOut));
+        assert_eq!(error.code(), "KOE-ASR-FINALIZE-TIMEOUT");
+        assert!(error.remedy().contains("saved WAV"));
+        assert!(error.retryable());
+        assert!(started.elapsed() < Duration::from_millis(200));
+        let (lock, signal) = &*gate;
+        lock.lock().expect("gate").1 = true;
+        signal.notify_all();
     }
     #[test]
     fn models_list_installed_is_offline_and_machine_readable() {
@@ -3270,7 +4432,10 @@ mod tests {
         .expect("consented install and ASR preparation without a license pin");
 
         assert_eq!(manager.policy(), NetworkPolicy::Denied);
-        assert_eq!(transcript_model.id, "FixtureLocal/NemotronASRStreaming0.6B");
+        assert_eq!(
+            transcript_model.id(),
+            "FixtureLocal/NemotronASRStreaming0.6B"
+        );
         assert_eq!(
             manager.installed_models().expect("installed models").len(),
             1
@@ -3289,7 +4454,7 @@ mod tests {
             &cancel,
         )
         .expect("installed model stays offline");
-        assert_eq!(repeated_model.id, transcript_model.id);
+        assert_eq!(repeated_model.id(), transcript_model.id());
         assert_eq!(
             manager.installed_models().expect("installed models").len(),
             1
@@ -3618,6 +4783,30 @@ mod tests {
         let value: serde_json::Value = serde_json::from_slice(&output).expect("json");
         assert_eq!(value["session_id"], id.to_string());
 
+        let segment =
+            TranscriptSegment::final_segment(0, 10, "offline text".to_owned(), None, Vec::new())
+                .expect("segment");
+        fs::write(
+            session_dir.join("transcript/final.json"),
+            serde_json::to_vec(&vec![segment]).expect("transcript json"),
+        )
+        .expect("transcript");
+        let transcript_cli = Cli::try_parse_from([
+            "koe",
+            "--output-format",
+            "json",
+            "transcript",
+            &id.to_string(),
+            "--data-root",
+            root.path().to_str().expect("utf8"),
+        ])
+        .expect("parse transcript");
+        let mut transcript_output = Vec::new();
+        execute(&transcript_cli, &UnsupportedBackend, &mut transcript_output).expect("transcript");
+        let transcript_value: serde_json::Value =
+            serde_json::from_slice(&transcript_output).expect("transcript output");
+        assert_eq!(transcript_value[0]["text"], "offline text");
+
         let delete_cli = Cli::try_parse_from([
             "koe",
             "sessions",
@@ -3629,6 +4818,91 @@ mod tests {
         .expect("parse");
         execute(&delete_cli, &UnsupportedBackend, &mut Vec::new()).expect("delete");
         assert!(!session_dir.exists());
+    }
+
+    #[test]
+    fn transcript_sanitizes_only_human_rendering() {
+        let root = TempDir::new().expect("temp");
+        let mut recorder =
+            SessionRecorder::start(RecordingConfig::microphone(root.path(), 16_000, 1))
+                .expect("recorder");
+        let id = recorder.session_id();
+        recorder.finalize(false).expect("complete");
+        let session_dir = root.path().join("sessions").join(id.to_string());
+        fs::create_dir_all(session_dir.join("transcript")).expect("dirs");
+        let segment = TranscriptSegment::final_segment(0, 1, "safe\u{1b}[31m", None, Vec::new())
+            .expect("segment");
+        fs::write(
+            session_dir.join("transcript/final.json"),
+            serde_json::to_vec(&vec![segment]).expect("json"),
+        )
+        .expect("transcript");
+
+        let id_string = id.to_string();
+        let base = [
+            "koe",
+            "transcript",
+            &id_string,
+            "--data-root",
+            root.path().to_str().expect("utf8"),
+        ];
+        let human = Cli::try_parse_from(base).expect("human CLI");
+        let mut output = Vec::new();
+        execute(&human, &UnsupportedBackend, &mut output).expect("human");
+        let rendered = String::from_utf8(output).expect("utf8");
+        assert!(rendered.contains("\\x1B"));
+        assert!(!rendered.contains('\u{1b}'));
+
+        let machine = Cli::try_parse_from([
+            "koe",
+            "--output-format",
+            "json",
+            "transcript",
+            &id_string,
+            "--data-root",
+            root.path().to_str().expect("utf8"),
+        ])
+        .expect("json CLI");
+        let mut output = Vec::new();
+        execute(&machine, &UnsupportedBackend, &mut output).expect("json");
+        let parsed: serde_json::Value = serde_json::from_slice(&output).expect("json");
+        assert_eq!(parsed[0]["text"], "safe\u{1b}[31m");
+
+        let jsonl = Cli::try_parse_from([
+            "koe",
+            "--output-format",
+            "jsonl",
+            "transcript",
+            &id_string,
+            "--data-root",
+            root.path().to_str().expect("utf8"),
+        ])
+        .expect("jsonl CLI");
+        let mut output = Vec::new();
+        execute(&jsonl, &UnsupportedBackend, &mut output).expect("jsonl");
+        let lines: Vec<_> = output
+            .split(|byte| *byte == b'\n')
+            .filter(|line| !line.is_empty())
+            .collect();
+        assert_eq!(lines.len(), 1);
+        let parsed: serde_json::Value = serde_json::from_slice(lines[0]).expect("jsonl row");
+        assert_eq!(parsed["text"], "safe\u{1b}[31m");
+
+        let final_path = session_dir.join("transcript/final.json");
+        fs::remove_file(&final_path).expect("remove final");
+        assert_eq!(
+            execute(&machine, &UnsupportedBackend, &mut Vec::new())
+                .expect_err("missing transcript")
+                .code(),
+            "KOE-TRANSCRIPT-NOT-FOUND"
+        );
+        fs::write(&final_path, b"not json").expect("malformed final");
+        assert_eq!(
+            execute(&machine, &UnsupportedBackend, &mut Vec::new())
+                .expect_err("malformed transcript")
+                .code(),
+            "KOE-SESSION-JSON-FAILED"
+        );
     }
 
     #[test]
@@ -3650,6 +4924,49 @@ mod tests {
         execute(&cli, &UnsupportedBackend, &mut output).expect("set");
         let value: serde_json::Value = serde_json::from_slice(&output).expect("json");
         assert!(matches!(value["retention"], serde_json::Value::Object(_)));
+    }
+
+    #[test]
+    fn retention_cli_previews_then_requires_confirmation() {
+        let root = TempDir::new().expect("temp");
+        let mut recorder =
+            SessionRecorder::start(RecordingConfig::microphone(root.path(), 16_000, 1))
+                .expect("recorder");
+        let id = recorder.session_id();
+        recorder.finalize(false).expect("complete");
+        let mut config = super::config::Config::default();
+        config.retention = super::config::RetentionPolicy::Days(0);
+        super::config::save(root.path(), &config).expect("config");
+
+        let preview = Cli::try_parse_from([
+            "koe",
+            "--output-format",
+            "json",
+            "config",
+            "--data-root",
+            root.path().to_str().expect("utf8"),
+            "apply-retention",
+        ])
+        .expect("preview CLI");
+        let mut output = Vec::new();
+        execute(&preview, &UnsupportedBackend, &mut output).expect("preview");
+        let value: serde_json::Value = serde_json::from_slice(&output).expect("json");
+        assert_eq!(value[0], id.to_string());
+        assert!(root.path().join("sessions").join(id.to_string()).exists());
+
+        let confirm = Cli::try_parse_from([
+            "koe",
+            "--output-format",
+            "json",
+            "config",
+            "--data-root",
+            root.path().to_str().expect("utf8"),
+            "apply-retention",
+            "--confirm",
+        ])
+        .expect("confirm CLI");
+        execute(&confirm, &UnsupportedBackend, &mut Vec::new()).expect("confirm");
+        assert!(!root.path().join("sessions").join(id.to_string()).exists());
     }
 
     #[test]
@@ -3715,5 +5032,483 @@ mod tests {
         let text = String::from_utf8_lossy(&output);
         assert!(!text.contains("secret"));
         assert!(!text.contains("transcript text"));
+    }
+
+    /// Deterministic word vocabulary produced by [`koe_model::fixture_transcribe`].
+    /// The E2E transcript must consist solely of these words, proving that the
+    /// local fixture model — not some other source — produced the transcript.
+    const FIXTURE_VOCABULARY: [&str; 16] = [
+        "aha", "amma", "ane", "asa", "awa", "baba", "bee", "dada", "e", "ene", "fufu", "koko",
+        "mama", "nana", "oh", "yaya",
+    ];
+
+    /// In-process audio backend that replays a finite, deterministic PCM stream
+    /// and then requests a cooperative stop, so the real-time record loop can be
+    /// driven end-to-end without audio hardware.
+    struct SyntheticBackend {
+        samples: Arc<Vec<i16>>,
+        interrupts: Arc<AtomicUsize>,
+    }
+
+    impl AudioBackend for SyntheticBackend {
+        type Stream = SyntheticStream;
+
+        fn capabilities(&self) -> Result<Vec<AudioCapability>, AudioError> {
+            Ok(vec![koe_audio::AudioCapability {
+                source: SourceKind::Microphone,
+                state: koe_core::CapabilityState::Supported,
+                availability: koe_core::Availability::Available,
+                permission: koe_core::PermissionState::Granted,
+                probe_effect: koe_core::ProbeEffect::None,
+                backend: "synthetic".to_owned(),
+            }])
+        }
+
+        fn permissions(&self) -> Result<Vec<AudioCapability>, AudioError> {
+            self.capabilities()
+        }
+
+        fn enumerate(
+            &self,
+            kind: SourceKind,
+        ) -> Result<Vec<AudioDevice>, AudioError> {
+            if kind == SourceKind::Microphone {
+                Ok(vec![AudioDevice {
+                    id: "synthetic-mic".to_owned(),
+                    display_name: "Synthetic Microphone".to_owned(),
+                    backend: "synthetic".to_owned(),
+                    kind: SourceKind::Microphone,
+                    persistent: true,
+                }])
+            } else {
+                Ok(Vec::new())
+            }
+        }
+
+        fn open(
+            &self,
+            request: &OpenSource,
+        ) -> Result<Self::Stream, AudioError> {
+            Ok(SyntheticStream {
+                samples: Arc::clone(&self.samples),
+                interrupts: Arc::clone(&self.interrupts),
+                sample_rate: request.preferred_sample_rate,
+                channels: request.preferred_channels,
+                worker: None,
+            })
+        }
+    }
+
+    struct SyntheticStream {
+        samples: Arc<Vec<i16>>,
+        interrupts: Arc<AtomicUsize>,
+        sample_rate: u32,
+        channels: u16,
+        worker: Option<std::thread::JoinHandle<()>>,
+    }
+
+    impl koe_audio::AudioStream for SyntheticStream {
+        fn native_sample_format(&self) -> koe_audio::NativeSampleFormat {
+            koe_audio::NativeSampleFormat::I16
+        }
+
+        fn sample_rate(&self) -> u32 {
+            self.sample_rate
+        }
+
+        fn channels(&self) -> u16 {
+            self.channels
+        }
+
+        fn start(
+            &mut self,
+            sink: Box<dyn koe_audio::FrameSink>,
+        ) -> Result<(), AudioError> {
+            let samples = Arc::clone(&self.samples);
+            let interrupts = Arc::clone(&self.interrupts);
+            let sample_rate = self.sample_rate;
+            let channels = self.channels;
+            self.worker = Some(std::thread::spawn(move || {
+                const FRAME_SAMPLES: usize = 1_600; // 100 ms at 16 kHz mono.
+                let mut sequence = 0_u64;
+                for (index, chunk) in samples.chunks(FRAME_SAMPLES).enumerate() {
+                    let capture_ns = (index as u64).saturating_mul(100_000_000);
+                    let metadata = koe_audio::FrameMetadata {
+                        sequence,
+                        source_kind: SourceKind::Microphone,
+                        sample_rate,
+                        channels,
+                        sample_format: koe_audio::NativeSampleFormat::I16,
+                        payload_sample_format: koe_audio::NativeSampleFormat::I16,
+                        capture_timestamp_ns: capture_ns,
+                        callback_arrival_timestamp_ns: koe_audio::process_timeline_now_ns(),
+                        ..koe_audio::FrameMetadata::default()
+                    };
+                    // The bounded ring is drained by the record loop every few
+                    // milliseconds; pace pushes so nothing overflows. Honor a
+                    // watchdog stop while retrying so `stop()` cannot block
+                    // forever joining a producer after the consumer exits.
+                    while sink.try_send(metadata, chunk).is_err() {
+                        if interrupts.load(Ordering::SeqCst) != 0 {
+                            return;
+                        }
+                        std::thread::sleep(Duration::from_millis(2));
+                    }
+                    sequence = sequence.saturating_add(1);
+                    std::thread::sleep(Duration::from_millis(2));
+                }
+                // Give the loop time to drain and feed the ASR bridge before it
+                // observes the cooperative stop and finalizes the session.
+                std::thread::sleep(Duration::from_millis(50));
+                interrupts.store(1, Ordering::SeqCst);
+            }));
+            Ok(())
+        }
+
+        fn stop(&mut self) -> Result<(), AudioError> {
+            if let Some(worker) = self.worker.take() {
+                worker.join().map_err(|_| AudioError::StreamRuntimeFailed)?;
+            }
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn setup_is_offline_and_idempotent_for_audio_only_use() {
+        let root = TempDir::new().expect("temp");
+        let interrupts = Arc::new(AtomicUsize::new(0));
+        let backend = SyntheticBackend {
+            samples: Arc::new(Vec::new()),
+            interrupts,
+        };
+        let cli = Cli::try_parse_from([
+            "koe",
+            "--output-format",
+            "json",
+            "setup",
+            "--data-root",
+            root.path().to_str().expect("utf8"),
+            "--mic",
+            "synthetic-mic",
+            "--model",
+            "none",
+        ])
+        .expect("setup CLI");
+
+        for _ in 0..2 {
+            let mut output = Vec::new();
+            execute(&cli, &backend, &mut output).expect("idempotent setup");
+            let report: serde_json::Value = serde_json::from_slice(&output).expect("report");
+            assert_eq!(report["data_root_ready"], true);
+            assert_eq!(report["model_verified"], true);
+            assert_eq!(report["offline_smoke_test"], false);
+            assert_eq!(report["next_command_argv"][0], "koe");
+            assert_eq!(report["next_command_argv"][1], "record");
+        }
+        let config = super::config::load_or_migrate(root.path()).expect("config");
+        assert_eq!(
+            config.defaults.microphone_id.as_deref(),
+            Some("synthetic-mic")
+        );
+        assert_eq!(config.defaults.model_selector.as_deref(), Some("none"));
+    }
+
+    #[test]
+    fn setup_recovers_audio_before_reporting_a_missing_offline_model() {
+        let root = TempDir::new().expect("temp");
+        let session_id = {
+            let mut recorder =
+                SessionRecorder::start(RecordingConfig::microphone(root.path(), 16_000, 1))
+                    .expect("recorder");
+            recorder.write_samples(&[1, 2]).expect("audio");
+            recorder.checkpoint().expect("checkpoint");
+            recorder.session_id()
+        };
+        let backend = SyntheticBackend {
+            samples: Arc::new(Vec::new()),
+            interrupts: Arc::new(AtomicUsize::new(0)),
+        };
+        let cli = Cli::try_parse_from([
+            "koe",
+            "setup",
+            "--data-root",
+            root.path().to_str().expect("utf8"),
+            "--mic",
+            "synthetic-mic",
+            "--model",
+            "definitely-missing",
+        ])
+        .expect("CLI");
+        assert!(matches!(
+            execute(&cli, &backend, &mut Vec::new()),
+            Err(super::CliError::Model(koe_model::ModelError::NotFound))
+        ));
+        let manifest: koe_recording::SessionManifest = serde_json::from_slice(
+            &fs::read(
+                root.path()
+                    .join("sessions")
+                    .join(session_id.to_string())
+                    .join("session.json"),
+            )
+            .expect("manifest"),
+        )
+        .expect("json");
+        assert_eq!(manifest.state, SessionState::RecoveredPartial);
+    }
+
+    #[test]
+    fn setup_rejects_denied_permission_before_opening_capture() {
+        struct DeniedBackend(Arc<AtomicBool>);
+        impl AudioBackend for DeniedBackend {
+            type Stream = UnsupportedStream;
+            fn capabilities(&self) -> Result<Vec<AudioCapability>, AudioError> {
+                Ok(vec![AudioCapability {
+                    source: SourceKind::Microphone,
+                    state: koe_core::CapabilityState::PermissionRequired,
+                    availability: koe_core::Availability::Available,
+                    permission: koe_core::PermissionState::Denied,
+                    probe_effect: koe_core::ProbeEffect::None,
+                    backend: "denied".to_owned(),
+                }])
+            }
+            fn permissions(&self) -> Result<Vec<AudioCapability>, AudioError> {
+                self.capabilities()
+            }
+            fn enumerate(
+                &self,
+                _kind: SourceKind,
+            ) -> Result<Vec<AudioDevice>, AudioError> {
+                Ok(vec![AudioDevice {
+                    id: "denied".to_owned(),
+                    display_name: "Denied".to_owned(),
+                    backend: "denied".to_owned(),
+                    kind: SourceKind::Microphone,
+                    persistent: true,
+                }])
+            }
+            fn open(
+                &self,
+                _request: &OpenSource,
+            ) -> Result<Self::Stream, AudioError> {
+                self.0.store(true, Ordering::SeqCst);
+                Err(AudioError::PermissionDenied)
+            }
+        }
+        let root = TempDir::new().expect("temp");
+        let opened = Arc::new(AtomicBool::new(false));
+        let cli = Cli::try_parse_from([
+            "koe",
+            "setup",
+            "--data-root",
+            root.path().to_str().expect("utf8"),
+            "--mic",
+            "denied",
+            "--model",
+            "none",
+        ])
+        .expect("CLI");
+        assert!(matches!(
+            execute(&cli, &DeniedBackend(Arc::clone(&opened)), &mut Vec::new()),
+            Err(super::CliError::Audio(AudioError::PermissionDenied))
+        ));
+        assert!(!opened.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn setup_probe_bounds_a_stalled_stream_start() {
+        struct StalledBackend;
+        struct StalledStream;
+        impl koe_audio::AudioStream for StalledStream {
+            fn native_sample_format(&self) -> koe_audio::NativeSampleFormat {
+                koe_audio::NativeSampleFormat::I16
+            }
+            fn sample_rate(&self) -> u32 {
+                48_000
+            }
+            fn channels(&self) -> u16 {
+                1
+            }
+            fn start(
+                &mut self,
+                _sink: Box<dyn koe_audio::FrameSink>,
+            ) -> Result<(), AudioError> {
+                std::thread::sleep(Duration::from_secs(1));
+                Ok(())
+            }
+            fn stop(&mut self) -> Result<(), AudioError> {
+                Ok(())
+            }
+        }
+        impl AudioBackend for StalledBackend {
+            type Stream = StalledStream;
+            fn capabilities(&self) -> Result<Vec<AudioCapability>, AudioError> {
+                Ok(Vec::new())
+            }
+            fn permissions(&self) -> Result<Vec<AudioCapability>, AudioError> {
+                Ok(Vec::new())
+            }
+            fn enumerate(
+                &self,
+                _kind: SourceKind,
+            ) -> Result<Vec<AudioDevice>, AudioError> {
+                Ok(Vec::new())
+            }
+            fn open(
+                &self,
+                _request: &OpenSource,
+            ) -> Result<Self::Stream, AudioError> {
+                Ok(StalledStream)
+            }
+        }
+
+        let started = Instant::now();
+        assert!(matches!(
+            super::probe_microphone(&StalledBackend, "stalled"),
+            Err(super::CliError::SetupProbeTimedOut)
+        ));
+        assert!(started.elapsed() < Duration::from_millis(500));
+    }
+
+    /// Deterministic 16 kHz mono PCM: a blend of tones so the fixture model
+    /// produces a varied, reproducible word sequence.
+    #[allow(clippy::cast_possible_truncation, clippy::cast_precision_loss)]
+    fn synthetic_pcm(sample_count: usize) -> Vec<i16> {
+        (0..sample_count)
+            .map(|index| {
+                let t = index as f64 / 16_000.0;
+                let tone = 0.5f64.mul_add(
+                    (t * 2.0 * std::f64::consts::PI * 1_200.0).sin(),
+                    (t * 2.0 * std::f64::consts::PI * 440.0).sin(),
+                );
+                (tone * 9_000.0) as i16
+            })
+            .collect()
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn e2e_local_model_records_and_transcribes_to_durable_artifacts() {
+        let root = TempDir::new().expect("temp");
+        let cache = TempDir::new().expect("cache");
+        let manager = KoeModelManager::new(
+            root.path(),
+            DigestAllowlist::empty(),
+            Box::new(FixtureFoundryAdapter::new(cache.path())),
+            NetworkPolicy::Denied,
+        )
+        .expect("manager");
+
+        // Two seconds of deterministic mono PCM at the canonical ASR rate.
+        let pcm = Arc::new(synthetic_pcm(32_000));
+        let interrupts = Arc::new(AtomicUsize::new(0));
+        let timed_out = Arc::new(AtomicBool::new(false));
+        let (cancel_watchdog, watchdog_cancelled) = std::sync::mpsc::sync_channel(1);
+        let watchdog_interrupts = Arc::clone(&interrupts);
+        let watchdog_timed_out = Arc::clone(&timed_out);
+        let watchdog = std::thread::spawn(move || {
+            match watchdog_cancelled.recv_timeout(Duration::from_secs(10)) {
+                Ok(()) | Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {},
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                    watchdog_timed_out.store(true, Ordering::SeqCst);
+                    watchdog_interrupts.store(1, Ordering::SeqCst);
+                },
+            }
+        });
+        let backend = SyntheticBackend {
+            samples: Arc::clone(&pcm),
+            interrupts: Arc::clone(&interrupts),
+        };
+
+        let cli = Cli::try_parse_from([
+            "koe",
+            "record",
+            "--mic",
+            "synthetic-mic",
+            "--model",
+            "fixture-nemotron-asr-0.6b",
+            "--install-model",
+            "--network",
+            "--sample-rate",
+            "16000",
+            "--channels",
+            "1",
+            "--output",
+            root.path().to_str().expect("UTF-8 root"),
+            "--consent",
+        ])
+        .expect("record CLI");
+
+        let mut output = Vec::new();
+        let result = execute_with_model_manager_and_interrupts(
+            &cli,
+            &backend,
+            &mut output,
+            &manager,
+            Arc::clone(&interrupts),
+        );
+        let _ignored = cancel_watchdog.send(());
+        watchdog.join().expect("watchdog thread");
+        assert!(
+            !timed_out.load(Ordering::SeqCst),
+            "end-to-end recording exceeded the 10-second deadline"
+        );
+        result.expect("end-to-end fixture recording succeeds");
+
+        // 1. A completed session manifest exists.
+        let summaries = super::sessions::list_sessions(root.path()).expect("list sessions");
+        assert_eq!(summaries.len(), 1, "exactly one session recorded");
+        let summary = &summaries[0];
+        assert_eq!(summary.state, "completed");
+        assert!(summary.has_transcript, "transcript materialized");
+
+        let detail =
+            super::sessions::show_session(root.path(), &summary.session_id).expect("show session");
+        assert_eq!(detail.manifest.state, SessionState::Completed);
+
+        // 2. Audio files were written to durable storage.
+        assert!(
+            !detail.manifest.audio_files.is_empty(),
+            "audio segments persisted"
+        );
+        assert!(
+            summary.audio_files > 0,
+            "session summary reports audio files"
+        );
+
+        // 3. A transcript was materialized with deterministic fixture words.
+        let transcript = detail.transcript.as_ref().expect("transcript summary");
+        assert!(transcript.has_final_json, "final.json materialized");
+        assert!(transcript.has_final_txt, "final.txt materialized");
+        assert!(transcript.segment_count > 0, "transcript has segments");
+        assert!(transcript.final_text_word_count > 0, "transcript has words");
+
+        let transcript_dir = root
+            .path()
+            .join("sessions")
+            .join(&summary.session_id)
+            .join("transcript");
+        let final_text =
+            fs::read_to_string(transcript_dir.join("final.txt")).expect("read final.txt");
+        assert!(
+            !final_text.trim().is_empty(),
+            "final transcript is non-empty"
+        );
+        for word in final_text.split_whitespace() {
+            assert!(
+                FIXTURE_VOCABULARY.contains(&word),
+                "unexpected transcript word {word:?}; the local fixture model must \
+                 produce only fixture vocabulary"
+            );
+        }
+        assert!(
+            transcript_dir.join("events.jsonl").is_file(),
+            "streaming events log materialized"
+        );
+
+        // The fixture model was actually installed under the data root.
+        assert_eq!(
+            manager.installed_models().expect("installed models").len(),
+            1
+        );
     }
 }

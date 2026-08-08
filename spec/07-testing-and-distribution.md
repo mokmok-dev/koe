@@ -38,6 +38,24 @@ audio test は deterministic fixture と property test を使い、wall clock �
 | default switch | 必須 | 必須 | 必須 |
 | clock drift | mic + loopback | mic + tap | source + sink |
 
+#### 現在の自動化範囲と実機ゲート
+
+`windows.yaml` は Windows の workspace compile と deterministic test を必須化する。
+これは音声 device や権限を持たない hosted runner 上の骨格であり、下表の実機項目を
+代替しない。各 release candidate は結果（OS build、hardware、backend、sample format、
+duration、recovery point）を release evidence として保存する。
+
+| 項目 | 自動fixture | Windows HIL | macOS HIL | Linux HIL |
+| --- | --- | --- | --- | --- |
+| format変換 44.1/48/96kHz, mono/stereo, integer/float | 必須 | smoke | smoke | backend別 smoke |
+| 30分録音と停止 | synthetic | WASAPI mic/loopback | CoreAudio mic/tap | PipeWire/Pulse/ALSA |
+| permission deny→grant→revoke | state fixture | Settings/package | TCC | portal/policy |
+| hot-plug/default変更/sleep復帰 | event fixture | 必須 | 必須 | backend別必須 |
+| crash recovery (WAV + JSONL境界) | fault injection | 必須 | 必須 | 必須 |
+| 2時間drift | deterministic clock | mic+loopback | mic+tap | source+sink |
+
+未完了のHIL行が一つでもあるplatformのpackageはproduction-readyとして公開しない。
+
 ### Hardware-in-the-loop
 
 GitHub-hosted runner は compile/unit/fixture/package matrix に使い、real microphone、

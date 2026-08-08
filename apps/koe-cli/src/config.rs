@@ -159,12 +159,31 @@ pub fn apply_retention(
     data_root: &Path,
     config: &Config,
 ) -> Result<Vec<SessionId>, ConfigError> {
+    let candidates = retention_candidates(data_root, config)?;
+    let mut deleted = Vec::with_capacity(candidates.len());
+    for session_id in candidates {
+        delete_session_directory(data_root, &session_id)?;
+        deleted.push(session_id);
+    }
+    Ok(deleted)
+}
+
+/// Lists sessions eligible for retention without deleting anything.
+///
+/// # Errors
+///
+/// Returns an error when the session directory cannot be scanned or a
+/// manifest cannot be parsed.
+pub fn retention_candidates(
+    data_root: &Path,
+    config: &Config,
+) -> Result<Vec<SessionId>, ConfigError> {
     let RetentionPolicy::Days(days) = config.retention else {
         return Ok(Vec::new());
     };
     let cutoff = unix_millis().saturating_sub(u128::from(days) * 24 * 60 * 60 * 1_000);
     let sessions_dir = sessions_dir(data_root)?;
-    let mut deleted = Vec::new();
+    let mut candidates = Vec::new();
     let entries = match fs::read_dir(&sessions_dir) {
         Ok(entries) => entries,
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
@@ -190,24 +209,14 @@ pub fn apply_retention(
         }
         let ended = manifest.ended_unix_ms.unwrap_or(manifest.started_unix_ms);
         if ended < cutoff {
-            delete_session_directory(data_root, &session_id)?;
-            deleted.push(session_id);
+            candidates.push(session_id);
         }
     }
-    Ok(deleted)
+    Ok(candidates)
 }
 
 const fn is_active(state: SessionState) -> bool {
-    matches!(
-        state,
-        SessionState::Idle
-            | SessionState::Preparing
-            | SessionState::Starting
-            | SessionState::Recording
-            | SessionState::Degraded
-            | SessionState::Stopping
-            | SessionState::Finalizing
-    )
+    !state.is_terminal()
 }
 
 /// Removes a session directory after verifying it lives under the data root.
@@ -266,7 +275,9 @@ mod tests {
 
     use std::fs;
 
-    use super::{Config, RetentionPolicy, apply_retention, load_or_migrate, save};
+    use super::{
+        Config, RetentionPolicy, apply_retention, load_or_migrate, retention_candidates, save,
+    };
 
     fn manifest(
         state: SessionState,
@@ -357,6 +368,9 @@ mod tests {
             retention: RetentionPolicy::Days(7),
             ..Config::default()
         };
+        let preview = retention_candidates(root.path(), &config).expect("preview");
+        assert_eq!(preview, vec![old_id]);
+        assert!(old_dir.exists(), "preview must not delete data");
         let deleted = apply_retention(root.path(), &config).expect("apply");
         assert_eq!(deleted.len(), 1);
         assert_eq!(deleted[0], old_id);
@@ -386,5 +400,43 @@ mod tests {
         let deleted = apply_retention(root.path(), &config).expect("apply");
         assert!(deleted.is_empty());
         assert!(dir.exists());
+    }
+
+    #[test]
+    fn retention_protects_every_nonterminal_state() {
+        for state in [
+            SessionState::Idle,
+            SessionState::Preparing,
+            SessionState::PermissionRequired,
+            SessionState::Starting,
+            SessionState::Recording,
+            SessionState::Degraded,
+            SessionState::Stopping,
+            SessionState::Finalizing,
+            SessionState::Cancelling,
+        ] {
+            let root = TempDir::new().expect("temp");
+            let sessions = root.path().join("sessions");
+            fs::create_dir_all(&sessions).expect("sessions dir");
+            let id = koe_core::SessionId::new();
+            let dir = sessions.join(id.to_string());
+            fs::create_dir_all(&dir).expect("dir");
+            fs::write(
+                dir.join("session.json"),
+                serde_json::to_vec(&manifest(state, 10 * 24 * 60 * 60 * 1_000)).expect("json"),
+            )
+            .expect("write");
+            let config = Config {
+                retention: RetentionPolicy::Days(7),
+                ..Config::default()
+            };
+            assert!(
+                retention_candidates(root.path(), &config)
+                    .expect("candidates")
+                    .is_empty(),
+                "state {state:?} must be protected"
+            );
+            assert!(dir.exists());
+        }
     }
 }

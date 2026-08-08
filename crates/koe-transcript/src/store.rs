@@ -669,11 +669,7 @@ mod tests {
     }
 
     fn model() -> TranscriptModel {
-        TranscriptModel {
-            id: "fixture-model".to_owned(),
-            version: "1.0".to_owned(),
-            variant: "cpu".to_owned(),
-        }
+        TranscriptModel::new("fixture-model", "1.0", "cpu").expect("valid model")
     }
 
     fn open(directory: &std::path::Path) -> TranscriptStore {

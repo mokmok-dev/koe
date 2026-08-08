@@ -1417,6 +1417,7 @@ dependencies = [
 name = "koe-cli"
 version = "0.0.0"
 dependencies = [
+ "async-trait",
  "clap",
  "ctrlc",
  "koe-app",
@@ -1433,6 +1434,8 @@ dependencies = [
  "tokio-util",
  "tracing",
  "tracing-subscriber",
+ "unicode-width",
+ "uuid",
 ]
 
 [[package]]
@@ -1448,12 +1451,14 @@ dependencies = [
 name = "koe-mcp"
 version = "0.0.0"
 dependencies = [
+ "async-trait",
  "clap",
  "koe-app",
  "koe-audio",
  "koe-core",
  "koe-model",
  "koe-recording",
+ "koe-transcript",
  "serde",
  "serde_json",
  "tempfile",

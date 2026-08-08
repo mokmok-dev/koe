@@ -411,7 +411,7 @@ impl SessionRecorder {
         if root_metadata.file_type().is_symlink() || !root_metadata.is_dir() {
             return Err(RecordingError::PathRejected);
         }
-        let root_identity = File::open(&config.data_root)?;
+        let root_identity = open_directory_identity(&config.data_root)?;
         let root = Dir::open_ambient_dir(&config.data_root, ambient_authority())?;
         verify_opened_identity(&root_identity, &root)?;
         if root_created {
@@ -1034,7 +1034,7 @@ pub fn recover_sessions(data_root: &Path) -> Result<Vec<SessionManifest>, Record
     if root_metadata.file_type().is_symlink() || !root_metadata.is_dir() {
         return Err(RecordingError::PathRejected);
     }
-    let root_identity = File::open(data_root)?;
+    let root_identity = open_directory_identity(data_root)?;
     let root = match Dir::open_ambient_dir(data_root, ambient_authority()) {
         Ok(root) => root,
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
@@ -1763,6 +1763,28 @@ fn unix_millis() -> Result<u128, RecordingError> {
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_millis())
         .map_err(|_| RecordingError::Clock)
+}
+
+/// Opens a directory as a [`File`] handle for identity verification.
+///
+/// On Windows a directory cannot be opened with the default `File::open`
+/// flags (it fails with `ERROR_ACCESS_DENIED`), so `FILE_FLAG_BACKUP_SEMANTICS`
+/// is required to obtain a handle to the directory.
+#[cfg(not(windows))]
+fn open_directory_identity(path: &Path) -> io::Result<File> {
+    File::open(path)
+}
+
+#[cfg(windows)]
+fn open_directory_identity(path: &Path) -> io::Result<File> {
+    use std::os::windows::fs::OpenOptionsExt;
+
+    use windows_sys::Win32::Storage::FileSystem::FILE_FLAG_BACKUP_SEMANTICS;
+
+    fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+        .open(path)
 }
 
 fn create_private_directory(path: &Path) -> io::Result<bool> {

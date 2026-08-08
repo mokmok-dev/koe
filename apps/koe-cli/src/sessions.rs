@@ -1,14 +1,14 @@
 //! Session library operations: list, show, export, and delete.
 
 use std::{
-    fs,
-    io::{self, Read},
+    fs, io,
     path::{Path, PathBuf},
 };
 
 use koe_core::SessionId;
 use koe_core::SessionState;
 use koe_recording::SessionManifest;
+use koe_transcript::TranscriptSegment;
 use serde::Serialize;
 use thiserror::Error;
 
@@ -33,13 +33,39 @@ pub struct SessionDetail {
     pub transcript: Option<TranscriptSummary>,
 }
 
-/// Transcript metadata exposed by the CLI; never the raw transcript text.
+/// Transcript metadata exposed by the session detail command.
 #[derive(Clone, Debug, Serialize)]
 pub struct TranscriptSummary {
     pub segment_count: usize,
     pub final_text_word_count: usize,
     pub has_final_json: bool,
     pub has_final_txt: bool,
+}
+
+/// Reads the materialized final transcript for one session.
+///
+/// # Errors
+///
+/// Returns an error when the session does not exist, is active, or its
+/// materialized transcript is missing or malformed.
+pub fn transcript(
+    data_root: &Path,
+    id: &str,
+) -> Result<Vec<TranscriptSegment>, SessionError> {
+    let session_id = SessionId::parse(id).map_err(|_| SessionError::InvalidId(id.to_owned()))?;
+    let dir = session_dir(data_root, &session_id)?;
+    if !dir.exists() {
+        return Err(SessionError::NotFound(session_id));
+    }
+    let manifest = read_manifest(&dir.join("session.json"))?;
+    if is_active(manifest.state) {
+        return Err(SessionError::Active);
+    }
+    let path = dir.join("transcript").join("final.json");
+    if !path.is_file() {
+        return Err(SessionError::TranscriptMissing);
+    }
+    Ok(serde_json::from_slice(&fs::read(path)?)?)
 }
 
 /// Session library operation failure.
@@ -59,6 +85,8 @@ pub enum SessionError {
     DestinationRejected,
     #[error("invalid session id: {0}")]
     InvalidId(String),
+    #[error("materialized transcript is missing")]
+    TranscriptMissing,
 }
 
 impl SessionError {
@@ -73,6 +101,7 @@ impl SessionError {
             Self::Active => "KOE-SESSION-ACTIVE",
             Self::DestinationRejected => "KOE-SESSION-DESTINATION-REJECTED",
             Self::InvalidId(_) => "KOE-SESSION-INVALID-ID",
+            Self::TranscriptMissing => "KOE-TRANSCRIPT-NOT-FOUND",
         }
     }
 }
@@ -226,15 +255,13 @@ fn transcript_summary(session_dir: &Path) -> Option<TranscriptSummary> {
     } else {
         0
     };
-    let segment_count = if events.is_file() {
-        fs::File::open(&events)
+    // final.json is the materialized latest revision of final segments. Event
+    // line counts include interim and revised events and therefore overcount.
+    let segment_count = if has_final_json {
+        fs::read(&final_json)
             .ok()
-            .and_then(|mut file| {
-                let mut text = String::new();
-                file.read_to_string(&mut text).ok()?;
-                Some(text.lines().filter(|line| !line.is_empty()).count())
-            })
-            .unwrap_or(0)
+            .and_then(|bytes| serde_json::from_slice::<Vec<TranscriptSegment>>(&bytes).ok())
+            .map_or(0, |segments| segments.len())
     } else {
         0
     };
@@ -336,7 +363,7 @@ mod tests {
     use koe_recording::SessionManifest;
     use tempfile::TempDir;
 
-    use super::{delete_session, export_session, list_sessions, show_session};
+    use super::{delete_session, export_session, list_sessions, show_session, transcript};
 
     fn manifest(
         session_id: SessionId,
@@ -418,6 +445,76 @@ mod tests {
         let detail = show_session(root.path(), &id.to_string()).expect("show");
         assert_eq!(detail.session_id, id.to_string());
         assert_eq!(detail.manifest.state, SessionState::Completed);
+    }
+
+    #[test]
+    fn transcript_and_summary_use_materialized_final_segments() {
+        let root = TempDir::new().expect("temp");
+        fs::create_dir_all(root.path().join("sessions")).expect("sessions");
+        let id = create_session(&root, SessionState::Completed);
+        let transcript_dir = root
+            .path()
+            .join("sessions")
+            .join(id.to_string())
+            .join("transcript");
+        let segment = koe_transcript::TranscriptSegment::final_segment(
+            0,
+            100,
+            "hello offline".to_owned(),
+            None,
+            Vec::new(),
+        )
+        .expect("segment");
+        fs::write(
+            transcript_dir.join("final.json"),
+            serde_json::to_vec(&vec![segment.clone()]).expect("json"),
+        )
+        .expect("final json");
+        fs::write(transcript_dir.join("final.txt"), "hello offline\n").expect("final text");
+        fs::write(transcript_dir.join("events.jsonl"), "{}\n{}\n{}\n").expect("events");
+
+        let detail = show_session(root.path(), &id.to_string()).expect("show");
+        assert_eq!(detail.transcript.expect("summary").segment_count, 1);
+        assert_eq!(
+            transcript(root.path(), &id.to_string()).expect("transcript"),
+            vec![segment]
+        );
+    }
+
+    #[test]
+    fn transcript_distinguishes_missing_malformed_and_empty_materialization() {
+        let root = TempDir::new().expect("temp");
+        fs::create_dir_all(root.path().join("sessions")).expect("sessions");
+        let missing = create_session(&root, SessionState::Completed);
+        let error = transcript(root.path(), &missing.to_string()).expect_err("missing");
+        assert_eq!(error.code(), "KOE-TRANSCRIPT-NOT-FOUND");
+
+        let malformed = create_session(&root, SessionState::Completed);
+        let malformed_path = root
+            .path()
+            .join("sessions")
+            .join(malformed.to_string())
+            .join("transcript/final.json");
+        fs::write(&malformed_path, b"not json").expect("malformed fixture");
+        assert_eq!(
+            transcript(root.path(), &malformed.to_string())
+                .expect_err("malformed")
+                .code(),
+            "KOE-SESSION-JSON-FAILED"
+        );
+
+        let empty = create_session(&root, SessionState::Completed);
+        let empty_path = root
+            .path()
+            .join("sessions")
+            .join(empty.to_string())
+            .join("transcript/final.json");
+        fs::write(empty_path, b"[]").expect("empty fixture");
+        assert!(
+            transcript(root.path(), &empty.to_string())
+                .expect("empty")
+                .is_empty()
+        );
     }
 
     #[test]
