@@ -58,6 +58,11 @@ unused = "deny"
 [workspace.package]
 edition = "2024"
 version = "0.0.0"
+# Model verification hashes hundreds of MiB before every runtime load. Keep
+# `cargo run` startup practical while retaining full digest verification.
+[profile.dev.package.sha2]
+opt-level = 3
+
 [patch.crates-io]
 # Upstream 1.2.3 selects NuGet native artifacts from the build host and always
 # falls back to network. The vendored patch selects from Cargo TARGET and

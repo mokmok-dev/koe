@@ -22,6 +22,8 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tokio::sync::{Mutex, RwLock};
 
+const ARTIFACT_READ_BUFFER_BYTES: usize = 1024 * 1024;
+
 use crate::{
     adapter::{
         AsrError, AsrEvent, AsrSessionSettings, FinalTranscript, FoundryAdapter, Pcm16Mono16k,
@@ -1409,7 +1411,11 @@ fn inventory_from_artifact(
             return Err(ModelError::VerifyFailed);
         }
         let read_limit = size.checked_add(1).ok_or(ModelError::StoreFailed)?;
-        let mut reader = BufReader::new(opened).take(read_limit);
+        // Large model shards dominate startup on macOS. Keep the bounded,
+        // identity-checked streaming hash, but avoid issuing an 8 KiB read to
+        // the filesystem for every digest update.
+        let mut reader =
+            BufReader::with_capacity(ARTIFACT_READ_BUFFER_BYTES, opened).take(read_limit);
         let mut hasher = Sha256::new();
         let mut streamed = 0_u64;
         let mut buffer = [0_u8; 8 * 1024];

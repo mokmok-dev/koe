@@ -589,6 +589,14 @@ impl SessionRecorder {
         {
             return Err(RecordingError::IncompleteSampleFrame);
         }
+        self.write_samples_uncheckpointed(samples)?;
+        self.checkpoint_if_due()
+    }
+
+    fn write_samples_uncheckpointed(
+        &mut self,
+        samples: &[i16],
+    ) -> Result<(), RecordingError> {
         for sample in samples {
             if self.segment_samples == self.config.samples_per_segment {
                 self.rotate()?;
@@ -597,7 +605,7 @@ impl SessionRecorder {
             self.segment_samples += 1;
             self.total_samples += 1;
         }
-        self.checkpoint_if_due()
+        Ok(())
     }
 
     /// Writes microphone PCM together with its canonical session placement.
@@ -613,13 +621,14 @@ impl SessionRecorder {
         let channels = u64::from(self.config.channels);
         validate_timeline_block(samples, channels, &timeline)?;
         let pcm_start_frame = self.total_samples / channels;
-        self.write_samples(samples)?;
+        self.write_samples_uncheckpointed(samples)?;
         self.persist_timeline_block(
             TrackKind::Microphone,
             pcm_start_frame,
             self.config.sample_rate,
             timeline,
-        )
+        )?;
+        self.checkpoint_if_due()
     }
 
     /// Writes one optional isolated or mixed track configured at session start.
@@ -628,6 +637,15 @@ impl SessionRecorder {
     ///
     /// Returns a configuration, frame, or storage error.
     pub fn write_track(
+        &mut self,
+        kind: TrackKind,
+        samples: &[i16],
+    ) -> Result<(), RecordingError> {
+        self.write_track_uncheckpointed(kind, samples)?;
+        self.checkpoint_if_due()
+    }
+
+    fn write_track_uncheckpointed(
         &mut self,
         kind: TrackKind,
         samples: &[i16],
@@ -663,7 +681,7 @@ impl SessionRecorder {
             track.segment_samples += 1;
             track.total_samples += 1;
         }
-        self.checkpoint_if_due()
+        Ok(())
     }
 
     /// Writes an optional track together with its canonical session placement.
@@ -690,8 +708,9 @@ impl SessionRecorder {
             })
             .ok_or(RecordingError::InvalidConfiguration)?;
         validate_timeline_block(samples, channels, &timeline)?;
-        self.write_track(kind, samples)?;
-        self.persist_timeline_block(kind, pcm_start_frame, sample_rate, timeline)
+        self.write_track_uncheckpointed(kind, samples)?;
+        self.persist_timeline_block(kind, pcm_start_frame, sample_rate, timeline)?;
+        self.checkpoint_if_due()
     }
 
     fn persist_timeline_block(
@@ -718,7 +737,11 @@ impl SessionRecorder {
             sequence: timeline.sequence,
             discontinuity_before: timeline.discontinuity_before,
         });
-        write_json_atomic(&self.session_cap, Path::new("session.json"), &self.manifest)
+        // Do not rewrite and fsync the ever-growing manifest for every audio
+        // callback. `write_samples`/`write_track` checkpoints it together with
+        // the matching durable PCM lengths every five seconds, and finalization
+        // publishes the complete timeline.
+        Ok(())
     }
 
     /// Adds callback overflow observations to the durable per-source metric.
