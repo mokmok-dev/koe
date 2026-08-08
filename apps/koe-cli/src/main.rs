@@ -3,7 +3,7 @@ mod sessions;
 
 use std::{
     collections::VecDeque,
-    io,
+    io::{self, IsTerminal as _},
     path::{Path, PathBuf},
     process::ExitCode,
     sync::{
@@ -366,6 +366,7 @@ struct ErrorEnvelope {
 }
 
 fn main() -> ExitCode {
+    init_tracing();
     let cli = Cli::parse();
     match execute(&cli, &CpalBackend::default(), &mut io::stdout()) {
         Ok(()) => ExitCode::SUCCESS,
@@ -383,6 +384,33 @@ fn main() -> ExitCode {
     }
 }
 
+/// Installs a human-readable tracing subscriber on stderr. stdout stays
+/// reserved for rendered command output. The level defaults to `info` and can
+/// be overridden with `RUST_LOG`.
+fn init_tracing() {
+    let filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
+    tracing_subscriber::fmt()
+        .with_env_filter(filter)
+        .with_writer(io::stderr)
+        .with_ansi(io::stderr().is_terminal())
+        .compact()
+        .init();
+}
+
+const fn command_name(command: &Command) -> &'static str {
+    match command {
+        Command::Capabilities => "capabilities",
+        Command::Devices { .. } => "devices",
+        Command::Permissions { .. } => "permissions",
+        Command::Doctor { .. } => "doctor",
+        Command::Models { .. } => "models",
+        Command::Sessions { .. } => "sessions",
+        Command::Config { .. } => "config",
+        Command::Record { .. } => "record",
+    }
+}
+
 fn execute(
     cli: &Cli,
     backend: &impl AudioBackend,
@@ -397,6 +425,7 @@ fn execute_with_model_manager(
     output: &mut impl io::Write,
     record_model_manager: Option<&KoeModelManager>,
 ) -> Result<(), CliError> {
+    tracing::debug!(command = command_name(&cli.command), "dispatching command");
     match &cli.command {
         Command::Capabilities => {
             let capabilities = backend.capabilities()?;
@@ -1281,6 +1310,7 @@ fn prepare_asr_with_manager(
     let installed_id = match manager.installed_id_for(&selector)? {
         Some(installed_id) => {
             let installed = manager.installed_model(&installed_id)?;
+            tracing::debug!(model = %selector.key(), "using installed model");
             report_installed_model(format, &installed);
             installed_id
         },
@@ -1340,6 +1370,7 @@ fn prepare_asr_with_manager(
             .await
             .map_err(CliError::Model)
     })?;
+    tracing::info!(model = %selector.key(), "ASR session ready");
     Ok((
         session,
         TranscriptModel {
@@ -1630,6 +1661,14 @@ fn record<B: AudioBackend>(
             return Err(error.into());
         },
     };
+    tracing::info!(
+        session_id = %recording.session_id.map_or_else(|| "unknown".to_owned(), |id| id.to_string()),
+        microphone = %terminal_safe(microphone_id),
+        system = %terminal_safe(system_id.unwrap_or("none")),
+        sample_rate = microphone_sample_rate,
+        channels = microphone_channels,
+        "recording session created"
+    );
     // The durable manifest, recovery marker, and visible session state exist
     // before either OS stream can deliver a callback.
     let session_clock = Instant::now();
@@ -1704,6 +1743,7 @@ fn record<B: AudioBackend>(
             coordinator.record_overflow(TrackKind::Microphone, dropped)?;
         }
         if consumer.take_device_lost() {
+            tracing::warn!(source = "microphone", "audio device lost");
             stream.stop()?;
             coordinator.mark_degraded()?;
             let loss_start = elapsed_ns(session_clock);
@@ -1720,6 +1760,7 @@ fn record<B: AudioBackend>(
                 stream.native_sample_format(),
                 queue_capacity,
             ) {
+                tracing::info!(source = "microphone", "audio device reopened");
                 stream = reopened;
                 consumer = replacement;
                 microphone_active = true;
@@ -1746,6 +1787,7 @@ fn record<B: AudioBackend>(
                     coordinator.mark_recording()?;
                 }
             } else {
+                tracing::warn!(source = "microphone", "audio device could not be reopened");
                 microphone_active = false;
             }
             if no_capture_source_active(microphone_active, system_active) {
@@ -1820,6 +1862,7 @@ fn record<B: AudioBackend>(
             .as_ref()
             .is_some_and(FrameConsumer::take_device_lost)
         {
+            tracing::warn!(source = "system", "audio device lost");
             if let Some(system) = &mut system_stream {
                 system.stop()?;
             }
@@ -1840,6 +1883,7 @@ fn record<B: AudioBackend>(
                     queue_capacity,
                 )
             {
+                tracing::info!(source = "system", "audio device reopened");
                 system_stream = Some(reopened);
                 system_consumer = Some(replacement);
                 system_active = true;
@@ -1862,6 +1906,7 @@ fn record<B: AudioBackend>(
                     coordinator.mark_recording()?;
                 }
             } else {
+                tracing::warn!(source = "system", "audio device could not be reopened");
                 system_active = false;
             }
             if no_capture_source_active(microphone_active, system_active) {
@@ -2059,11 +2104,13 @@ fn record<B: AudioBackend>(
         record_device_loss_gap(&coordinator, TrackKind::System, start_ns, ended_ns)?;
     }
     let terminal = if interrupts.load(Ordering::Relaxed) >= 2 {
+        tracing::info!("recording cancelled by interrupt");
         coordinator.cancel()?
     } else {
         coordinator.stop()?
     };
     task.shutdown()?;
+    tracing::info!(state = ?terminal.state, "recording finished");
     if let Some(asr) = asr.take() {
         // Drains remaining chunks, runs the model finalization and
         // materializes `events.jsonl` -> `final.json`/`final.txt`.

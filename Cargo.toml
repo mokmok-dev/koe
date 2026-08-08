@@ -28,6 +28,8 @@ koe-recording = { path = "crates/koe-recording" }
 koe-transcript = { path = "crates/koe-transcript" }
 tokio = { version = "1.45.1", features = ["macros", "rt-multi-thread", "sync", "time"] }
 tokio-util = { version = "0.7.15", features = ["rt"] }
+tracing = { version = "0.1.41", default-features = false, features = ["std"] }
+tracing-subscriber = { version = "0.3.20", features = ["env-filter"] }
 objc2-av-foundation = { version = "0.3.2", default-features = false, features = [
   "AVCaptureDevice",
   "AVMediaFormat",

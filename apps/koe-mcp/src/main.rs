@@ -8,7 +8,7 @@ use std::{
     collections::{HashMap, HashSet},
     fs,
     future::Future,
-    io::{self, BufRead, Read, Write},
+    io::{self, BufRead, IsTerminal as _, Read, Write},
     path::{Path, PathBuf},
     sync::{
         Arc, Mutex,
@@ -268,6 +268,7 @@ impl Server {
             return None;
         }
         let id = id.unwrap_or(Value::Null);
+        tracing::debug!(method, "handling request");
         match self.handle_request(method, request.get("params")) {
             Ok(result) => Some(json!({"jsonrpc": "2.0", "id": id, "result": result})),
             Err(error) => Some(error_response(id, &error)),
@@ -433,6 +434,7 @@ impl Server {
             .map_err(|_| McpError::InvalidParams)?;
         let manager = self.model_manager();
         let operation_id = OperationId::new();
+        let selector_key = selector.key();
         let snapshot = Arc::new(Mutex::new(OperationSnapshot {
             operation_id,
             session_id: None,
@@ -497,6 +499,7 @@ impl Server {
                 };
             }
         });
+        tracing::info!(%operation_id, model = %selector_key, "model install operation started");
         self.operations.insert(
             operation_id.to_string(),
             Operation {
@@ -589,6 +592,13 @@ impl Server {
             .mark_recording()
             .map_err(|_| McpError::OperationFailed)?;
         let operation_id = started.operation_id;
+        tracing::info!(
+            %operation_id,
+            %session_id,
+            sample_rate,
+            channels,
+            "recording operation started"
+        );
         let snapshot = Arc::new(Mutex::new(OperationSnapshot {
             operation_id,
             session_id: Some(session_id),
@@ -648,6 +658,7 @@ impl Server {
             .state
             .clone();
         if matches!(state, OperationState::Running) {
+            tracing::info!(operation_id, cancel, "stop requested for operation");
             if let Some(control) = &operation.recording_control {
                 if cancel {
                     operation.cancellation.cancel();
@@ -712,12 +723,18 @@ impl Server {
                 if let Ok(mut snapshot) = operation.snapshot.lock()
                     && matches!(snapshot.state, OperationState::Running)
                 {
-                    snapshot.state = OperationState::Failed;
-                    snapshot.error_code = Some(if joined.is_err() {
+                    let error_code = if joined.is_err() {
                         "KOE-SESSION-WORKER-PANICKED"
                     } else {
                         "KOE-SESSION-WORKER-STOPPED"
-                    });
+                    };
+                    tracing::warn!(
+                        operation_id = %snapshot.operation_id,
+                        error_code,
+                        "operation worker stopped without a terminal state"
+                    );
+                    snapshot.state = OperationState::Failed;
+                    snapshot.error_code = Some(error_code);
                 }
             }
             let terminal = operation
@@ -1533,7 +1550,22 @@ fn sensitive_session_tool(
     )
 }
 
+/// Installs a human-readable tracing subscriber on stderr. stdout stays
+/// reserved exclusively for JSON-RPC frames. The level defaults to `info`
+/// and can be overridden with `RUST_LOG`.
+fn init_tracing() {
+    let filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
+    tracing_subscriber::fmt()
+        .with_env_filter(filter)
+        .with_writer(io::stderr)
+        .with_ansi(io::stderr().is_terminal())
+        .compact()
+        .init();
+}
+
 fn main() -> std::process::ExitCode {
+    init_tracing();
     let args = Args::parse();
     let mut server = match Server::new(&args) {
         Ok(server) => server,
@@ -1542,8 +1574,15 @@ fn main() -> std::process::ExitCode {
             return std::process::ExitCode::FAILURE;
         },
     };
+    tracing::info!(
+        data_root = %server.data_root.display(),
+        "koe-mcp server started"
+    );
     match server.run(io::BufReader::new(io::stdin()), io::stdout().lock()) {
-        Ok(()) => std::process::ExitCode::SUCCESS,
+        Ok(()) => {
+            tracing::info!("koe-mcp server stopped");
+            std::process::ExitCode::SUCCESS
+        },
         Err(error) => {
             eprintln!("KOE-MCP-STDIO-FAILED: {error}");
             std::process::ExitCode::FAILURE
