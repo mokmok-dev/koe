@@ -70,10 +70,6 @@
                 drv.overrideAttrs {
                   patches = [ ./nix/patches/pipewire-sys-bindgen-out-dir.patch ];
                 }
-              else if package.name == "gpui" && package.version == "0.2.2" then
-                drv.overrideAttrs {
-                  patches = [ ./nix/patches/gpui-windows-runtime-shaders.patch ];
-                }
               else
                 drv;
           };

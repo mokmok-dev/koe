@@ -1,4 +1,4 @@
-//! Stable model domain types shared by the manager, CLI, desktop and MCP.
+//! Stable model domain types shared by the manager, CLI and MCP.
 
 use std::{fmt, str::FromStr};
 

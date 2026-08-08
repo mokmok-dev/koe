@@ -12,11 +12,10 @@ crates/
   koe-app/           use case、coordinator、policy
 apps/
   koe-cli/
-  koe-desktop/
   koe-mcp/
 ```
 
-`koe-core` は CPAL、Foundry、GPUI、MCP、filesystem implementation に依存しない。
+`koe-core` は CPAL、Foundry、MCP、filesystem implementation に依存しない。
 `koe-app` が port trait を所有し、外側の crate が adapter を実装する。
 
 Cargo workspace は library と個別 binary の共有に適する。
@@ -83,7 +82,7 @@ Preparing/Starting/Recording/Degraded -> Cancelling -> Cancelled
 - `Doctor`
 
 各 command は `OperationId`、caller、deadline、cancellation token、audit context を持つ。
-CLI、GPUI、MCP は同じ command を使い、adapter 固有引数を core に追加しない。
+CLI と MCP は同じ command を使い、adapter 固有引数を core に追加しない。
 
 ## Event
 

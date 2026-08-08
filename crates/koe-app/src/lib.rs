@@ -1,6 +1,4 @@
-//! Application coordinator shared by CLI, desktop and MCP adapters.
-
-pub mod desktop;
+//! Application coordinator shared by CLI and MCP adapters.
 
 use std::{
     sync::mpsc::{self, Receiver, SyncSender},
