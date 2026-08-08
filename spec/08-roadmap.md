@@ -7,7 +7,6 @@
 - CPAL で各 OS の microphone と system audio capability probe
 - Foundry Rust sample を pinned commit/version で build
 - Nemotron catalog availability と variant/provider inventory
-- GPUI 最小 window の 3 OS build
 - license と redistribution の記録
 
 受入条件:
@@ -100,21 +99,6 @@ crate:
 - stdout/stderr contract が snapshot test 済み
 - audio/transcript が default log に現れない
 
-## Milestone 5: GPUI desktop
-
-機能:
-
-- setup、recorder、model manager、session library
-- accessibility、keyboard navigation
-- persistent recording indicator
-- privacy、retention、diagnostics settings
-
-受入条件:
-
-- CLI と同じ conformance suite を通る
-- permission denied/revoked UX を 3 OS で確認
-- signing/notarization 前の package smoke test を通る
-
 ## Milestone 6: MCP stdio
 
 機能:
@@ -157,9 +141,8 @@ crate:
 3. cross-stream clock origin と device drift は application 補正が必要。
 4. macOS system audio は 14.6+ で、旧 OS は同一機能を提供できない。
 5. Linux desktop/sandbox ごとの PipeWire portal behavior が異なる。
-6. GPUI の 3 OS packaging と accessibility は prototype が必要。
-7. Nemotron の日本語品質、CPU-only RTF、memory は未測定。
-8. 長時間 WAV、RF64、segment rotation の最適値は未確定。
+6. Nemotron の日本語品質、CPU-only RTF、memory は未測定。
+7. 長時間 WAV、RF64、segment rotation の最適値は未確定。
 
 ## 決定前の open question
 
@@ -169,7 +152,7 @@ crate:
 - default chunk size
 - isolated stem を default 保存するか
 - application-level encryption を初期 scope に含めるか
-- desktop update framework と Linux package format
+- Linux package format
 - Foundry runtime を同一 process に置くか child process に分離するか
 
 open question は Milestone 0/1 の測定結果を ADR として記録して閉じる。

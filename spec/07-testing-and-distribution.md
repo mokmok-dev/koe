@@ -75,7 +75,7 @@ Hosted CI:
 - macOS Intel、Apple Silicon
 - stable Rust、最低対応 Rust は決定後追加
 - fmt、clippy、test、doc、dependency/license audit
-- feature matrix: minimal、PipeWire、PulseAudio、desktop、MCP
+- feature matrix: minimal、PipeWire、PulseAudio、MCP
 - package smoke test と artifact attestation
 
 Nix は既存の Linux x86_64/arm64、Apple Silicon を維持する。Windows と Intel macOS は
@@ -87,7 +87,6 @@ PR では model download を行わず fake/fixture を使う。nightly/release c
 ## Release artifact
 
 - CLI archive/binary
-- desktop installer/bundle
 - MCP binary は CLI と同一 binary の subcommand または別最小 binary
 - checksum file
 - SBOM

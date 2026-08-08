@@ -17,7 +17,7 @@ OS audio subsystem / permission broker
   -> koe process
        -> Foundry native runtime
        -> local session/model stores
-       -> CLI/GPUI/MCP caller
+       -> CLI/MCP caller
 network
   -> model/update endpoints（明示操作時のみ）
 ```
@@ -45,8 +45,8 @@ audio source、Foundry/runtime、MCP client、download artifact、filesystem pat
 - MCP caller へ返す範囲
 
 OS permission と application consent は別 record とする。過去の OS grant を今回の
-recording consent とみなさない。recording 中は CLI、window、tray/menu の少なくとも
-利用中 surface に persistent indicator を出す。
+recording consent とみなさない。recording 中は利用中の CLI surface に persistent
+indicator を出す。
 
 macOS の microphone purpose string と system audio declaration を設定する。
 Windows package は microphone capability と denial を処理する。

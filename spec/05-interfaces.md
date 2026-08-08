@@ -1,8 +1,8 @@
-# CLI、GPUI、MCP
+# CLI、MCP
 
 ## 共通方針
 
-3 つの UI は `koe-app` の同一 command、snapshot、event API を利用する。UI 自身が
+各 interface は `koe-app` の同一 command、snapshot、event API を利用する。adapter 自身が
 CPAL stream、Foundry model handle、WAV writer を所有しない。
 
 長時間 operation は `OperationId` を返し、進捗取得、cancel、完了確認を共通化する。
@@ -36,30 +36,6 @@ koe doctor
 - password や token を command line argument で受け取らない。
 
 CLI は最初の vertical slice と reference behavior にする。
-
-## GPUI desktop
-
-GPUI の `Entity` と `Context` は desktop adapter 内の view model に限定する。
-[GPUI overview](https://github.com/zed-industries/zed/blob/main/crates/gpui/README.md#the-big-picture)
-
-画面:
-
-- setup: capability、権限、source、model
-- recorder: source meter、録音 indicator、elapsed time、transcript
-- model manager: size、license、download progress、provider
-- session library: playback、export、delete
-- settings/privacy: offline policy、retention、diagnostics
-
-録音 indicator は window 最小化中も tray/menu bar または OS が許す常時表示で維持する。
-permission prompt の前に、なぜ必要かと何を取得するかを app 内で説明する。
-
-GPUI は pre-1.0 であるため、次を release gate とする。
-
-- Windows/Linux/macOS の windowing と text input
-- accessibility tree と keyboard navigation
-- tray/menu integration
-- installer、code signing、notarization
-- panic/native runtime failure からの session recovery
 
 ## MCP stdio
 
@@ -116,7 +92,6 @@ request timeout と operation lifetime を分離する。MCP request が timeout
 初期版:
 
 - CLI: 1 process
-- GPUI: UI と core は 1 process
 - MCP: 1 stdio server process
 - 同時に複数 frontend が同じ session store を書く構成は非対応
 
