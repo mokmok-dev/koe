@@ -64,9 +64,3 @@ version = "0.0.0"
 # `cargo run` startup practical while retaining full digest verification.
 [profile.dev.package.sha2]
 opt-level = 3
-
-[patch.crates-io]
-# Upstream 1.2.3 selects NuGet native artifacts from the build host and always
-# falls back to network. The vendored patch selects from Cargo TARGET and
-# supports a strict, pre-populated FOUNDRY_NATIVE_OVERRIDE_DIR.
-foundry-local-sdk = { path = "vendor/foundry-local-sdk" }
