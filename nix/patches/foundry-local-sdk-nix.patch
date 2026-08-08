@@ -1,0 +1,305 @@
+--- a/build.rs
++++ b/build.rs
+@@ -96,45 +96,45 @@
+ const ALL_NATIVE_FILES: &[&str] = &[];
+ const WINML_RUNTIME_FILES: &[&str] = &["Microsoft.Windows.AI.MachineLearning.dll"];
+
+-fn get_rid() -> Option<&'static str> {
+-    let os = env::consts::OS;
+-    let arch = env::consts::ARCH;
+-    match (os, arch) {
+-        ("windows", "x86_64") => Some("win-x64"),
+-        ("windows", "aarch64") => Some("win-arm64"),
+-        ("linux", "x86_64") => Some("linux-x64"),
+-        ("linux", "aarch64") => Some("linux-arm64"),
+-        ("macos", "aarch64") => Some("osx-arm64"),
+-        _ => None,
+-    }
+-}
+-
+-fn native_lib_extension() -> &'static str {
+-    match env::consts::OS {
+-        "windows" => "dll",
+-        "linux" => "so",
+-        "macos" => "dylib",
+-        _ => "so",
+-    }
++struct CargoTarget {
++    os: String,
++    rid: &'static str,
++    extension: &'static str,
++    lib_prefix: &'static str,
+ }
+
+-fn native_lib_prefix() -> &'static str {
+-    if env::consts::OS == "windows" {
+-        ""
+-    } else {
+-        "lib"
++impl CargoTarget {
++    fn from_cargo_env() -> Option<Self> {
++        // Build scripts execute on the build host. Cargo's cfg variables
++        // describe TARGET, including during cross compilation.
++        let os = env::var("CARGO_CFG_TARGET_OS").ok()?;
++        let arch = env::var("CARGO_CFG_TARGET_ARCH").ok()?;
++        let (rid, extension, lib_prefix) = match (os.as_str(), arch.as_str()) {
++            ("windows", "x86_64") => ("win-x64", "dll", ""),
++            ("windows", "aarch64") => ("win-arm64", "dll", ""),
++            ("linux", "x86_64") => ("linux-x64", "so", "lib"),
++            ("linux", "aarch64") => ("linux-arm64", "so", "lib"),
++            ("macos", "aarch64") => ("osx-arm64", "dylib", "lib"),
++            _ => return None,
++        };
++        Some(Self {
++            os,
++            rid,
++            extension,
++            lib_prefix,
++        })
+     }
+ }
+
+-fn get_packages(rid: &str) -> Vec<NuGetPackage> {
++fn get_packages(target: &CargoTarget) -> Vec<NuGetPackage> {
+     let winml = env::var("CARGO_FEATURE_WINML").is_ok();
+     // Microsoft.ML.OnnxRuntime.Gpu.Linux only ships x86_64 native binaries, so use it
+     // only for linux-x64. For linux-arm64 fall through to the Foundry package which
+     // provides the arm64 ORT runtime.
+-    let is_linux_x64 = rid == "linux-x64";
++    let is_linux_x64 = target.rid == "linux-x64";
+     let deps = load_deps_versions();
+-    let ext = native_lib_extension();
+-    let prefix = native_lib_prefix();
++    let ext = target.extension;
++    let prefix = target.lib_prefix;
+
+     let core_file = format!("Microsoft.AI.Foundry.Local.Core.{ext}");
+     let ort_file = format!("{prefix}onnxruntime.{ext}");
+@@ -169,7 +169,7 @@
+             include_files: ALL_NATIVE_FILES,
+             always_extract: false,
+         });
+-        if rid.starts_with("win-") {
++        if target.rid.starts_with("win-") {
+             let winml_runtime = deps
+                 .winml_runtime
+                 .clone()
+@@ -277,7 +277,7 @@
+ /// zip parse error, etc.).
+ fn try_download_from_feed(
+     pkg: &NuGetPackage,
+-    rid: &str,
++    target: &CargoTarget,
+     out_dir: &Path,
+     feed_url: &str,
+ ) -> Result<(), String> {
+@@ -311,9 +311,9 @@
+         .read_to_end(&mut bytes)
+         .map_err(|e| format!("Failed to read response body for {}: {e}", pkg.name))?;
+
+-    let ext = native_lib_extension();
+-    let native_prefix = format!("runtimes/{rid}/native/");
+-    let runtime_prefix = format!("runtimes/{rid}/");
++    let ext = target.extension;
++    let native_prefix = format!("runtimes/{}/native/", target.rid);
++    let runtime_prefix = format!("runtimes/{}/", target.rid);
+
+     let cursor = io::Cursor::new(&bytes);
+     let mut archive = zip::ZipArchive::new(cursor)
+@@ -368,8 +368,8 @@
+
+     if extracted == 0 {
+         println!(
+-            "cargo:warning=  No native libraries found for RID '{rid}' in {} {}",
+-            pkg.name, pkg.version
++            "cargo:warning=  No native libraries found for RID '{}' in {} {}",
++            target.rid, pkg.name, pkg.version
+         );
+     }
+
+@@ -379,7 +379,11 @@
+ /// Download a .nupkg and extract native libraries for the given RID into `out_dir`.
+ /// Skips download if native files from this package are already present.
+ /// Tries each configured feed in order; on failure falls back to the next.
+-fn download_and_extract(pkg: &NuGetPackage, rid: &str, out_dir: &Path) -> Result<(), String> {
++fn download_and_extract(
++    pkg: &NuGetPackage,
++    target: &CargoTarget,
++    out_dir: &Path,
++) -> Result<(), String> {
+     // Skip if this package's main native library is already in out_dir
+     // (e.g. pre-populated from FOUNDRY_NATIVE_OVERRIDE_DIR).
+     if !pkg.always_extract && out_dir.join(&pkg.expected_file).exists() {
+@@ -392,7 +396,7 @@
+
+     let mut last_error = String::new();
+     for (i, feed_url) in FEEDS.iter().enumerate() {
+-        match try_download_from_feed(pkg, rid, out_dir, feed_url) {
++        match try_download_from_feed(pkg, target, out_dir, feed_url) {
+             Ok(()) => return Ok(()),
+             Err(e) => {
+                 let is_last = i == FEEDS.len() - 1;
+@@ -419,8 +423,8 @@
+         .all(|pkg| out_dir.join(&pkg.expected_file).exists())
+ }
+
+-fn remove_unneeded_winml_runtime_files(out_dir: &Path) {
+-    if env::var("CARGO_FEATURE_WINML").is_err() || env::consts::OS != "windows" {
++fn remove_unneeded_winml_runtime_files(out_dir: &Path, target: &CargoTarget) {
++    if env::var("CARGO_FEATURE_WINML").is_err() || target.os != "windows" {
+         return;
+     }
+
+@@ -441,18 +445,21 @@
+ fn main() {
+     println!("cargo:rerun-if-changed=build.rs");
+     println!("cargo:rerun-if-env-changed=FOUNDRY_NATIVE_OVERRIDE_DIR");
++    println!("cargo:rerun-if-env-changed=FOUNDRY_NATIVE_OFFLINE");
+     println!("cargo:rerun-if-env-changed=FOUNDRY_LOCAL_WINDOWS_AI_MACHINELEARNING_VERSION");
+     println!("cargo:rerun-if-env-changed=CARGO_FEATURE_WINML");
++    println!("cargo:rerun-if-env-changed=CARGO_CFG_TARGET_OS");
++    println!("cargo:rerun-if-env-changed=CARGO_CFG_TARGET_ARCH");
+
+     let out_dir = PathBuf::from(env::var("OUT_DIR").expect("OUT_DIR not set"));
+
+-    let rid = match get_rid() {
+-        Some(r) => r,
++    let target = match CargoTarget::from_cargo_env() {
++        Some(target) => target,
+         None => {
+             println!(
+-                "cargo:warning=Unsupported platform: {} {}. Native libraries will not be downloaded.",
+-                env::consts::OS,
+-                env::consts::ARCH,
++                "cargo:warning=Unsupported Cargo target: {} {}. Native libraries will not be downloaded.",
++                env::var("CARGO_CFG_TARGET_OS").unwrap_or_else(|_| "unknown-os".to_string()),
++                env::var("CARGO_CFG_TARGET_ARCH").unwrap_or_else(|_| "unknown-arch".to_string()),
+             );
+             return;
+         }
+@@ -464,57 +471,72 @@
+     // will then only fetch packages whose files are still missing (ORT, GenAI).
+     if let Ok(override_dir) = env::var("FOUNDRY_NATIVE_OVERRIDE_DIR") {
+         let src = Path::new(&override_dir);
+-        if src.is_dir() {
+-            let ext = native_lib_extension();
+-            for entry in fs::read_dir(src).expect("Failed to read FOUNDRY_NATIVE_OVERRIDE_DIR") {
+-                let path = entry.expect("Failed to read dir entry").path();
+-                if path.extension().and_then(|e| e.to_str()) == Some(ext) {
+-                    let dest = out_dir.join(path.file_name().unwrap());
+-                    if env::var("CARGO_FEATURE_WINML").is_ok()
+-                        && env::consts::OS == "windows"
+-                        && path
+-                            .file_name()
+-                            .and_then(|n| n.to_str())
+-                            .map(|n| n.eq_ignore_ascii_case("DirectML.dll"))
+-                            .unwrap_or(false)
+-                    {
+-                        println!("cargo:warning=Skipped unneeded DirectML.dll from override dir");
+-                        continue;
+-                    }
+-
+-                    fs::copy(&path, &dest).expect("Failed to copy native lib from override dir");
+-                    println!(
+-                        "cargo:warning=Copied {} from override dir",
+-                        path.file_name().unwrap().to_string_lossy()
+-                    );
++        assert!(
++            src.is_dir(),
++            "FOUNDRY_NATIVE_OVERRIDE_DIR is not a directory: {}",
++            src.display()
++        );
++        for entry in fs::read_dir(src).expect("Failed to read FOUNDRY_NATIVE_OVERRIDE_DIR") {
++            let path = entry.expect("Failed to read dir entry").path();
++            if path.extension().and_then(|e| e.to_str()) == Some(target.extension) {
++                let dest = out_dir.join(path.file_name().unwrap());
++                if env::var("CARGO_FEATURE_WINML").is_ok()
++                    && target.os == "windows"
++                    && path
++                        .file_name()
++                        .and_then(|n| n.to_str())
++                        .map(|n| n.eq_ignore_ascii_case("DirectML.dll"))
++                        .unwrap_or(false)
++                {
++                    println!("cargo:warning=Skipped unneeded DirectML.dll from override dir");
++                    continue;
+                 }
++
++                fs::copy(&path, &dest).expect("Failed to copy native lib from override dir");
++                println!(
++                    "cargo:warning=Copied {} from override dir",
++                    path.file_name().unwrap().to_string_lossy()
++                );
+             }
+         }
+     }
+
+-    let packages = get_packages(rid);
+-    let packages_require_extraction = packages.iter().any(|pkg| pkg.always_extract);
++    let packages = get_packages(&target);
+
+-    // Skip all downloads if every required library is already present.
+-    // WinML packages that overwrite stale runtime files still need to run.
+-    if !packages_require_extraction && libs_already_present(&packages, &out_dir) {
++    // A complete pre-populated directory is authoritative, including for
++    // WinML. This is the no-network path used by sandboxed/Nix builds.
++    if libs_already_present(&packages, &out_dir) {
+         println!("cargo:warning=Native libraries already present in OUT_DIR, skipping download.");
+         println!("cargo:rustc-link-search=native={}", out_dir.display());
+         println!("cargo:rustc-env=FOUNDRY_NATIVE_DIR={}", out_dir.display());
+-        #[cfg(windows)]
+-        println!("cargo:rustc-link-lib=kernel32");
++        if target.os == "windows" {
++            println!("cargo:rustc-link-lib=kernel32");
++        }
+         return;
+     }
+
++    if env::var_os("FOUNDRY_NATIVE_OFFLINE").is_some() {
++        let missing = packages
++            .iter()
++            .filter(|pkg| !out_dir.join(&pkg.expected_file).exists())
++            .map(|pkg| pkg.expected_file.as_str())
++            .collect::<Vec<_>>()
++            .join(", ");
++        panic!(
++            "FOUNDRY_NATIVE_OFFLINE is set and FOUNDRY_NATIVE_OVERRIDE_DIR did not provide required target artifacts for {}: {}",
++            target.rid, missing
++        );
++    }
++
+     let mut download_failed = false;
+     for pkg in &packages {
+-        if let Err(e) = download_and_extract(pkg, rid, &out_dir) {
++        if let Err(e) = download_and_extract(pkg, &target, &out_dir) {
+             println!("cargo:warning=Error downloading {}: {e}", pkg.name);
+             download_failed = true;
+         }
+     }
+
+-    remove_unneeded_winml_runtime_files(&out_dir);
++    remove_unneeded_winml_runtime_files(&out_dir, &target);
+
+     if download_failed && !libs_already_present(&packages, &out_dir) {
+         panic!(
+@@ -528,6 +550,7 @@
+     println!("cargo:rustc-env=FOUNDRY_NATIVE_DIR={}", out_dir.display());
+
+     // LocalFree (used to free native-allocated buffers) lives in kernel32.lib on Windows.
+-    #[cfg(windows)]
+-    println!("cargo:rustc-link-lib=kernel32");
++    if target.os == "windows" {
++        println!("cargo:rustc-link-lib=kernel32");
++    }
+ }
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -101,6 +101,8 @@
+
+ [build-dependencies.zip]
+ version = "2"
++features = ["deflate"]
++default-features = false
+
+ [lints.clippy.all]
+ level = "warn"

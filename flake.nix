@@ -150,7 +150,14 @@
             src = ./.;
             overrideVendorCargoPackage =
               package: drv:
-              if package.name == "libspa-sys" && package.version == "0.10.0" then
+              if package.name == "foundry-local-sdk" && package.version == "1.2.3" then
+                drv.overrideAttrs (old: {
+                  prePatch = (old.prePatch or "") + ''
+                    sed -i 's/\r$//' build.rs
+                  '';
+                  patches = [ ./nix/patches/foundry-local-sdk-nix.patch ];
+                })
+              else if package.name == "libspa-sys" && package.version == "0.10.0" then
                 drv.overrideAttrs {
                   patches = [ ./nix/patches/libspa-sys-bindgen-out-dir.patch ];
                 }
@@ -198,6 +205,7 @@
               buildInputs = pkgs.lib.optionals pkgs.stdenv.isLinux [
                 pkgs.alsa-lib
                 pkgs.libpulseaudio
+                pkgs.openssl
                 pkgs.pipewire
               ];
               nativeBuildInputs = pkgs.lib.optionals pkgs.stdenv.isLinux [
