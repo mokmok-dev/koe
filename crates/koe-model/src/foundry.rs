@@ -79,6 +79,27 @@ impl FoundryLocalAdapter {
         Ok(model)
     }
 
+    /// Ensure execution providers are registered with the native core.
+    ///
+    /// The native core bundles onnxruntime libraries but requires explicit
+    /// registration via `download_and_register_eps`. Without this step
+    /// inference silently produces no output (empty responses).
+    ///
+    /// Registration is idempotent — already-registered EPs are
+    /// skipped without error.
+    async fn ensure_eps_registered(&mut self) -> Result<(), AdapterError> {
+        let manager = self.manager()?;
+        // Register all available execution providers. On Apple Silicon
+        // this will be WebGpuExecutionProvider; on Intel it will be
+        // CPUExecutionProvider. Passing `None` lets the native core
+        // discover and register whichever EPs are available.
+        manager.download_and_register_eps(None).await.map_err(|e| {
+            eprintln!("[koe] EP registration failed: {e:?}");
+            AdapterError::RuntimeFailed
+        })?;
+        Ok(())
+    }
+
     fn artifact_from_path(
         descriptor: &ModelDescriptor,
         artifact_root: &Path,
@@ -613,6 +634,10 @@ impl FoundryAdapter for FoundryLocalAdapter {
             return Err(AdapterError::DownloadFailed);
         }
         let model = self.exact_model(descriptor).await?;
+        // Register execution providers before downloading the model.
+        // The native core requires EPs to be registered for inference
+        // to work, even though the onnxruntime libraries are bundled.
+        self.ensure_eps_registered().await?;
         let cache_existed = model.is_cached().await.map_err(map_runtime_error)?;
         if sdk_download_required(cache_existed, force)? {
             let cancel_flag = Arc::new(AtomicBool::new(false));
@@ -666,6 +691,9 @@ impl FoundryAdapter for FoundryLocalAdapter {
         if !model.is_cached().await.map_err(map_runtime_error)? {
             return Err(AdapterError::NotFound);
         }
+        // Ensure execution providers are registered before loading.
+        // The native core requires EPs for inference.
+        self.ensure_eps_registered().await?;
         model.load().await.map_err(map_runtime_error)
     }
 
