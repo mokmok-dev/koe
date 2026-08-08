@@ -7,6 +7,7 @@
 use std::{
     collections::{HashMap, HashSet},
     fs,
+    future::Future,
     io::{self, BufRead, Read, Write},
     path::{Path, PathBuf},
     sync::{
@@ -36,6 +37,9 @@ const MAX_RETAINED_OPERATIONS: usize = 64;
 const MAX_EXPORT_FILES: usize = 100_000;
 const MAX_EXPORT_BYTES: u64 = 256 * 1024 * 1024 * 1024;
 const MAX_EXPORT_DEPTH: usize = 32;
+const OPERATION_DEADLINE: Duration = Duration::from_hours(1);
+const CANCELLATION_GRACE: Duration = Duration::from_secs(5);
+const OPERATION_DEADLINE_ERROR: &str = "KOE-MCP-OPERATION-DEADLINE";
 const PROTOCOL_VERSION: &str = "2025-06-18";
 
 #[derive(Debug, Parser)]
@@ -445,23 +449,16 @@ impl Server {
                 policy: NetworkPolicy::ModelInstallOnly,
                 cancel: thread_cancellation.clone(),
                 progress: Some(progress),
-                accepted_descriptor: None,
+                expected_descriptor: None,
                 force_redownload: false,
             };
-            let result = block_on(async {
+            let outcome = block_on(async {
                 let install_with_progress = async {
                     let install = manager.install(&selector, &options);
-                    let deadline = tokio::time::sleep(Duration::from_hours(1));
                     tokio::pin!(install);
-                    tokio::pin!(deadline);
-                    let mut timeout_requested = false;
                     loop {
                         tokio::select! {
                             result = &mut install => break result,
-                            () = &mut deadline, if !timeout_requested => {
-                                timeout_requested = true;
-                                thread_cancellation.cancel();
-                            },
                             phase = progress_rx.recv() => {
                                 let Some(phase) = phase else {
                                     break install.await;
@@ -473,16 +470,27 @@ impl Server {
                         }
                     }
                 };
-                install_with_progress.await
+                run_with_deadline(
+                    install_with_progress,
+                    &thread_cancellation,
+                    OPERATION_DEADLINE,
+                    CANCELLATION_GRACE,
+                )
+                .await
             });
             if let Ok(mut state) = thread_snapshot.lock() {
-                state.state = match result {
-                    Ok(_) => {
+                state.state = match outcome {
+                    TimedOperation::Completed(Ok(_)) => {
                         state.progress = 100;
                         OperationState::Completed
                     },
-                    Err(ModelError::Cancelled) => OperationState::Cancelled,
-                    Err(error) => {
+                    TimedOperation::Completed(Err(ModelError::Cancelled))
+                    | TimedOperation::Cancelled => OperationState::Cancelled,
+                    TimedOperation::DeadlineExceeded => {
+                        state.error_code = Some(OPERATION_DEADLINE_ERROR);
+                        OperationState::Failed
+                    },
+                    TimedOperation::Completed(Err(error)) => {
                         state.error_code = Some(error.code());
                         OperationState::Failed
                     },
@@ -1267,6 +1275,44 @@ const fn has_multiple_links(_metadata: &fs::Metadata) -> bool {
     false
 }
 
+enum TimedOperation<T> {
+    Completed(T),
+    Cancelled,
+    DeadlineExceeded,
+}
+
+#[derive(Clone, Copy)]
+enum StopReason {
+    Cancelled,
+    DeadlineExceeded,
+}
+
+async fn run_with_deadline<F>(
+    operation: F,
+    cancellation: &tokio_util::sync::CancellationToken,
+    deadline: Duration,
+    cancellation_grace: Duration,
+) -> TimedOperation<F::Output>
+where
+    F: Future,
+{
+    tokio::pin!(operation);
+    let reason = tokio::select! {
+        biased;
+        output = &mut operation => return TimedOperation::Completed(output),
+        () = cancellation.cancelled() => StopReason::Cancelled,
+        () = tokio::time::sleep(deadline) => StopReason::DeadlineExceeded,
+    };
+    cancellation.cancel();
+    if let Ok(output) = tokio::time::timeout(cancellation_grace, &mut operation).await {
+        return TimedOperation::Completed(output);
+    }
+    match reason {
+        StopReason::Cancelled => TimedOperation::Cancelled,
+        StopReason::DeadlineExceeded => TimedOperation::DeadlineExceeded,
+    }
+}
+
 const fn model_progress_value(progress: &ModelProgress) -> u8 {
     match progress {
         ModelProgress::Resolving => 5,
@@ -1509,11 +1555,18 @@ fn main() -> std::process::ExitCode {
 mod tests {
     use tempfile::TempDir;
 
-    use std::sync::{Arc, Mutex};
+    use std::{
+        future::pending,
+        sync::{Arc, Mutex},
+        time::Duration,
+    };
 
     use koe_core::{OperationId, SessionId};
 
-    use super::{Args, LifecycleState, Operation, OperationSnapshot, OperationState, Server};
+    use super::{
+        Args, LifecycleState, Operation, OperationSnapshot, OperationState, Server, TimedOperation,
+        run_with_deadline,
+    };
 
     fn request(
         server: &mut Server,
@@ -1536,6 +1589,53 @@ mod tests {
         let mut server = server(root);
         server.lifecycle = LifecycleState::Initialized;
         server
+    }
+
+    #[tokio::test]
+    async fn operation_deadline_has_bounded_cooperative_cancellation() {
+        let cooperative_cancel = tokio_util::sync::CancellationToken::new();
+        let observed_cancel = cooperative_cancel.clone();
+        let cooperative = async move {
+            observed_cancel.cancelled().await;
+            7_u8
+        };
+        assert!(matches!(
+            run_with_deadline(
+                cooperative,
+                &cooperative_cancel,
+                Duration::ZERO,
+                Duration::from_secs(1),
+            )
+            .await,
+            TimedOperation::Completed(7)
+        ));
+        assert!(cooperative_cancel.is_cancelled());
+
+        let ignored_cancel = tokio_util::sync::CancellationToken::new();
+        assert!(matches!(
+            run_with_deadline(
+                pending::<()>(),
+                &ignored_cancel,
+                Duration::ZERO,
+                Duration::ZERO,
+            )
+            .await,
+            TimedOperation::DeadlineExceeded
+        ));
+        assert!(ignored_cancel.is_cancelled());
+
+        let explicit_cancel = tokio_util::sync::CancellationToken::new();
+        explicit_cancel.cancel();
+        assert!(matches!(
+            run_with_deadline(
+                pending::<()>(),
+                &explicit_cancel,
+                Duration::from_secs(1),
+                Duration::ZERO,
+            )
+            .await,
+            TimedOperation::Cancelled
+        ));
     }
 
     #[test]

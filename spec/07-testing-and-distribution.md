@@ -81,6 +81,15 @@ Hosted CI:
 Nix は既存の Linux x86_64/arm64、Apple Silicon を維持する。Windows と Intel macOS は
 GitHub Actions の native runner を authoritative build とする。
 
+`foundry-local-sdk` 1.2.3 は vendored patch で build host の `env::consts` ではなく Cargo
+`CARGO_CFG_TARGET_OS` / `CARGO_CFG_TARGET_ARCH` から RID、拡張子、prefix を選ぶ。
+flake は Core 1.2.3、ORT 1.26.0、GenAI 0.14.1（Windows WinML 2.1.1 を含む）の NuGet を
+fixed-output `fetchurl` で取得・target RID ごとに展開し、`FOUNDRY_NATIVE_OVERRIDE_DIR` と
+`FOUNDRY_NATIVE_OFFLINE=1` を native build と Windows cross build の crane derivation に渡す。
+strict offline mode で必要 library が不足した場合は network fallback せず build を失敗させる。
+通常の Nix 外 Cargo build は override 未指定なら upstream と同じ pinned NuGet download を
+利用でき、完全な pre-populated directory を指定すれば network を使わない。
+
 PR では model download を行わず fake/fixture を使う。nightly/release candidate で
 許可された test cache と HIL を使い、license acceptance を自動 bypass しない。
 

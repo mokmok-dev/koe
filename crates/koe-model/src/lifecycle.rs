@@ -42,7 +42,7 @@ impl ModelState {
                 | (Loading, Ready | Unloading | Failed)
                 | (Ready, InUse | Unloading | Failed)
                 | (InUse, InUse | Unloading | Failed)
-                | (Unloading, Installed | Failed)
+                | (Unloading, Installed | Ready | Failed)
                 | (Removing, Absent | Failed)
                 | (Failed, Absent)
         )
@@ -141,6 +141,33 @@ mod tests {
         ] {
             assert!(lifecycle.transition(state).is_ok());
         }
+    }
+
+    #[test]
+    fn failed_unload_can_return_to_ready_for_retry() {
+        let mut lifecycle = ModelLifecycle {
+            state: ModelState::Ready,
+        };
+        lifecycle
+            .transition(ModelState::Unloading)
+            .expect("unloading");
+        lifecycle.transition(ModelState::Ready).expect("ready");
+        assert_eq!(lifecycle.state(), ModelState::Ready);
+    }
+
+    #[test]
+    fn final_session_release_unloads_to_installed() {
+        let mut lifecycle = ModelLifecycle {
+            state: ModelState::Ready,
+        };
+        lifecycle.transition(ModelState::InUse).expect("in use");
+        lifecycle
+            .transition(ModelState::Unloading)
+            .expect("unloading");
+        lifecycle
+            .transition(ModelState::Installed)
+            .expect("installed");
+        assert_eq!(lifecycle.state(), ModelState::Installed);
     }
 
     #[test]

@@ -5,11 +5,11 @@ edition.workspace = true
 
 [features]
 default = ["foundry-local"]
-foundry-local = ["dep:foundry-local"]
+foundry-local = ["dep:foundry-local-sdk", "dep:futures-util"]
 
 [dependencies]
 async-trait.workspace = true
-foundry-local = { version = "0.1.0", optional = true }
+futures-util = { workspace = true, optional = true }
 fs2 = "0.4"
 cap-std.workspace = true
 cap-fs-ext = "4.0.2"
@@ -22,7 +22,16 @@ tokio = { workspace = true }
 tokio-util.workspace = true
 uuid.workspace = true
 
+[target.'cfg(not(windows))'.dependencies]
+foundry-local-sdk = { workspace = true, optional = true }
+
 [target.'cfg(windows)'.dependencies]
+foundry-local-sdk = { workspace = true, features = ["winml"], optional = true }
+same-file = "1.0.6"
+windows-sys = { version = "0.61.2", features = [
+    "Win32_Foundation",
+    "Win32_Storage_FileSystem",
+] }
 atomicwrites = "0.4"
 
 [target.'cfg(unix)'.dependencies]

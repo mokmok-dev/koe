@@ -486,13 +486,45 @@ impl InstalledArtifact {
     }
 }
 
+/// Largest caller-side chunk target accepted for one live session.
+pub const MAX_ASR_CHUNK_MS: u64 = 60_000;
+/// Largest SDK push queue accepted for one live session.
+pub const MAX_ASR_PUSH_QUEUE_CAPACITY: usize = 4_096;
+
 /// Bounded live-session configuration frozen at creation.
 #[derive(Clone, Debug)]
 pub struct AsrSessionSettings {
+    /// Caller-side target duration and per-append upper bound.
+    ///
+    /// The manager does not rechunk input: callers must construct canonical
+    /// chunks at this duration. A shorter final chunk is accepted, while a
+    /// larger append returns [`AsrError::InvalidInput`]. Must be in
+    /// `1..=MAX_ASR_CHUNK_MS`.
     pub chunk_ms: u64,
     /// Optional BCP-47 language hint.
     pub language: Option<String>,
+    /// SDK push queue size. Must be in `1..=MAX_ASR_PUSH_QUEUE_CAPACITY`.
     pub push_queue_capacity: usize,
+}
+
+impl AsrSessionSettings {
+    /// Validates settings before a model reference or runtime session is acquired.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ModelError::InvalidSettings`] for a chunk duration outside
+    /// `1..=MAX_ASR_CHUNK_MS` or a push queue capacity outside
+    /// `1..=MAX_ASR_PUSH_QUEUE_CAPACITY`.
+    pub const fn validate(&self) -> Result<(), ModelError> {
+        if self.chunk_ms == 0
+            || self.chunk_ms > MAX_ASR_CHUNK_MS
+            || self.push_queue_capacity == 0
+            || self.push_queue_capacity > MAX_ASR_PUSH_QUEUE_CAPACITY
+        {
+            return Err(ModelError::InvalidSettings);
+        }
+        Ok(())
+    }
 }
 
 impl Default for AsrSessionSettings {
@@ -558,6 +590,9 @@ pub trait StreamingAsrSession: Send {
     async fn poll_results(&mut self) -> Result<Option<AsrEvent>, AsrError>;
 
     /// Flushes remaining audio and returns the full transcript.
+    ///
+    /// Manager-created sessions also release their runtime reference here and
+    /// unload the model after the final concurrent session.
     ///
     /// # Errors
     ///
@@ -641,6 +676,10 @@ pub enum AdapterError {
     NotFound,
     #[error("adapter reported an invalid model artifact: {0}")]
     InvalidArtifact(ArtifactValidationError),
+    #[error("ASR session settings are invalid")]
+    InvalidSettings,
+    #[error("safe force-redownload is unsupported by the runtime")]
+    ForceRedownloadUnsupported,
 }
 
 /// Port implemented by the foundry SDK and by test fixtures.
@@ -699,7 +738,9 @@ pub trait FoundryAdapter: Send + Sync {
     ///
     /// # Errors
     ///
-    /// Returns an adapter error when the download fails.
+    /// Returns an adapter error when the download fails or a safe forced
+    /// replacement is unsupported. Implementations must not remove a usable
+    /// cache entry before a forced replacement succeeds.
     async fn install(
         &mut self,
         model: &ModelDescriptor,
@@ -771,7 +812,7 @@ pub trait FoundryAdapter: Send + Sync {
     ///
     /// # Errors
     ///
-    /// Returns an adapter error when the runtime is unavailable.
+    /// Returns an adapter error when settings are invalid or the runtime is unavailable.
     async fn create_asr_session(
         &mut self,
         model: &ModelDescriptor,
@@ -780,6 +821,15 @@ pub trait FoundryAdapter: Send + Sync {
 
     /// Queries which scopes resolve locally without the online catalog.
     fn offline_scopes(&self) -> Vec<ModelScope>;
+
+    /// Whether this runtime can atomically replace an already-cached model.
+    ///
+    /// The default is `false`, so adding this query does not require existing
+    /// adapters to implement a new method. Callers should check it before
+    /// exposing force-redownload as an available action.
+    fn supports_cached_force_redownload(&self) -> bool {
+        false
+    }
 
     /// Number of outbound adapter calls attempted, for offline-enforcement
     /// diagnostics. The default adapter reports `0`; test adapters override.
@@ -803,6 +853,8 @@ pub const fn map_adapter_error(error: AdapterError) -> ModelError {
             ArtifactValidationError::DuplicateEntry => ModelArtifactFailure::DuplicateEntry,
             ArtifactValidationError::LimitExceeded => ModelArtifactFailure::LimitExceeded,
         }),
+        AdapterError::InvalidSettings => ModelError::InvalidSettings,
+        AdapterError::ForceRedownloadUnsupported => ModelError::ForceRedownloadUnsupported,
         AdapterError::CatalogFailed
         | AdapterError::DownloadFailed
         | AdapterError::RuntimeFailed => ModelError::Internal,

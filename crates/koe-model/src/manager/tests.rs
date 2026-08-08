@@ -24,7 +24,7 @@ fn install_options(policy: NetworkPolicy) -> InstallOptions {
         policy,
         cancel: tokio_util::sync::CancellationToken::new(),
         progress: None,
-        accepted_descriptor: None,
+        expected_descriptor: None,
         force_redownload: false,
     }
 }
@@ -373,7 +373,7 @@ async fn closed_progress_channel_does_not_fail_install() {
                 policy: NetworkPolicy::ModelInstallOnly,
                 cancel: tokio_util::sync::CancellationToken::new(),
                 progress: Some(progress),
-                accepted_descriptor: None,
+                expected_descriptor: None,
                 force_redownload: false,
             },
         )
@@ -400,7 +400,7 @@ async fn install_progress_reaches_done_and_cancel_stops_install() {
                 policy: NetworkPolicy::ModelInstallOnly,
                 cancel: tokio_util::sync::CancellationToken::new(),
                 progress: Some(progress),
-                accepted_descriptor: None,
+                expected_descriptor: None,
                 force_redownload: false,
             },
         )
@@ -429,7 +429,7 @@ async fn install_progress_reaches_done_and_cancel_stops_install() {
                 policy: NetworkPolicy::ModelInstallOnly,
                 cancel,
                 progress: None,
-                accepted_descriptor: None,
+                expected_descriptor: None,
                 force_redownload: false,
             },
         )
