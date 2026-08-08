@@ -6,7 +6,7 @@
 
 use std::{
     collections::HashMap,
-    path::{Path, PathBuf},
+    path::Path,
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
@@ -24,18 +24,17 @@ use futures_util::{FutureExt as _, StreamExt as _};
 
 use crate::{
     adapter::{
-        AdapterError, AsrError, AsrEvent, AsrSessionSettings, FinalTranscript, FoundryAdapter,
-        InstalledArtifact, InstalledFile, Pcm16Mono16k, StreamingAsrSession,
+        AdapterError, ArtifactValidationError, AsrError, AsrEvent, AsrSessionSettings,
+        FinalTranscript, FoundryAdapter, InstalledArtifact, InstalledFile, Pcm16Mono16k,
+        StreamingAsrSession,
     },
     types::{Alias, ModelDescriptor, ModelId, ModelScope, ModelSelector, ModelVersion},
 };
 
 /// Maximum directory depth inventoried inside one runtime-owned model path.
 const MAX_CACHE_DEPTH: usize = 4;
-/// Maximum files and bytes admitted to one digest inventory.
+/// Maximum files admitted to one digest inventory.
 const MAX_INVENTORY_FILES: usize = 1_024;
-const MAX_INVENTORY_FILE_BYTES: u64 = 16 * 1024 * 1024 * 1024;
-const MAX_INVENTORY_TOTAL_BYTES: u64 = 16 * 1024 * 1024 * 1024;
 /// Maximum entries examined while inventorying one exact SDK model path.
 const MAX_CACHE_ENTRIES: usize = 16_384;
 /// Wraps the process-wide SDK manager without exposing it through koe APIs.
@@ -82,11 +81,11 @@ impl FoundryLocalAdapter {
 
     fn artifact_from_path(
         descriptor: &ModelDescriptor,
-        artifact_root: PathBuf,
+        artifact_root: &Path,
         created_by_operation: bool,
     ) -> Result<InstalledArtifact, AdapterError> {
         let artifact_metadata =
-            std::fs::symlink_metadata(&artifact_root).map_err(|_| AdapterError::RuntimeFailed)?;
+            std::fs::symlink_metadata(artifact_root).map_err(|_| AdapterError::RuntimeFailed)?;
         if artifact_metadata.file_type().is_symlink() || !artifact_metadata.is_dir() {
             return Err(AdapterError::RuntimeFailed);
         }
@@ -106,16 +105,18 @@ impl FoundryLocalAdapter {
         let mut entries_examined = 0_usize;
         collect_files(
             &cache_root,
-            &artifact_root,
+            artifact_root,
             0,
             &mut files,
             &mut total_bytes,
             &mut entries_examined,
         )?;
         if files.is_empty() {
-            return Err(AdapterError::RuntimeFailed);
+            return Err(AdapterError::InvalidArtifact(
+                ArtifactValidationError::EmptyInventory,
+            ));
         }
-        files.sort_by(|left, right| left.relative_path.cmp(&right.relative_path));
+        files.sort_by(|left, right| left.relative_path().cmp(right.relative_path()));
         Ok(InstalledArtifact {
             cache_root,
             model_id: descriptor.id.clone(),
@@ -193,11 +194,11 @@ fn descriptor_matches_persisted(
 }
 
 fn collect_files(
-    cache_root: &Path,
+    root: &Path,
     directory: &Path,
     depth: usize,
     files: &mut Vec<InstalledFile>,
-    total_bytes: &mut u64,
+    total_size: &mut u64,
     entries_examined: &mut usize,
 ) -> Result<(), AdapterError> {
     if depth > MAX_CACHE_DEPTH {
@@ -210,47 +211,38 @@ fn collect_files(
         let path = entry.path();
         let file_type = entry.file_type().map_err(|_| AdapterError::RuntimeFailed)?;
         if file_type.is_symlink() {
-            return Err(AdapterError::RuntimeFailed);
+            return Err(AdapterError::InvalidArtifact(
+                ArtifactValidationError::Symlink,
+            ));
         }
         if file_type.is_dir() {
-            collect_files(
-                cache_root,
-                &path,
-                depth + 1,
-                files,
-                total_bytes,
-                entries_examined,
-            )?;
+            collect_files(root, &path, depth + 1, files, total_size, entries_examined)?;
         } else if file_type.is_file() {
             if files.len() >= MAX_INVENTORY_FILES {
-                return Err(AdapterError::RuntimeFailed);
+                return Err(AdapterError::InvalidArtifact(
+                    ArtifactValidationError::LimitExceeded,
+                ));
             }
-            let size = entry
-                .metadata()
-                .map_err(|_| AdapterError::RuntimeFailed)?
-                .len();
-            if size > MAX_INVENTORY_FILE_BYTES {
-                return Err(AdapterError::RuntimeFailed);
+            let metadata = entry.metadata().map_err(|_| AdapterError::RuntimeFailed)?;
+            *total_size =
+                total_size
+                    .checked_add(metadata.len())
+                    .ok_or(AdapterError::InvalidArtifact(
+                        ArtifactValidationError::LimitExceeded,
+                    ))?;
+            if *total_size > crate::MAX_ARTIFACT_INVENTORY_BYTES {
+                return Err(AdapterError::InvalidArtifact(
+                    ArtifactValidationError::LimitExceeded,
+                ));
             }
-            *total_bytes = total_bytes
-                .checked_add(size)
-                .filter(|total| *total <= MAX_INVENTORY_TOTAL_BYTES)
-                .ok_or(AdapterError::RuntimeFailed)?;
-            let relative_path = path
-                .strip_prefix(cache_root)
-                .map_err(|_| AdapterError::RuntimeFailed)?
-                .to_string_lossy()
-                .replace('\\', "/");
-            files.push(InstalledFile {
-                absolute_path: path,
-                relative_path,
-                size,
-                // Koe computes the authoritative digest after validating and
-                // reopening every reported file.
-                sha256: String::new(),
-            });
+            let relative = path
+                .strip_prefix(root)
+                .map_err(|_| AdapterError::RuntimeFailed)?;
+            files.push(InstalledFile::try_from_cache_path_blocking(root, relative)?);
         } else {
-            return Err(AdapterError::RuntimeFailed);
+            return Err(AdapterError::InvalidArtifact(
+                ArtifactValidationError::InvalidPath,
+            ));
         }
     }
     Ok(())
@@ -643,7 +635,12 @@ impl FoundryAdapter for FoundryLocalAdapter {
             return Err(AdapterError::DownloadFailed);
         }
         let path = model.path().await.map_err(map_runtime_error)?;
-        Self::artifact_from_path(descriptor, path, !cache_existed)
+        let descriptor = descriptor.clone();
+        tokio::task::spawn_blocking(move || {
+            Self::artifact_from_path(&descriptor, &path, !cache_existed)
+        })
+        .await
+        .map_err(|_| AdapterError::RuntimeFailed)?
     }
 
     async fn inspect_local_artifact(
@@ -655,7 +652,10 @@ impl FoundryAdapter for FoundryLocalAdapter {
             return Err(AdapterError::NotFound);
         }
         let path = model.path().await.map_err(map_runtime_error)?;
-        Self::artifact_from_path(descriptor, path, false)
+        let descriptor = descriptor.clone();
+        tokio::task::spawn_blocking(move || Self::artifact_from_path(&descriptor, &path, false))
+            .await
+            .map_err(|_| AdapterError::RuntimeFailed)?
     }
 
     async fn load(
@@ -945,13 +945,15 @@ mod tests {
         std::fs::create_dir(&artifact_root).expect("artifact");
         std::fs::write(artifact_root.join("model.bin"), b"model").expect("model");
         let descriptor = crate::FixtureFoundryAdapter::fixture_descriptor();
-        let artifact =
-            FoundryLocalAdapter::artifact_from_path(&descriptor, artifact_root.clone(), true)
-                .expect("inventory");
-        assert_eq!(artifact.artifact_root, artifact_root);
-        assert_eq!(artifact.files.len(), 1);
-        assert_eq!(artifact.files[0].relative_path, "exact-model-id/model.bin");
-        assert!(artifact.created_by_install);
+        let artifact = FoundryLocalAdapter::artifact_from_path(&descriptor, &artifact_root, true)
+            .expect("inventory");
+        assert_eq!(artifact.cache_root(), cache.path());
+        assert_eq!(artifact.files().len(), 1);
+        assert_eq!(
+            artifact.files()[0].relative_path(),
+            "exact-model-id/model.bin"
+        );
+        assert!(artifact.was_created_by_install());
     }
 
     #[test]
@@ -975,7 +977,7 @@ mod tests {
         symlink(&outside, artifact_root.join("model.bin")).expect("symlink");
         let descriptor = crate::FixtureFoundryAdapter::fixture_descriptor();
         assert!(
-            FoundryLocalAdapter::artifact_from_path(&descriptor, artifact_root, false).is_err()
+            FoundryLocalAdapter::artifact_from_path(&descriptor, &artifact_root, false).is_err()
         );
     }
 

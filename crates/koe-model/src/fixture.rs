@@ -182,17 +182,6 @@ pub struct SessionCreationControl {
     release: Arc<tokio::sync::Notify>,
 }
 
-#[cfg(test)]
-impl SessionCreationControl {
-    pub(super) async fn wait_until_entered(&self) {
-        self.entered.notified().await;
-    }
-
-    pub(super) fn release(&self) {
-        self.release.notify_one();
-    }
-}
-
 #[derive(Default)]
 enum FixtureSessionFailure {
     #[default]
@@ -283,28 +272,6 @@ impl FixtureFoundryAdapter {
     #[must_use]
     pub const fn failing_session_finish(mut self) -> Self {
         self.session_failure = FixtureSessionFailure::Finish;
-        self
-    }
-
-    /// Fails the requested number of unload attempts.
-    #[cfg(test)]
-    pub(crate) const fn with_unload_failures(
-        mut self,
-        failures: usize,
-    ) -> Self {
-        self.unload_failures_remaining = failures;
-        self
-    }
-
-    /// Blocks the first session start and fails the requested number of starts.
-    #[cfg(test)]
-    pub(crate) fn with_controlled_session_creation(
-        mut self,
-        control: SessionCreationControl,
-        failures: usize,
-    ) -> Self {
-        self.session_creation_control = Some(control);
-        self.session_creation_failures = failures;
         self
     }
 
