@@ -24,6 +24,9 @@ Absent
 
 各操作は cancellation token と progress event を受け取る。中断された download は
 `Installed` に遷移させず、staging directory を cleanup または quarantine する。
+既存 cache の force-redownload は usable artifact を先に削除してはならない。公式 SDK
+1.2.3 には atomic force/replace option がないため、Foundry adapter は既存 cache を保持して
+`KOE-MODEL-FORCE-REDOWNLOAD-UNSUPPORTED` を返す。
 `remove` は active session、loaded model、参照中 recording job がある間は拒否する。
 
 ## 抽象 API
@@ -130,7 +133,13 @@ canonical input は `Pcm16Mono16k`。live API の既定も 16 kHz、mono、16-bi
 [Foundry live session](https://github.com/microsoft/Foundry-Local/blob/b4ca39fcb4cc90aaea6f6e89e6665f9577e69855/sdk/rust/src/openai/live_audio_session.rs#L1-L708)
 
 `is_final` は model-neutral event に保持するが、現行 Nemotron は常に final とされる。
-partial の置換を前提とした UI にしない。chunk は 80/160/560/1120 ms を設定候補とし、
+SDK response に ID がない場合も final まで同一 fallback segment ID を保持し、timestamp が
+省略された revision は同じ segment の直前 bounds を再利用する。`chunk_ms` は SDK 内部の
+rechunk option ではなく caller-side の目標 duration と 1 append の上限であり、caller が
+16 kHz PCM をその長さに分割する（最後の短い chunk は許可）。session settings は
+`chunk_ms=1..=60000`、`push_queue_capacity=1..=4096` とし、違反や上限超過 append は typed
+input/settings error にする。partial の置換を前提とした UI にしない。chunk は
+80/160/560/1120 ms を設定候補とし、
 既定値は benchmark 後に決める。公開 model card では chunk 増加に伴う WER 改善が
 報告されている。
 [Nemotron performance](https://huggingface.co/nvidia/nemotron-speech-streaming-en-0.6b#performance)

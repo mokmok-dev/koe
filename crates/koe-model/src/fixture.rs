@@ -77,11 +77,12 @@ fn mean_abs(samples: &[i16]) -> u32 {
 
 /// Streaming session that produces fixture events from input PCM.
 pub struct FixtureAsrSession {
-    _settings: AsrSessionSettings,
+    settings: AsrSessionSettings,
     cursor_us: u64,
     events: Vec<AsrEvent>,
     delivered: usize,
     started: bool,
+    fail_finish: bool,
 }
 
 impl FixtureAsrSession {
@@ -89,11 +90,19 @@ impl FixtureAsrSession {
     #[must_use]
     pub fn new(settings: &AsrSessionSettings) -> Self {
         Self {
-            _settings: settings.clone(),
+            settings: settings.clone(),
             cursor_us: 0,
             events: Vec::new(),
             delivered: 0,
             started: true,
+            fail_finish: false,
+        }
+    }
+
+    fn failing_finish(settings: &AsrSessionSettings) -> Self {
+        Self {
+            fail_finish: true,
+            ..Self::new(settings)
         }
     }
 }
@@ -116,6 +125,11 @@ impl StreamingAsrSession for FixtureAsrSession {
     ) -> Result<(), AsrError> {
         if !self.started {
             return Err(AsrError::SessionNotActive);
+        }
+        let max_chunk_samples = usize::try_from(self.settings.chunk_ms.saturating_mul(16))
+            .map_err(|_| AsrError::InvalidInput)?;
+        if chunk.samples.len() > max_chunk_samples {
+            return Err(AsrError::InvalidInput);
         }
         if chunk.samples.is_empty() {
             return Ok(());
@@ -151,10 +165,29 @@ impl StreamingAsrSession for FixtureAsrSession {
     }
 
     async fn finish(self: Box<Self>) -> Result<FinalTranscript, AsrError> {
+        if self.fail_finish {
+            return Err(AsrError::RuntimeFailed);
+        }
         Ok(FinalTranscript {
             events: self.events,
         })
     }
+}
+
+/// Deterministic gate for concurrent session-start tests.
+#[cfg(test)]
+#[derive(Clone, Default)]
+pub struct SessionCreationControl {
+    entered: Arc<tokio::sync::Notify>,
+    release: Arc<tokio::sync::Notify>,
+}
+
+#[derive(Default)]
+enum FixtureSessionFailure {
+    #[default]
+    None,
+    Creation,
+    Finish,
 }
 
 /// Adapter that materializes fixture artifacts and fakes runtime state.
@@ -165,6 +198,19 @@ pub struct FixtureFoundryAdapter {
     install_calls: Arc<Mutex<usize>>,
     install_delay: Duration,
     ignore_install_cancellation: bool,
+    accepted_selector_aliases: BTreeSet<String>,
+    change_descriptor_after_first_resolution: bool,
+    session_failure: FixtureSessionFailure,
+    #[cfg(test)]
+    unload_failures_remaining: usize,
+    #[cfg(test)]
+    session_creation_control: Option<SessionCreationControl>,
+    #[cfg(test)]
+    session_creation_calls: usize,
+    #[cfg(test)]
+    session_creation_failures: usize,
+    resolve_calls: usize,
+    outbound_attempts: usize,
 }
 
 impl FixtureFoundryAdapter {
@@ -179,7 +225,54 @@ impl FixtureFoundryAdapter {
             install_calls: Arc::new(Mutex::new(0)),
             install_delay: Duration::ZERO,
             ignore_install_cancellation: false,
+            accepted_selector_aliases: BTreeSet::new(),
+            change_descriptor_after_first_resolution: false,
+            session_failure: FixtureSessionFailure::None,
+            #[cfg(test)]
+            unload_failures_remaining: 0,
+            #[cfg(test)]
+            session_creation_control: None,
+            #[cfg(test)]
+            session_creation_calls: 0,
+            #[cfg(test)]
+            session_creation_failures: 0,
+            resolve_calls: 0,
+            outbound_attempts: 0,
         }
+    }
+
+    /// Uses an additional alias while retaining deterministic fixture model
+    /// metadata and artifacts.
+    #[must_use]
+    pub fn with_selector_alias(
+        mut self,
+        selector: impl Into<String>,
+    ) -> Self {
+        self.accepted_selector_aliases
+            .insert(selector.into().to_ascii_lowercase());
+        self
+    }
+
+    /// Returns changed catalog metadata after the first resolution, allowing
+    /// descriptor-binding behavior to be tested.
+    #[must_use]
+    pub const fn changing_descriptor_after_first_resolution(mut self) -> Self {
+        self.change_descriptor_after_first_resolution = true;
+        self
+    }
+
+    /// Makes live-session creation fail like an unavailable native runtime.
+    #[must_use]
+    pub const fn failing_session_creation(mut self) -> Self {
+        self.session_failure = FixtureSessionFailure::Creation;
+        self
+    }
+
+    /// Makes live-session finalization fail after startup.
+    #[must_use]
+    pub const fn failing_session_finish(mut self) -> Self {
+        self.session_failure = FixtureSessionFailure::Finish;
+        self
     }
 
     /// Delays fixture installation so cancellation races can be tested.
@@ -333,6 +426,7 @@ impl FoundryAdapter for FixtureFoundryAdapter {
     }
 
     async fn list_catalog(&mut self) -> Result<Vec<ModelDescriptor>, AdapterError> {
+        self.outbound_attempts = self.outbound_attempts.saturating_add(1);
         Ok(vec![Self::fixture_descriptor()])
     }
 
@@ -340,21 +434,31 @@ impl FoundryAdapter for FixtureFoundryAdapter {
         &mut self,
         selector: &ModelSelector,
     ) -> Result<ModelDescriptor, AdapterError> {
-        let descriptor = Self::fixture_descriptor();
+        self.outbound_attempts = self.outbound_attempts.saturating_add(1);
+        let mut descriptor = Self::fixture_descriptor();
         let key = selector.key();
-        if key == descriptor.alias.0.to_ascii_lowercase()
-            || key == descriptor.id.0.to_ascii_lowercase()
+        let is_additional_alias = self.accepted_selector_aliases.contains(&key);
+        if key != descriptor.alias.0.to_ascii_lowercase()
+            && key != descriptor.id.0.to_ascii_lowercase()
+            && !is_additional_alias
         {
-            Ok(descriptor)
-        } else {
-            Err(AdapterError::NotFound)
+            return Err(AdapterError::NotFound);
         }
+        if is_additional_alias {
+            descriptor.alias = Alias(key);
+        }
+        self.resolve_calls = self.resolve_calls.saturating_add(1);
+        if self.change_descriptor_after_first_resolution && self.resolve_calls > 1 {
+            descriptor.version = ModelVersion::new("0.6.1-catalog-changed".to_owned());
+        }
+        Ok(descriptor)
     }
 
     async fn latest_version(
         &mut self,
         model: &ModelDescriptor,
     ) -> Result<ModelVersion, AdapterError> {
+        self.outbound_attempts = self.outbound_attempts.saturating_add(1);
         Ok(model.version.clone())
     }
 
@@ -378,6 +482,7 @@ impl FoundryAdapter for FixtureFoundryAdapter {
         cancel: &tokio_util::sync::CancellationToken,
         force: bool,
     ) -> Result<InstalledArtifact, AdapterError> {
+        self.outbound_attempts = self.outbound_attempts.saturating_add(1);
         if cancel.is_cancelled() {
             return Err(AdapterError::DownloadFailed);
         }
@@ -432,6 +537,11 @@ impl FoundryAdapter for FixtureFoundryAdapter {
         &mut self,
         model: &ModelDescriptor,
     ) -> Result<(), AdapterError> {
+        #[cfg(test)]
+        if self.unload_failures_remaining != 0 {
+            self.unload_failures_remaining = self.unload_failures_remaining.saturating_sub(1);
+            return Err(AdapterError::RuntimeFailed);
+        }
         self.loaded.remove(&model.id);
         Ok(())
     }
@@ -457,11 +567,43 @@ impl FoundryAdapter for FixtureFoundryAdapter {
         _model: &ModelDescriptor,
         settings: &AsrSessionSettings,
     ) -> Result<Box<dyn StreamingAsrSession>, AdapterError> {
-        Ok(Box::new(FixtureAsrSession::new(settings)))
+        settings
+            .validate()
+            .map_err(|_| AdapterError::InvalidSettings)?;
+        #[cfg(test)]
+        let sequence_failure = {
+            let call = self.session_creation_calls;
+            self.session_creation_calls = self.session_creation_calls.saturating_add(1);
+            if call == 0
+                && let Some(control) = self.session_creation_control.clone()
+            {
+                control.entered.notify_one();
+                control.release.notified().await;
+            }
+            call < self.session_creation_failures
+        };
+        #[cfg(not(test))]
+        let sequence_failure = false;
+        if matches!(self.session_failure, FixtureSessionFailure::Creation) || sequence_failure {
+            return Err(AdapterError::Unavailable);
+        }
+        if matches!(self.session_failure, FixtureSessionFailure::Finish) {
+            Ok(Box::new(FixtureAsrSession::failing_finish(settings)))
+        } else {
+            Ok(Box::new(FixtureAsrSession::new(settings)))
+        }
     }
 
     fn offline_scopes(&self) -> Vec<ModelScope> {
         vec![ModelScope::Installed, ModelScope::Loaded]
+    }
+
+    fn supports_cached_force_redownload(&self) -> bool {
+        true
+    }
+
+    fn outbound_attempts(&self) -> usize {
+        self.outbound_attempts
     }
 }
 
@@ -613,6 +755,10 @@ where
         self.inner.offline_scopes()
     }
 
+    fn supports_cached_force_redownload(&self) -> bool {
+        self.inner.supports_cached_force_redownload()
+    }
+
     fn outbound_attempts(&self) -> usize {
         self.calls.try_lock().map_or(0, |calls| *calls)
     }
@@ -637,7 +783,10 @@ mod tests {
         assert_eq!(first, second);
         assert!(!first.is_empty());
 
-        let mut session = FixtureAsrSession::new(&AsrSessionSettings::default());
+        let mut session = FixtureAsrSession::new(&AsrSessionSettings {
+            chunk_ms: 1_000,
+            ..AsrSessionSettings::default()
+        });
         session
             .append(Pcm16Mono16k {
                 samples: samples.clone(),

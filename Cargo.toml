@@ -17,7 +17,8 @@ clap = { version = "4.5.42", features = ["derive"] }
 async-trait = "0.1.88"
 cpal = { version = "0.18.1", features = ["pipewire", "pulseaudio"] }
 ctrlc = "3.4.7"
-foundry-local = "0.1.0"
+foundry-local-sdk = "=1.2.3"
+futures-util = "0.3.31"
 hound = "3.5.1"
 koe-app = { path = "crates/koe-app" }
 koe-audio = { path = "crates/koe-audio" }
@@ -57,3 +58,8 @@ unused = "deny"
 [workspace.package]
 edition = "2024"
 version = "0.0.0"
+[patch.crates-io]
+# Upstream 1.2.3 selects NuGet native artifacts from the build host and always
+# falls back to network. The vendored patch selects from Cargo TARGET and
+# supports a strict, pre-populated FOUNDRY_NATIVE_OVERRIDE_DIR.
+foundry-local-sdk = { path = "vendor/foundry-local-sdk" }

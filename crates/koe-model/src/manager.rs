@@ -642,6 +642,12 @@ impl KoeModelManager {
         Ok(backend.backend_name())
     }
 
+    /// Reports whether the selected runtime can atomically replace an
+    /// already-cached model for [`InstallOptions::force_redownload`].
+    pub async fn supports_cached_force_redownload(&self) -> bool {
+        self.adapter.lock().await.supports_cached_force_redownload()
+    }
+
     /// Counts outbound adapter attempts (diagnostic offline-enforcement hook).
     ///
     /// # Errors
@@ -721,10 +727,10 @@ impl ModelManager for KoeModelManager {
             adapter.resolve(selector).await.map_err(map_adapter_error)?
         };
         check_cancel(&cancel)?;
-        if let Some(accepted) = &options.accepted_descriptor
-            && accepted != &descriptor
+        if let Some(expected) = &options.expected_descriptor
+            && expected != &descriptor
         {
-            return Err(ModelError::LicenseNotAccepted);
+            return Err(ModelError::DescriptorChanged);
         }
         let _runtime_gate = self.runtime_gate.lock().await;
         check_cancel(&cancel)?;

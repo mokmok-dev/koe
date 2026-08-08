@@ -34,6 +34,13 @@ koe doctor
 - audio/transcript data を stdout へ流す command は明示 option がある場合だけ。
 - `record` の Ctrl-C は cooperative stop と finalize を行う。2 回目は cancel を要求する。
 - password や token を command line argument で受け取らない。
+- missing-model recording の `--expect-model-license <id>` は license acceptance ではなく
+  expected ID の pin である。旧 `--accept-model-license` は help 非表示の互換 option として
+  のみ保持し、使用時に `--expect-model-license` への deprecation guidance を stderr へ出す。
+- license pin の不一致は typed `LicenseMismatch` / `KOE-MODEL-LICENSE-MISMATCH` とする。
+- candidate JSON/JSONL は `authorization` mode と license expectation の有無を含める。
+  reported descriptor は consent record ではなく、download 前の再解決に対する expected
+  binding であり、変化時は `KOE-MODEL-DESCRIPTOR-CHANGED` を返す。
 
 CLI は最初の vertical slice と reference behavior にする。
 

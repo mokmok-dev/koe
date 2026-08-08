@@ -311,12 +311,15 @@ pub struct InstallOptions {
     /// full or closed. Callers must use the install result, not `Done`, as the
     /// authoritative terminal signal and should drain progress concurrently.
     pub progress: Option<tokio::sync::mpsc::Sender<ModelProgress>>,
-    /// Catalog metadata displayed and explicitly accepted by the caller.
-    /// Installation re-resolves metadata and returns
-    /// [`ModelError::LicenseNotAccepted`] if it changed, closing the consent
-    /// time-of-check/time-of-use window.
-    pub accepted_descriptor: Option<ModelDescriptor>,
-    /// Re-download even when the runtime cache already has the model.
+    /// Catalog metadata observed by the caller before installation.
+    ///
+    /// This binds the install to an expected second resolution; it does not
+    /// itself represent license acceptance or authorize network access.
+    pub expected_descriptor: Option<ModelDescriptor>,
+    /// Request a re-download even when the runtime cache has the model.
+    ///
+    /// Runtimes without an atomic force/replace primitive return
+    /// [`ModelError::ForceRedownloadUnsupported`] and preserve the cache.
     pub force_redownload: bool,
 }
 
@@ -484,8 +487,16 @@ pub enum ModelError {
     NotCorrupt,
     #[error("the model operation was cancelled")]
     Cancelled,
-    #[error("the resolved model license was not explicitly accepted")]
-    LicenseNotAccepted,
+    #[error("the resolved model license did not match the expected license ID")]
+    LicenseMismatch,
+    #[error("the resolved model descriptor changed after it was reported")]
+    DescriptorChanged,
+    #[error(
+        "the ASR session settings are invalid; chunk_ms must be between 1 and 60000 and push_queue_capacity must be between 1 and 4096"
+    )]
+    InvalidSettings,
+    #[error("safe force-redownload is not supported by this model runtime")]
+    ForceRedownloadUnsupported,
     #[error("model registration {id} was removed but cache cleanup was incomplete: {cause}")]
     RemovalIncomplete {
         id: InstalledModelId,
@@ -532,7 +543,10 @@ impl ModelError {
             Self::Unsupported => "KOE-MODEL-UNSUPPORTED",
             Self::NotCorrupt => "KOE-MODEL-NOT-CORRUPT",
             Self::Cancelled => "KOE-MODEL-CANCELLED",
-            Self::LicenseNotAccepted => "KOE-MODEL-LICENSE-NOT-ACCEPTED",
+            Self::LicenseMismatch => "KOE-MODEL-LICENSE-MISMATCH",
+            Self::DescriptorChanged => "KOE-MODEL-DESCRIPTOR-CHANGED",
+            Self::InvalidSettings => "KOE-MODEL-ASR-INVALID-SETTINGS",
+            Self::ForceRedownloadUnsupported => "KOE-MODEL-FORCE-REDOWNLOAD-UNSUPPORTED",
             Self::RemovalIncomplete { .. } => "KOE-MODEL-REMOVAL-INCOMPLETE",
             Self::ReplacementInvalidated { .. } => "KOE-MODEL-REPLACEMENT-INVALIDATED",
             Self::InvalidSelector | Self::InvalidId => "KOE-MODEL-INVALID-SELECTOR",
@@ -581,5 +595,21 @@ mod tests {
         );
         assert_eq!(ModelError::VerifyFailed.code(), "KOE-MODEL-VERIFY-FAILED");
         assert_eq!(ModelError::Unavailable.code(), "KOE-MODEL-UNAVAILABLE");
+        assert_eq!(
+            ModelError::LicenseMismatch.code(),
+            "KOE-MODEL-LICENSE-MISMATCH"
+        );
+        assert_eq!(
+            ModelError::DescriptorChanged.code(),
+            "KOE-MODEL-DESCRIPTOR-CHANGED"
+        );
+        assert_eq!(
+            ModelError::InvalidSettings.code(),
+            "KOE-MODEL-ASR-INVALID-SETTINGS"
+        );
+        assert_eq!(
+            ModelError::ForceRedownloadUnsupported.code(),
+            "KOE-MODEL-FORCE-REDOWNLOAD-UNSUPPORTED"
+        );
     }
 }

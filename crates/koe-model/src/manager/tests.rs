@@ -24,7 +24,7 @@ fn install_options(policy: NetworkPolicy) -> InstallOptions {
         policy,
         cancel: tokio_util::sync::CancellationToken::new(),
         progress: None,
-        accepted_descriptor: None,
+        expected_descriptor: None,
         force_redownload: false,
     }
 }
@@ -115,13 +115,19 @@ async fn online_install_then_offline_transcription_succeeds() {
         .await
         .expect("session");
     let audio = sample_audio(1);
-    session
-        .append(crate::Pcm16Mono16k {
-            samples: audio.clone(),
-            session_start_us: 0,
-        })
-        .await
-        .expect("append");
+    // The fixture session enforces the default 160 ms chunk limit; feed the
+    // one-second sample in boundary-aligned chunks.
+    let chunk_samples = 160 * 16;
+    for (index, chunk) in audio.chunks(chunk_samples).enumerate() {
+        session
+            .append(crate::Pcm16Mono16k {
+                samples: chunk.to_vec(),
+                session_start_us: u64::try_from(index * chunk_samples * 1_000_000 / 16_000)
+                    .expect("chunk timestamp"),
+            })
+            .await
+            .expect("append");
+    }
     let final_transcript = Box::new(session).finish().await.expect("finish");
     let text = final_transcript
         .events
@@ -373,7 +379,7 @@ async fn closed_progress_channel_does_not_fail_install() {
                 policy: NetworkPolicy::ModelInstallOnly,
                 cancel: tokio_util::sync::CancellationToken::new(),
                 progress: Some(progress),
-                accepted_descriptor: None,
+                expected_descriptor: None,
                 force_redownload: false,
             },
         )
@@ -400,7 +406,7 @@ async fn install_progress_reaches_done_and_cancel_stops_install() {
                 policy: NetworkPolicy::ModelInstallOnly,
                 cancel: tokio_util::sync::CancellationToken::new(),
                 progress: Some(progress),
-                accepted_descriptor: None,
+                expected_descriptor: None,
                 force_redownload: false,
             },
         )
@@ -429,7 +435,7 @@ async fn install_progress_reaches_done_and_cancel_stops_install() {
                 policy: NetworkPolicy::ModelInstallOnly,
                 cancel,
                 progress: None,
-                accepted_descriptor: None,
+                expected_descriptor: None,
                 force_redownload: false,
             },
         )

@@ -69,8 +69,8 @@ Milestone 6 の MCP stdio adapter を実装した。
 - すべてのコマンドで `--output-format json|jsonl` を提供し、stdout/stderr の
   機械可読 contract をテストで保証する。default log には audio 波形や transcript
   テキストは含まれない。
-- ネイティブ live-audio session は公開された foundry SDK に無いため、capability
-  として報告する。E2E offline テストは fixture adapter で駆動する。
+- 公開 `foundry-local-sdk` のネイティブ live-audio session を `koe-model` 内へ隔離し、
+  E2E offline テストは通常 fixture adapter、実 runtime 検証は明示 gate で駆動する。
 - `koe-mcp` は MCP 2025-06-18 の stdio JSON-RPC server として capability/device/model/
   session tool、operation state と cancellation、session/transcript resource を提供する。
 - MCP の stdout は protocol 専用で、request/response size と operation concurrency を
