@@ -247,13 +247,6 @@ fn try_download_from_feed(
         .and_then(|s| s.split('/').next())
         .unwrap_or(feed_url);
 
-    println!(
-        "cargo:warning=Downloading {name} {ver} from {host}",
-        name = pkg.name,
-        ver = pkg.version,
-        host = feed_host,
-    );
-
     let mut response = ureq::get(&url)
         .call()
         .map_err(|e| format!("Failed to download {} from {feed_host}: {e}", pkg.name))?;
@@ -316,7 +309,6 @@ fn try_download_from_feed(
         io::copy(&mut file, &mut out_file)
             .map_err(|e| format!("Failed to write {}: {e}", dest.display()))?;
 
-        println!("cargo:warning=  Extracted {file_name}");
         extracted += 1;
     }
 
@@ -341,10 +333,6 @@ fn download_and_extract(
     // Skip if this package's main native library is already in out_dir
     // (e.g. pre-populated from FOUNDRY_NATIVE_OVERRIDE_DIR).
     if !pkg.always_extract && out_dir.join(&pkg.expected_file).exists() {
-        println!(
-            "cargo:warning={} already present, skipping download.",
-            pkg.name
-        );
         return Ok(());
     }
 
@@ -453,10 +441,6 @@ fn main() {
                 }
 
                 fs::copy(&path, &dest).expect("Failed to copy native lib from override dir");
-                println!(
-                    "cargo:warning=Copied {} from override dir",
-                    path.file_name().unwrap().to_string_lossy()
-                );
             }
         }
     }
@@ -466,7 +450,6 @@ fn main() {
     // A complete pre-populated directory is authoritative, including for
     // WinML. This is the no-network path used by sandboxed/Nix builds.
     if libs_already_present(&packages, &out_dir) {
-        println!("cargo:warning=Native libraries already present in OUT_DIR, skipping download.");
         println!("cargo:rustc-link-search=native={}", out_dir.display());
         println!("cargo:rustc-env=FOUNDRY_NATIVE_DIR={}", out_dir.display());
         if target.os == "windows" {

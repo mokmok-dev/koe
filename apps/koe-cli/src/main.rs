@@ -8,7 +8,7 @@ use std::{
     process::ExitCode,
     sync::{
         Arc,
-        atomic::{AtomicUsize, Ordering},
+        atomic::{AtomicU8, AtomicUsize, Ordering},
     },
     thread,
     time::{Duration, Instant},
@@ -35,6 +35,10 @@ use serde::Serialize;
 
 const MIX_JITTER_CAPACITY: usize = 32_000;
 const CANONICAL_SAMPLE_RATE: u64 = 16_000;
+const INTERRUPT_EXIT_CODE: i32 = 130;
+const INTERRUPT_GRACE_PERIOD: Duration = Duration::from_secs(10);
+const PHASE_PREPARING: u8 = 0;
+const PHASE_RECORDING: u8 = 1;
 
 #[derive(Default)]
 struct TimelineTrack {
@@ -935,20 +939,36 @@ async fn install_model_with_progress(
         expected_descriptor,
         force_redownload,
     };
+    // Print before polling the SDK future. Catalog/native calls may take a
+    // while to produce their first yield, especially on a cold macOS cache.
+    report_model_progress(format, selector, &koe_model::ModelProgress::Resolving);
     let install = manager.install(selector, &options);
     tokio::pin!(install);
     let mut progress_open = true;
+    let mut skip_initial_resolving = true;
     loop {
         tokio::select! {
             result = &mut install => {
                 while let Ok(phase) = progress_rx.try_recv() {
-                    report_model_progress(format, selector, &phase);
+                    if skip_initial_resolving
+                        && matches!(phase, koe_model::ModelProgress::Resolving)
+                    {
+                        skip_initial_resolving = false;
+                    } else {
+                        report_model_progress(format, selector, &phase);
+                    }
                 }
                 return result.map_err(CliError::Model);
             }
             phase = progress_rx.recv(), if progress_open => {
                 if let Some(phase) = phase {
-                    report_model_progress(format, selector, &phase);
+                    if skip_initial_resolving
+                        && matches!(phase, koe_model::ModelProgress::Resolving)
+                    {
+                        skip_initial_resolving = false;
+                    } else {
+                        report_model_progress(format, selector, &phase);
+                    }
                 } else {
                     progress_open = false;
                 }
@@ -1395,13 +1415,33 @@ fn record<B: AudioBackend>(
     }
     let asr_enabled = model != "none";
     let interrupts = Arc::new(AtomicUsize::new(0));
+    let interrupt_phase = Arc::new(AtomicU8::new(PHASE_PREPARING));
     let install_cancel = tokio_util::sync::CancellationToken::new();
     let interrupt_handler = Arc::clone(&interrupts);
+    let handler_phase = Arc::clone(&interrupt_phase);
     let handler_cancel = install_cancel.clone();
     if model_manager_override.is_none() {
         ctrlc::set_handler(move || {
-            interrupt_handler.fetch_add(1, Ordering::Relaxed);
+            let previous = interrupt_handler.fetch_add(1, Ordering::Relaxed);
             handler_cancel.cancel();
+            // Before a recorder exists there is nothing to finalize. Native
+            // catalog/load calls are not all cooperatively cancellable, so
+            // restore the expected CLI behavior instead of swallowing SIGINT.
+            if handler_phase.load(Ordering::Acquire) == PHASE_PREPARING {
+                std::process::exit(INTERRUPT_EXIT_CODE);
+            }
+            // Recorder writes are synchronous and may be inside a slow fsync.
+            // Keep normal Ctrl-C finalization, but do not let one blocked
+            // request swallow SIGINT forever.
+            if previous == 0 {
+                let watchdog_phase = Arc::clone(&handler_phase);
+                thread::spawn(move || {
+                    thread::sleep(INTERRUPT_GRACE_PERIOD);
+                    if watchdog_phase.load(Ordering::Acquire) == PHASE_RECORDING {
+                        std::process::exit(INTERRUPT_EXIT_CODE);
+                    }
+                });
+            }
         })
         .map_err(|_| CliError::Signal)?;
     }
@@ -1544,6 +1584,9 @@ fn record<B: AudioBackend>(
         )
     };
     report_diagnostic(format, "recording_confirmed", &confirmation);
+    // From this point an interrupt must finalize the durable session rather
+    // than terminating immediately.
+    interrupt_phase.store(PHASE_RECORDING, Ordering::Release);
     let (coordinator, task) = RecorderCoordinator::spawn(config);
     let recording = match coordinator.start(RecordingConsent {
         microphone: true,
