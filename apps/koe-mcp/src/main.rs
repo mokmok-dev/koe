@@ -23,7 +23,7 @@ use koe_audio::{AudioBackend, AudioStream, CpalBackend, OpenSource, frame_ring};
 use koe_core::{NetworkPolicy, OperationId, SessionId, SessionState, SourceKind};
 use koe_model::{
     DigestAllowlist, FoundryLocalAdapter, InstallOptions, KoeModelManager, ModelError,
-    ModelManager, ModelProgress, ModelScope, ModelSelector,
+    ModelManager, ModelProgress, ModelSelector,
 };
 use koe_recording::{RecordingConfig, SessionManifest, TimelineBlock, TrackKind};
 use serde::Serialize;
@@ -150,6 +150,7 @@ struct Server {
     sessions_root: PathBuf,
     export_root: Option<PathBuf>,
     backend: CpalBackend,
+    model_manager: Arc<KoeModelManager>,
     operations: HashMap<String, Operation>,
     authorized_resources: HashSet<String>,
     lifecycle: LifecycleState,
@@ -170,11 +171,21 @@ impl Server {
         {
             return Err(McpError::Unauthorized);
         }
+        let model_manager = Arc::new(
+            KoeModelManager::new(
+                &data_root,
+                DigestAllowlist::empty(),
+                Box::new(FoundryLocalAdapter::new()),
+                NetworkPolicy::Denied,
+            )
+            .map_err(|_| McpError::OperationFailed)?,
+        );
         Ok(Self {
             data_root,
             sessions_root,
             export_root,
             backend: CpalBackend::default(),
+            model_manager,
             operations: HashMap::new(),
             authorized_resources: HashSet::new(),
             lifecycle: LifecycleState::Uninitialized,
@@ -349,9 +360,10 @@ impl Server {
                 .map_err(|_| McpError::OperationFailed)?
             },
             "koe_list_models" => {
-                let manager = self.model_manager(NetworkPolicy::Denied)?;
+                let manager = self.model_manager();
                 serde_json::to_value(
-                    block_on(manager.list(ModelScope::Installed))
+                    manager
+                        .inspect_installed_models_sync()
                         .map_err(|_| McpError::OperationFailed)?,
                 )
                 .map_err(|_| McpError::OperationFailed)?
@@ -415,7 +427,7 @@ impl Server {
         let selector = selector_text
             .parse::<ModelSelector>()
             .map_err(|_| McpError::InvalidParams)?;
-        let manager = self.model_manager(NetworkPolicy::ModelInstallOnly)?;
+        let manager = self.model_manager();
         let operation_id = OperationId::new();
         let snapshot = Arc::new(Mutex::new(OperationSnapshot {
             operation_id,
@@ -439,11 +451,17 @@ impl Server {
             let result = block_on(async {
                 let install_with_progress = async {
                     let install = manager.install(&selector, &options);
+                    let deadline = tokio::time::sleep(Duration::from_hours(1));
                     tokio::pin!(install);
+                    tokio::pin!(deadline);
+                    let mut timeout_requested = false;
                     loop {
                         tokio::select! {
                             result = &mut install => break result,
-                            () = thread_cancellation.cancelled() => break Err(ModelError::Cancelled),
+                            () = &mut deadline, if !timeout_requested => {
+                                timeout_requested = true;
+                                thread_cancellation.cancel();
+                            },
                             phase = progress_rx.recv() => {
                                 let Some(phase) = phase else {
                                     break install.await;
@@ -455,9 +473,7 @@ impl Server {
                         }
                     }
                 };
-                tokio::time::timeout(Duration::from_hours(1), install_with_progress)
-                    .await
-                    .unwrap_or(Err(ModelError::Cancelled))
+                install_with_progress.await
             });
             if let Ok(mut state) = thread_snapshot.lock() {
                 state.state = match result {
@@ -488,17 +504,8 @@ impl Server {
             .map_err(|_| McpError::OperationFailed)
     }
 
-    fn model_manager(
-        &self,
-        policy: NetworkPolicy,
-    ) -> Result<KoeModelManager, McpError> {
-        KoeModelManager::new(
-            &self.data_root,
-            DigestAllowlist::empty(),
-            Box::new(FoundryLocalAdapter::new()),
-            policy,
-        )
-        .map_err(|_| McpError::OperationFailed)
+    fn model_manager(&self) -> Arc<KoeModelManager> {
+        Arc::clone(&self.model_manager)
     }
 
     #[allow(clippy::too_many_lines)]
@@ -537,8 +544,9 @@ impl Server {
         let request = OpenSource {
             device_id: device_id.clone(),
             kind: SourceKind::Microphone,
-            sample_rate,
-            channels,
+            preferred_sample_rate: sample_rate,
+            preferred_channels: channels,
+            negotiation: koe_audio::FormatNegotiation::default(),
         };
         let mut stream = self
             .backend
@@ -566,7 +574,7 @@ impl Server {
             frame_ring(config.queue_capacity, 16_384).map_err(|_| McpError::OperationFailed)?;
         if stream.start(Box::new(producer)).is_err() {
             let _ignored = coordinator.cancel();
-            let _ignored = task.shutdown(&coordinator);
+            let _ignored = task.shutdown();
             return Err(McpError::OperationFailed);
         }
         coordinator
@@ -1060,7 +1068,7 @@ fn recording_loop<S: AudioStream>(
         },
         |code| coordinator.fail(code),
     );
-    let shutdown_failure = task.shutdown(coordinator).err().map(|error| error.code());
+    let shutdown_failure = task.shutdown().err().map(|error| error.code());
     let terminal_failure = failure_code.or(stream_failure).or(shutdown_failure);
     if let Ok(mut state) = snapshot.lock() {
         state.progress = 100;

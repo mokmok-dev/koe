@@ -15,11 +15,17 @@
 
 use std::{
     collections::BTreeMap,
-    fs,
-    io::{BufWriter, Write},
+    fs::{self, File},
+    io::{BufWriter, Read, Write},
     path::{Path, PathBuf},
+    sync::Arc,
     time::{SystemTime, UNIX_EPOCH},
 };
+
+#[cfg(unix)]
+use std::os::unix::fs::OpenOptionsExt;
+#[cfg(windows)]
+use std::os::windows::fs::OpenOptionsExt;
 
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -27,17 +33,76 @@ use uuid::Uuid;
 use crate::{
     FOUNDRY_SDK_VERSION,
     types::{
-        InstalledModelId, ModelDescriptor, ModelError, ModelFile, ModelId, ModelManifest,
-        ModelSelector, ModelVersion, Verification,
+        InstalledModelId, ManifestValidationError, ModelDescriptor, ModelError, ModelFile, ModelId,
+        ModelManifest, ModelSelector, ModelVersion, Verification,
     },
 };
 
 const MANIFEST_SCHEMA: u32 = 1;
-/// Absolute path of one expected digest for an allowlist.
+/// Maximum serialized manifest size (4 MiB).
+pub const MAX_MANIFEST_BYTES: u64 = 4 * 1024 * 1024;
+const MAX_BENCHMARK_BYTES: u64 = 4 * 1024 * 1024;
+/// Maximum bytes in required manifest identity text fields (16 KiB).
+pub const MAX_MANIFEST_TEXT_BYTES: usize = 16 * 1024;
+/// Maximum bytes in one manifest inventory path (16 KiB).
+pub const MAX_MANIFEST_PATH_BYTES: usize = 16 * 1024;
+/// Maximum files recorded by one manifest.
+pub const MAX_MANIFEST_FILES: usize = 4_096;
+/// Expected digest for one cache-root-relative artifact path.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(try_from = "FileDigestWire")]
 pub struct FileDigest {
-    pub sha256: String,
-    pub size: u64,
+    /// Exactly 64 lowercase hexadecimal SHA-256 characters.
+    sha256: String,
+    size: u64,
+}
+
+#[derive(Deserialize)]
+struct FileDigestWire {
+    sha256: String,
+    size: u64,
+}
+
+impl TryFrom<FileDigestWire> for FileDigest {
+    type Error = String;
+
+    fn try_from(value: FileDigestWire) -> Result<Self, Self::Error> {
+        Self::try_new(value.sha256, value.size)
+            .map_err(|_| "SHA-256 must be 64 lowercase hexadecimal characters".to_owned())
+    }
+}
+
+impl FileDigest {
+    /// Creates a validated expected digest.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ModelError::InvalidDigest`] unless `sha256` is exactly 64
+    /// lowercase hexadecimal characters.
+    pub fn try_new(
+        sha256: impl Into<String>,
+        size: u64,
+    ) -> Result<Self, ModelError> {
+        let sha256 = sha256.into();
+        if sha256.len() != 64
+            || !sha256
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
+        {
+            return Err(ModelError::InvalidDigest);
+        }
+        Ok(Self { sha256, size })
+    }
+
+    #[must_use]
+    pub fn sha256(&self) -> &str {
+        &self.sha256
+    }
+
+    #[must_use]
+    pub const fn size(&self) -> u64 {
+        self.size
+    }
 }
 
 /// Publisher-managed expected digests keyed by `model_id@version`.
@@ -49,6 +114,7 @@ pub struct DigestAllowlist {
 /// One allowlist entry: every file that must be present with exact digest.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct AllowlistEntry {
+    /// Digests keyed by the matching [`crate::InstalledFile::relative_path`].
     pub files: BTreeMap<String, FileDigest>,
 }
 
@@ -71,7 +137,7 @@ impl DigestAllowlist {
         self.entries.get(&allowlist_key(model_id, version))
     }
 
-    /// Inserts or replaces an entry for round-trip testing.
+    /// Inserts or replaces an entry keyed by cache-root-relative artifact paths.
     pub fn insert(
         &mut self,
         model_id: &ModelId,
@@ -81,6 +147,167 @@ impl DigestAllowlist {
         self.entries
             .insert(allowlist_key(model_id, version), AllowlistEntry { files });
     }
+}
+
+struct LimitedManifestWriter {
+    bytes: Vec<u8>,
+    exceeded: bool,
+}
+
+impl Write for LimitedManifestWriter {
+    fn write(
+        &mut self,
+        buffer: &[u8],
+    ) -> std::io::Result<usize> {
+        let limit = usize::try_from(MAX_MANIFEST_BYTES)
+            .unwrap_or(usize::MAX)
+            .saturating_sub(1);
+        if buffer.len() > limit.saturating_sub(self.bytes.len()) {
+            self.exceeded = true;
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "manifest too large",
+            ));
+        }
+        self.bytes.extend_from_slice(buffer);
+        Ok(buffer.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+fn serialize_manifest(manifest: &ModelManifest) -> Result<Vec<u8>, ModelError> {
+    let mut writer = LimitedManifestWriter {
+        bytes: Vec::with_capacity(8 * 1024),
+        exceeded: false,
+    };
+    if serde_json::to_writer_pretty(&mut writer, manifest).is_err() {
+        return Err(if writer.exceeded {
+            ModelError::InvalidManifest(ManifestValidationError::SerializedSizeLimit)
+        } else {
+            ModelError::StoreFailed
+        });
+    }
+    writer.bytes.push(b'\n');
+    Ok(writer.bytes)
+}
+
+fn validate_manifest(manifest: &ModelManifest) -> Result<(), ManifestValidationError> {
+    fn valid_text(value: &str) -> bool {
+        !value.is_empty()
+            && value.len() <= MAX_MANIFEST_TEXT_BYTES
+            && !value.chars().any(char::is_control)
+    }
+
+    if manifest.schema_version != MANIFEST_SCHEMA
+        || !valid_text(&manifest.model_id.0)
+        || !valid_text(&manifest.alias.0)
+        || !valid_text(&manifest.version.0)
+        || !valid_text(&manifest.variant)
+        || !valid_text(&manifest.provider)
+        || !valid_text(&manifest.license_id)
+        || !valid_text(&manifest.license_description)
+        || !valid_text(&manifest.source)
+        || !valid_text(&manifest.foundry_version)
+        || manifest.cache_directory.as_deref().is_some_and(|path| {
+            path.is_empty()
+                || path.len() > MAX_MANIFEST_PATH_BYTES
+                || path.chars().any(char::is_control)
+                || cfg!(windows) && path.contains(':')
+                || path
+                    .split(['/', '\\'])
+                    .any(|component| matches!(component, "" | "." | ".."))
+        })
+    {
+        return Err(ManifestValidationError::InvalidIdentity);
+    }
+    if manifest.files.is_empty() {
+        return Err(ManifestValidationError::EmptyInventory);
+    }
+    if manifest.files.len() > MAX_MANIFEST_FILES {
+        return Err(ManifestValidationError::TooManyFiles);
+    }
+    let mut total_size = 0_u64;
+    if manifest.cache_directory.is_some()
+        && manifest.cache_directory
+            != common_inventory_directory(&manifest.files, &manifest.model_id.0, &manifest.alias.0)
+    {
+        return Err(ManifestValidationError::InvalidIdentity);
+    }
+    let mut paths = std::collections::BTreeSet::new();
+    for file in &manifest.files {
+        let valid_path = !file.path.is_empty()
+            && file.path.len() <= MAX_MANIFEST_PATH_BYTES
+            && !file.path.chars().any(char::is_control)
+            && !file.path.starts_with('/')
+            && !file.path.starts_with('\\')
+            && file.path.as_bytes().get(1) != Some(&b':')
+            && !(cfg!(windows) && file.path.contains(':'))
+            && file
+                .path
+                .split(['/', '\\'])
+                .all(|component| !matches!(component, "" | "." | ".."))
+            && paths.insert(file.path.as_str());
+        if !valid_path {
+            return Err(ManifestValidationError::InvalidPath);
+        }
+        let valid_digest = file.sha256.len() == 64
+            && file
+                .sha256
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'));
+        if !valid_digest {
+            return Err(ManifestValidationError::InvalidDigest);
+        }
+        total_size = total_size
+            .checked_add(file.size)
+            .ok_or(ManifestValidationError::ArtifactSizeLimit)?;
+        if total_size > crate::MAX_ARTIFACT_INVENTORY_BYTES {
+            return Err(ManifestValidationError::ArtifactSizeLimit);
+        }
+    }
+    Ok(())
+}
+
+fn common_inventory_directory(
+    files: &[ModelFile],
+    model_id: &str,
+    alias: &str,
+) -> Option<String> {
+    let mut common = files.first()?.path.split('/').collect::<Vec<_>>();
+    common.pop();
+    for file in &files[1..] {
+        let mut directory = file.path.split('/').collect::<Vec<_>>();
+        directory.pop();
+        let shared = common
+            .iter()
+            .zip(directory.iter())
+            .take_while(|(left, right)| left == right)
+            .count();
+        common.truncate(shared);
+    }
+    let model_id = sanitize_cache_component(model_id);
+    let alias = sanitize_cache_component(alias);
+    let index = common.iter().rposition(|component| {
+        component.eq_ignore_ascii_case(&model_id) || component.eq_ignore_ascii_case(&alias)
+    })?;
+    common.truncate(index + 1);
+    Some(common.join("/"))
+}
+
+fn sanitize_cache_component(value: &str) -> String {
+    value
+        .chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() || matches!(character, '-' | '_' | '.') {
+                character
+            } else {
+                '_'
+            }
+        })
+        .collect()
 }
 
 fn allowlist_key(
@@ -100,9 +327,24 @@ pub struct QuarantineNote {
     pub quarantined_at_unix_ms: u128,
 }
 
+/// One per-entry result from diagnostic installed-model enumeration.
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[non_exhaustive]
+pub enum InstalledManifestEntry {
+    Valid {
+        id: InstalledModelId,
+        manifest: Box<ModelManifest>,
+    },
+    Corrupt {
+        id: InstalledModelId,
+    },
+}
+
 /// Filesystem-backed model manifest registry.
 #[derive(Clone, Debug)]
 pub struct ModelStore {
+    _lock_file: Arc<File>,
+    models_handle: Arc<cap_std::fs::Dir>,
     data_root: PathBuf,
     models_dir: PathBuf,
     quarantine_dir: PathBuf,
@@ -114,8 +356,10 @@ impl ModelStore {
     ///
     /// # Errors
     ///
-    /// Returns [`ModelError::PathRejected`] for a symlinked root and
-    /// [`ModelError::StoreFailed`] for filesystem failures.
+    /// The returned store and all of its clones hold an exclusive
+    /// interprocess lock for `data_root`; independent opens fail with
+    /// [`ModelError::StoreLocked`]. Returns [`ModelError::PathRejected`] for a
+    /// symlinked root and [`ModelError::StoreFailed`] for filesystem failures.
     pub fn open(
         data_root: impl Into<PathBuf>,
         allowlist: DigestAllowlist,
@@ -125,11 +369,59 @@ impl ModelStore {
         if metadata.file_type().is_symlink() || !metadata.is_dir() {
             return Err(ModelError::PathRejected);
         }
+        let lock_path = data_root.join(".koe-model.lock");
+        if matches!(fs::symlink_metadata(&lock_path), Ok(metadata) if metadata.file_type().is_symlink())
+        {
+            return Err(ModelError::PathRejected);
+        }
+        let mut lock_options = fs::OpenOptions::new();
+        lock_options.read(true).write(true).create(true);
+        set_no_follow(&mut lock_options);
+        let lock_file = lock_options.open(&lock_path).map_err(map_store_error)?;
+        fs2::FileExt::try_lock_exclusive(&lock_file).map_err(|error| {
+            if error.kind() == std::io::ErrorKind::WouldBlock {
+                ModelError::StoreLocked
+            } else {
+                ModelError::StoreFailed
+            }
+        })?;
+        let data_handle =
+            cap_std::fs::Dir::open_ambient_dir(&data_root, cap_std::ambient_authority())
+                .map_err(map_store_error)?;
+        match data_handle.create_dir("models") {
+            Ok(()) => {},
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {},
+            Err(error) => return Err(map_store_error(error)),
+        }
+        let models_metadata = data_handle
+            .symlink_metadata("models")
+            .map_err(map_store_error)?;
+        if models_metadata.file_type().is_symlink() || !models_metadata.is_dir() {
+            return Err(ModelError::PathRejected);
+        }
+        let models_handle = {
+            use cap_fs_ext::DirExt;
+            data_handle
+                .open_dir_nofollow("models")
+                .map_err(map_store_error)?
+        };
+        match models_handle.create_dir("quarantine") {
+            Ok(()) => {},
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {},
+            Err(error) => return Err(map_store_error(error)),
+        }
+        let quarantine_metadata = models_handle
+            .symlink_metadata("quarantine")
+            .map_err(map_store_error)?;
+        if quarantine_metadata.file_type().is_symlink() || !quarantine_metadata.is_dir() {
+            return Err(ModelError::PathRejected);
+        }
         let models_dir = data_root.join("models");
-        fs::create_dir_all(&models_dir).map_err(map_store_error)?;
         let quarantine_dir = models_dir.join("quarantine");
-        fs::create_dir_all(&quarantine_dir).map_err(map_store_error)?;
+        recover_staged_operations(&models_handle)?;
         Ok(Self {
+            _lock_file: Arc::new(lock_file),
+            models_handle: Arc::new(models_handle),
             data_root,
             models_dir,
             quarantine_dir,
@@ -141,7 +433,11 @@ impl ModelStore {
     ///
     /// # Errors
     ///
-    /// Returns [`ModelError::StoreFailed`] for filesystem failures.
+    /// Returns [`ModelError::InvalidManifest`] with a reason unless descriptor text is nonempty,
+    /// bounded, and control-free and the inventory is nonempty, within public
+    /// byte/manifest limits, uses unique traversal-free bounded paths, and has
+    /// lowercase 64-character SHA-256 digests. Returns
+    /// [`ModelError::StoreFailed`] for filesystem failures.
     pub fn publish_manifest(
         &self,
         id: InstalledModelId,
@@ -149,8 +445,15 @@ impl ModelStore {
         files: Vec<ModelFile>,
         verification: Verification,
     ) -> Result<InstalledModelId, ModelError> {
-        let directory = self.models_dir.join(id.to_string());
-        fs::create_dir(&directory).map_err(map_store_error)?;
+        let directory_name = id.to_string();
+        let staging_name = format!(".install-{id}");
+        self.models_handle
+            .create_dir(&staging_name)
+            .map_err(map_store_error)?;
+        let staging_handle = self
+            .models_handle
+            .open_dir(&staging_name)
+            .map_err(map_store_error)?;
         let manifest = ModelManifest {
             schema_version: MANIFEST_SCHEMA,
             model_id: descriptor.id.clone(),
@@ -161,49 +464,171 @@ impl ModelStore {
             license_id: descriptor.license_id.clone(),
             license_description: descriptor.license_description.clone(),
             source: descriptor.source.clone(),
+            cache_directory: common_inventory_directory(
+                &files,
+                &descriptor.id.0,
+                &descriptor.alias.0,
+            ),
             files,
             installed_at_unix_ms: unix_millis(),
             foundry_version: FOUNDRY_SDK_VERSION.to_owned(),
             verification,
         };
-        let mut serialized = Vec::new();
-        serde_json::to_writer_pretty(&mut serialized, &manifest)
-            .map_err(|_| ModelError::StoreFailed)?;
-        serialized.push(b'\n');
-        atomic_write(&directory.join("manifest.json"), &serialized)?;
+        if let Err(reason) = validate_manifest(&manifest) {
+            let _ignored = self.models_handle.remove_dir_all(&staging_name);
+            return Err(ModelError::InvalidManifest(reason));
+        }
+        let serialized = match serialize_manifest(&manifest) {
+            Ok(serialized) => serialized,
+            Err(error) => {
+                let _ignored = self.models_handle.remove_dir_all(&staging_name);
+                return Err(error);
+            },
+        };
+        if let Err(error) = atomic_write_cap(&staging_handle, "manifest.json", &serialized) {
+            let _ignored = self.models_handle.remove_dir_all(&staging_name);
+            return Err(error);
+        }
+        if let Err(error) = self
+            .models_handle
+            .rename(&staging_name, &self.models_handle, &directory_name)
+            .map_err(map_store_error)
+        {
+            let _ignored = self.models_handle.remove_dir_all(&staging_name);
+            return Err(error);
+        }
+        if let Err(error) = sync_directory(&self.models_dir) {
+            let _ignored = self.models_handle.remove_dir_all(&directory_name);
+            let _ignored = sync_directory(&self.models_dir);
+            return Err(error);
+        }
         Ok(id)
+    }
+
+    pub(crate) fn update_manifest_inventory(
+        &self,
+        id: &InstalledModelId,
+        files: Vec<ModelFile>,
+        verification: Verification,
+    ) -> Result<ModelManifest, ModelError> {
+        let mut manifest = self.load_manifest(id)?;
+        manifest.cache_directory =
+            common_inventory_directory(&files, &manifest.model_id.0, &manifest.alias.0);
+        manifest.files = files;
+        manifest.verification = verification;
+        validate_manifest(&manifest).map_err(ModelError::InvalidManifest)?;
+        let serialized = serialize_manifest(&manifest)?;
+        let directory = {
+            use cap_fs_ext::DirExt;
+            self.models_handle
+                .open_dir_nofollow(id.to_string())
+                .map_err(map_store_error)?
+        };
+        atomic_write_store_file(
+            &directory,
+            &self.models_dir.join(id.to_string()).join("manifest.json"),
+            "manifest.json",
+            &serialized,
+        )?;
+        Ok(manifest)
     }
 
     /// Loads one manifest.
     ///
     /// # Errors
     ///
-    /// Returns [`ModelError::NotFound`] for unknown ids and
-    /// [`ModelError::PathRejected`] for unsafe store entries.
+    /// Returns [`ModelError::NotFound`] for unknown ids,
+    /// [`ModelError::PathRejected`] for unsafe store entries, and
+    /// [`ModelError::CorruptManifest`] with the offending installation id when
+    /// JSON validation fails.
     pub fn load_manifest(
         &self,
         id: &InstalledModelId,
     ) -> Result<ModelManifest, ModelError> {
-        let directory = self.models_dir.join(id.to_string());
-        let manifest_path = directory.join("manifest.json");
-        let metadata = fs::symlink_metadata(&manifest_path).map_err(map_manifest_missing)?;
+        let directory_name = id.to_string();
+        let directory_metadata = self
+            .models_handle
+            .symlink_metadata(&directory_name)
+            .map_err(map_manifest_missing)?;
+        if directory_metadata.file_type().is_symlink() || !directory_metadata.is_dir() {
+            return Err(ModelError::PathRejected);
+        }
+        let directory = {
+            use cap_fs_ext::DirExt;
+            self.models_handle
+                .open_dir_nofollow(&directory_name)
+                .map_err(map_manifest_missing)?
+        };
+        let metadata = match directory.symlink_metadata("manifest.json") {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Err(ModelError::CorruptManifest(*id));
+            },
+            Err(error) => return Err(map_manifest_missing(error)),
+        };
         if metadata.file_type().is_symlink() || !metadata.is_file() {
             return Err(ModelError::PathRejected);
         }
-        let bytes = fs::read(&manifest_path).map_err(map_store_error)?;
-        serde_json::from_slice(&bytes).map_err(|_| ModelError::StoreFailed)
+        if metadata.len() > MAX_MANIFEST_BYTES {
+            return Err(ModelError::CorruptManifest(*id));
+        }
+        let mut options = cap_std::fs::OpenOptions::new();
+        options.read(true);
+        {
+            use cap_fs_ext::{FollowSymlinks, OpenOptionsFollowExt};
+            options.follow(FollowSymlinks::No);
+        }
+        let file = directory
+            .open_with("manifest.json", &options)
+            .map_err(map_store_error)?;
+        if !file.metadata().map_err(map_store_error)?.is_file() {
+            return Err(ModelError::PathRejected);
+        }
+        let mut bytes = Vec::new();
+        file.take(MAX_MANIFEST_BYTES + 1)
+            .read_to_end(&mut bytes)
+            .map_err(map_store_error)?;
+        if u64::try_from(bytes.len()).map_err(|_| ModelError::CorruptManifest(*id))?
+            > MAX_MANIFEST_BYTES
+        {
+            return Err(ModelError::CorruptManifest(*id));
+        }
+        let manifest = serde_json::from_slice::<ModelManifest>(&bytes)
+            .map_err(|_| ModelError::CorruptManifest(*id))?;
+        if validate_manifest(&manifest).is_err() {
+            return Err(ModelError::CorruptManifest(*id));
+        }
+        Ok(manifest)
     }
 
-    /// Lists every installed (id, manifest) pair.
+    /// Removes an installation only when its manifest is corrupt.
     ///
     /// # Errors
     ///
-    /// Returns [`ModelError::StoreFailed`] for filesystem failures.
-    pub fn installed_manifests(
-        &self
-    ) -> Result<Vec<(InstalledModelId, ModelManifest)>, ModelError> {
-        let mut installed = Vec::new();
-        for entry in fs::read_dir(&self.models_dir).map_err(map_store_error)? {
+    /// Returns [`ModelError::NotCorrupt`] when the manifest is valid,
+    /// [`ModelError::NotFound`] for an unknown id, and store/path errors when
+    /// the entry cannot be validated or removed safely.
+    pub fn remove_corrupt_manifest(
+        &self,
+        id: &InstalledModelId,
+    ) -> Result<(), ModelError> {
+        match self.load_manifest(id) {
+            Err(ModelError::CorruptManifest(corrupt)) if corrupt == *id => self.remove_manifest(id),
+            Ok(_) => Err(ModelError::NotCorrupt),
+            Err(error) => Err(error),
+        }
+    }
+
+    /// Diagnoses every installed entry without hiding healthy manifests when
+    /// another entry is corrupt.
+    ///
+    /// # Errors
+    ///
+    /// Returns path/store errors that cannot be attributed to one malformed
+    /// manifest.
+    pub fn inspect_installed_manifests(&self) -> Result<Vec<InstalledManifestEntry>, ModelError> {
+        let mut entries = Vec::new();
+        for entry in self.models_handle.entries().map_err(map_store_error)? {
             let entry = entry.map_err(map_store_error)?;
             let name = entry.file_name();
             let Some(name) = name.to_str() else {
@@ -212,13 +637,54 @@ impl ModelStore {
             let Ok(id) = InstalledModelId::parse(name) else {
                 continue;
             };
-            let metadata = fs::symlink_metadata(entry.path()).map_err(map_store_error)?;
-            if metadata.is_dir()
-                && !metadata.file_type().is_symlink()
-                && let Ok(manifest) = self.load_manifest(&id)
-            {
-                installed.push((id, manifest));
+            let file_type = entry.file_type().map_err(map_store_error)?;
+            if file_type.is_symlink() || !file_type.is_dir() {
+                return Err(ModelError::PathRejected);
             }
+            match self.load_manifest(&id) {
+                Ok(manifest) => entries.push(InstalledManifestEntry::Valid {
+                    id,
+                    manifest: Box::new(manifest),
+                }),
+                Err(ModelError::CorruptManifest(_)) => {
+                    entries.push(InstalledManifestEntry::Corrupt { id });
+                },
+                Err(error) => return Err(error),
+            }
+        }
+        entries.sort_by_key(|entry| match entry {
+            InstalledManifestEntry::Valid { id, .. } | InstalledManifestEntry::Corrupt { id } => {
+                *id
+            },
+        });
+        Ok(entries)
+    }
+
+    /// Lists every installed (id, manifest) pair.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ModelError::PathRejected`] for unsafe UUID-named entries,
+    /// [`ModelError::CorruptManifest`] with the offending id for malformed
+    /// manifests, and [`ModelError::StoreFailed`] for filesystem failures.
+    pub fn installed_manifests(
+        &self
+    ) -> Result<Vec<(InstalledModelId, ModelManifest)>, ModelError> {
+        let mut installed = Vec::new();
+        for entry in self.models_handle.entries().map_err(map_store_error)? {
+            let entry = entry.map_err(map_store_error)?;
+            let name = entry.file_name();
+            let Some(name) = name.to_str() else {
+                continue;
+            };
+            let Ok(id) = InstalledModelId::parse(name) else {
+                continue;
+            };
+            let file_type = entry.file_type().map_err(map_store_error)?;
+            if file_type.is_symlink() || !file_type.is_dir() {
+                return Err(ModelError::PathRejected);
+            }
+            installed.push((id, self.load_manifest(&id)?));
         }
         installed.sort_by(|left, right| {
             left.1
@@ -233,13 +699,52 @@ impl ModelStore {
     ///
     /// # Errors
     ///
-    /// Returns [`ModelError::StoreFailed`] for filesystem failures.
+    /// Returns [`ModelError::PathRejected`] for unsafe UUID-named entries,
+    /// [`ModelError::CorruptManifest`] with the offending id for malformed
+    /// manifests, and [`ModelError::StoreFailed`] for filesystem failures.
     pub fn list_manifests(&self) -> Result<Vec<ModelManifest>, ModelError> {
         Ok(self
             .installed_manifests()?
             .into_iter()
             .map(|(_id, manifest)| manifest)
             .collect())
+    }
+
+    pub(crate) fn stage_removal(
+        &self,
+        id: &InstalledModelId,
+    ) -> Result<PathBuf, ModelError> {
+        let directory_name = id.to_string();
+        let metadata = self
+            .models_handle
+            .symlink_metadata(&directory_name)
+            .map_err(map_manifest_missing)?;
+        if metadata.file_type().is_symlink() || !metadata.is_dir() {
+            return Err(ModelError::PathRejected);
+        }
+        let staged_name = format!(".remove-{id}");
+        self.models_handle
+            .rename(&directory_name, &self.models_handle, &staged_name)
+            .map_err(map_store_error)?;
+        if let Err(error) = sync_directory(&self.models_dir) {
+            let _ignored =
+                self.models_handle
+                    .rename(&staged_name, &self.models_handle, &directory_name);
+            let _ignored = sync_directory(&self.models_dir);
+            return Err(error);
+        }
+        Ok(self.models_dir.join(staged_name))
+    }
+
+    pub(crate) fn commit_removal(
+        &self,
+        staged: &Path,
+    ) -> Result<(), ModelError> {
+        let name = staged.file_name().ok_or(ModelError::PathRejected)?;
+        self.models_handle
+            .remove_dir_all(name)
+            .map_err(map_store_error)?;
+        sync_directory(&self.models_dir)
     }
 
     /// Removes one installed manifest directory.
@@ -252,19 +757,27 @@ impl ModelStore {
         &self,
         id: &InstalledModelId,
     ) -> Result<(), ModelError> {
-        let directory = self.models_dir.join(id.to_string());
-        let metadata = fs::symlink_metadata(&directory).map_err(map_manifest_missing)?;
+        let directory_name = id.to_string();
+        let metadata = self
+            .models_handle
+            .symlink_metadata(&directory_name)
+            .map_err(map_manifest_missing)?;
         if metadata.file_type().is_symlink() || !metadata.is_dir() {
             return Err(ModelError::PathRejected);
         }
-        fs::remove_dir_all(&directory).map_err(map_store_error)
+        self.models_handle
+            .remove_dir_all(&directory_name)
+            .map_err(map_store_error)?;
+        sync_directory(&self.models_dir)
     }
 
     /// Finds the installed id matching a selector key, if any.
     ///
     /// # Errors
     ///
-    /// Returns [`ModelError::StoreFailed`] for filesystem failures.
+    /// Returns [`ModelError::CorruptManifest`] for a repairable entry,
+    /// [`ModelError::PathRejected`] for unsafe entries, or
+    /// [`ModelError::StoreFailed`] for filesystem failures.
     pub fn find_installed(
         &self,
         selector: &ModelSelector,
@@ -318,7 +831,15 @@ impl ModelStore {
             )?;
             return Err(ModelError::VerifyFailed);
         }
+        let mut actual_paths = std::collections::BTreeSet::new();
         for file in files {
+            if !actual_paths.insert(file.path.as_str()) {
+                self.quarantine(
+                    descriptor,
+                    format!("duplicate file `{}`", redact_file(&file.path)),
+                )?;
+                return Err(ModelError::VerifyFailed);
+            }
             let Some(expected_digest) = expected.files.get(&file.path) else {
                 self.quarantine(
                     descriptor,
@@ -375,15 +896,27 @@ impl ModelStore {
         id: &InstalledModelId,
         report: &crate::benchmark::BenchmarkReport,
     ) -> Result<(), ModelError> {
-        let directory = self.models_dir.join(id.to_string());
-        if !Self::dir_is_owned_manifest(&directory) {
-            return Err(ModelError::NotFound);
-        }
+        let directory = {
+            use cap_fs_ext::DirExt;
+            self.models_handle
+                .open_dir_nofollow(id.to_string())
+                .map_err(map_manifest_missing)?
+        };
         let mut serialized = Vec::new();
         serde_json::to_writer_pretty(&mut serialized, report)
             .map_err(|_| ModelError::StoreFailed)?;
         serialized.push(b'\n');
-        atomic_write(&directory.join("benchmarks.json"), &serialized)
+        if u64::try_from(serialized.len()).map_err(|_| ModelError::StoreFailed)?
+            > MAX_BENCHMARK_BYTES
+        {
+            return Err(ModelError::StoreFailed);
+        }
+        atomic_write_store_file(
+            &directory,
+            &self.models_dir.join(id.to_string()).join("benchmarks.json"),
+            "benchmarks.json",
+            &serialized,
+        )
     }
 
     /// Loads the benchmark report for one installed model.
@@ -395,21 +928,53 @@ impl ModelStore {
         &self,
         id: &InstalledModelId,
     ) -> Result<crate::benchmark::BenchmarkReport, ModelError> {
-        let path = self.models_dir.join(id.to_string()).join("benchmarks.json");
-        match fs::read(&path) {
-            Ok(bytes) => serde_json::from_slice(&bytes).map_err(|_| ModelError::StoreFailed),
+        let directory = {
+            use cap_fs_ext::DirExt;
+            self.models_handle
+                .open_dir_nofollow(id.to_string())
+                .map_err(map_manifest_missing)?
+        };
+        let metadata = match directory.symlink_metadata("benchmarks.json") {
+            Ok(metadata) => metadata,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                Ok(crate::benchmark::BenchmarkReport::default())
+                return Ok(crate::benchmark::BenchmarkReport::default());
             },
-            Err(_) => Err(ModelError::StoreFailed),
+            Err(_) => return Err(ModelError::StoreFailed),
+        };
+        if metadata.file_type().is_symlink()
+            || !metadata.is_file()
+            || metadata.len() > MAX_BENCHMARK_BYTES
+        {
+            return Err(ModelError::PathRejected);
         }
+        let mut options = cap_std::fs::OpenOptions::new();
+        options.read(true);
+        {
+            use cap_fs_ext::{FollowSymlinks, OpenOptionsFollowExt};
+            options.follow(FollowSymlinks::No);
+        }
+        let file = directory
+            .open_with("benchmarks.json", &options)
+            .map_err(map_store_error)?;
+        let mut bytes = Vec::new();
+        file.take(MAX_BENCHMARK_BYTES + 1)
+            .read_to_end(&mut bytes)
+            .map_err(map_store_error)?;
+        if u64::try_from(bytes.len()).map_err(|_| ModelError::StoreFailed)? > MAX_BENCHMARK_BYTES {
+            return Err(ModelError::StoreFailed);
+        }
+        serde_json::from_slice(&bytes).map_err(|_| ModelError::StoreFailed)
     }
 
     /// Lists store manifests as installation-scope descriptors.
     ///
     /// # Errors
     ///
-    /// Returns [`ModelError::StoreFailed`] for filesystem failures.
+    /// Returns [`ModelError::CorruptManifest`] for a repairable entry,
+    /// [`ModelError::PathRejected`] for unsafe paths, or
+    /// [`ModelError::StoreFailed`] for filesystem failures. Use
+    /// [`Self::inspect_installed_manifests`] to retain healthy entries and
+    /// [`Self::remove_corrupt_manifest`] to repair by installation id.
     pub fn list_descriptors(&self) -> Result<Vec<ModelDescriptor>, ModelError> {
         Ok(self
             .list_manifests()?
@@ -418,18 +983,45 @@ impl ModelStore {
             .collect())
     }
 
-    fn dir_is_owned_manifest(directory: &Path) -> bool {
-        let Ok(metadata) = fs::symlink_metadata(directory) else {
-            return false;
-        };
-        metadata.is_dir() && !metadata.file_type().is_symlink()
-    }
-
     /// Raw data root for tests.
     #[must_use]
     pub fn data_root(&self) -> &Path {
         &self.data_root
     }
+}
+
+fn recover_staged_operations(models_dir: &cap_std::fs::Dir) -> Result<(), ModelError> {
+    let mut changed = false;
+    for entry in models_dir.entries().map_err(map_store_error)? {
+        let entry = entry.map_err(map_store_error)?;
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            continue;
+        };
+        let id = if let Some(id) = name.strip_prefix(".remove-") {
+            id
+        } else if let Some(id) = name.strip_prefix(".install-") {
+            id
+        } else {
+            continue;
+        };
+        if InstalledModelId::parse(id).is_err() {
+            continue;
+        }
+        let file_type = entry.file_type().map_err(map_store_error)?;
+        if file_type.is_symlink() || !file_type.is_dir() {
+            return Err(ModelError::PathRejected);
+        }
+        models_dir.remove_dir_all(name).map_err(map_store_error)?;
+        changed = true;
+    }
+    if changed {
+        models_dir
+            .open(".")
+            .and_then(|file| file.sync_all())
+            .map_err(map_store_error)?;
+    }
+    Ok(())
 }
 
 fn descriptor_from_manifest(manifest: &ModelManifest) -> ModelDescriptor {
@@ -444,6 +1036,66 @@ fn descriptor_from_manifest(manifest: &ModelManifest) -> ModelDescriptor {
         source: manifest.source.clone(),
         size_mb: 0,
         task: "automatic-speech-recognition".to_owned(),
+    }
+}
+
+fn atomic_write_store_file(
+    directory: &cap_std::fs::Dir,
+    ambient_path: &Path,
+    file_name: &str,
+    bytes: &[u8],
+) -> Result<(), ModelError> {
+    #[cfg(windows)]
+    {
+        let _ = (directory, file_name);
+        atomic_write(ambient_path, bytes)
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = ambient_path;
+        atomic_write_cap(directory, file_name, bytes)
+    }
+}
+
+fn atomic_write_cap(
+    directory: &cap_std::fs::Dir,
+    file_name: &str,
+    bytes: &[u8],
+) -> Result<(), ModelError> {
+    let temporary = format!(".{file_name}.{}.tmp", Uuid::new_v4());
+    let mut options = cap_std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    let file = directory
+        .open_with(&temporary, &options)
+        .map_err(map_store_error)?;
+    let mut writer = std::io::BufWriter::new(file);
+    let result = (|| {
+        writer.write_all(bytes).map_err(map_store_error)?;
+        writer.flush().map_err(map_store_error)?;
+        writer.get_ref().sync_all().map_err(map_store_error)
+    })();
+    drop(writer);
+    if let Err(error) = result {
+        let _ignored = directory.remove_file(&temporary);
+        return Err(error);
+    }
+    if let Err(error) = directory
+        .rename(&temporary, directory, file_name)
+        .map_err(map_store_error)
+    {
+        let _ignored = directory.remove_file(&temporary);
+        return Err(error);
+    }
+    #[cfg(unix)]
+    {
+        directory
+            .open(".")
+            .and_then(|file| file.sync_all())
+            .map_err(map_store_error)
+    }
+    #[cfg(not(unix))]
+    {
+        Ok(())
     }
 }
 
@@ -465,6 +1117,7 @@ fn atomic_write(
         let mut writer = BufWriter::new(file);
         writer.write_all(bytes).map_err(map_store_error)?;
         writer.flush().map_err(map_store_error)?;
+        writer.get_ref().sync_all().map_err(map_store_error)?;
         drop(writer);
         Ok(())
     })();
@@ -472,7 +1125,50 @@ fn atomic_write(
         let _ignored = fs::remove_file(&temporary);
         return Err(error);
     }
-    fs::rename(&temporary, path).map_err(map_store_error)
+    replace_file(&temporary, path)?;
+    sync_directory(parent)
+}
+
+#[cfg(not(windows))]
+fn replace_file(
+    source: &Path,
+    destination: &Path,
+) -> Result<(), ModelError> {
+    fs::rename(source, destination).map_err(map_store_error)
+}
+
+#[cfg(windows)]
+fn replace_file(
+    source: &Path,
+    destination: &Path,
+) -> Result<(), ModelError> {
+    use atomicwrites::{AllowOverwrite, AtomicFile};
+    let atomic = AtomicFile::new(destination, AllowOverwrite);
+    atomic
+        .write(|output| {
+            let mut input = File::open(source)?;
+            std::io::copy(&mut input, output)?;
+            Ok::<(), std::io::Error>(())
+        })
+        .map_err(|_| ModelError::StoreFailed)?;
+    fs::remove_file(source).map_err(map_store_error)
+}
+
+fn set_no_follow(options: &mut fs::OpenOptions) {
+    #[cfg(unix)]
+    options.custom_flags(libc::O_NOFOLLOW);
+    #[cfg(windows)]
+    options.custom_flags(0x0020_0000); // FILE_FLAG_OPEN_REPARSE_POINT
+}
+
+fn sync_directory(path: &Path) -> Result<(), ModelError> {
+    #[cfg(not(unix))]
+    let _ = path;
+    #[cfg(unix)]
+    File::open(path)
+        .and_then(|directory| directory.sync_all())
+        .map_err(map_store_error)?;
+    Ok(())
 }
 
 #[allow(clippy::needless_pass_by_value)]
@@ -514,6 +1210,14 @@ mod tests {
     use super::{DigestAllowlist, FileDigest, ModelStore};
     use crate::{Alias, ModelDescriptor, ModelId, ModelSelector, ModelVersion, Verification};
 
+    fn files() -> Vec<crate::ModelFile> {
+        vec![crate::ModelFile {
+            path: "models/model.bin".to_owned(),
+            sha256: "0".repeat(64),
+            size: 1,
+        }]
+    }
+
     fn descriptor(version: &str) -> ModelDescriptor {
         ModelDescriptor {
             id: ModelId::new("FixtureLocal/NemotronASRStreaming0.6B".to_owned()),
@@ -537,13 +1241,48 @@ mod tests {
             .publish_manifest(
                 crate::InstalledModelId::new(),
                 &descriptor("1.0"),
-                Vec::new(),
+                files(),
                 Verification::RuntimeOnly,
             )
             .expect("publish");
         let manifests = store.list_manifests().expect("list");
         assert_eq!(manifests.len(), 1);
         assert_eq!(store.load_manifest(&id).expect("load"), manifests[0]);
+    }
+
+    #[test]
+    fn corrupt_manifest_is_reported_during_enumeration() {
+        let root = TempDir::new().expect("temp");
+        let store = ModelStore::open(root.path(), DigestAllowlist::empty()).expect("store");
+        let id = store
+            .publish_manifest(
+                crate::InstalledModelId::new(),
+                &descriptor("1.0"),
+                files(),
+                Verification::RuntimeOnly,
+            )
+            .expect("publish");
+        std::fs::write(
+            root.path()
+                .join("models")
+                .join(id.to_string())
+                .join("manifest.json"),
+            b"not json\n",
+        )
+        .expect("corrupt manifest");
+        assert_eq!(
+            store.installed_manifests(),
+            Err(crate::ModelError::CorruptManifest(id))
+        );
+        store
+            .remove_corrupt_manifest(&id)
+            .expect("explicit corruption repair");
+        assert!(
+            store
+                .installed_manifests()
+                .expect("list repaired")
+                .is_empty()
+        );
     }
 
     #[test]
@@ -638,7 +1377,7 @@ mod tests {
             .publish_manifest(
                 crate::InstalledModelId::new(),
                 &descriptor("1.0"),
-                Vec::new(),
+                files(),
                 Verification::RuntimeOnly,
             )
             .expect("publish");
@@ -657,7 +1396,7 @@ mod tests {
             .publish_manifest(
                 crate::InstalledModelId::new(),
                 &descriptor("1.0"),
-                Vec::new(),
+                files(),
                 Verification::RuntimeOnly,
             )
             .expect("publish");
@@ -679,7 +1418,7 @@ mod tests {
             .publish_manifest(
                 crate::InstalledModelId::new(),
                 &descriptor("1.0"),
-                Vec::new(),
+                files(),
                 Verification::RuntimeOnly,
             )
             .expect("publish");

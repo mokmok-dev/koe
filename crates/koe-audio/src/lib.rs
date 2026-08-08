@@ -44,13 +44,69 @@ pub struct AudioCapability {
     pub backend: String,
 }
 
-/// Device and native format selected by explicit user action.
+/// Format matching policy for [`OpenSource`].
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum FormatNegotiation {
+    /// Reject the request unless both rate and channel count are supported.
+    Exact,
+    /// Select the nearest supported format according to backend precedence.
+    /// This default preserves behavior of serialized requests from before
+    /// format negotiation was explicit.
+    #[default]
+    Nearest,
+}
+
+/// Device selected by explicit user action plus preferred native format.
+///
+/// The backend exposes the selected result through [`AudioStream::sample_rate`]
+/// and [`AudioStream::channels`].
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct OpenSource {
     pub device_id: String,
     pub kind: SourceKind,
-    pub sample_rate: u32,
-    pub channels: u16,
+    /// Preferred rate, or required rate under [`FormatNegotiation::Exact`].
+    #[serde(rename = "sample_rate")]
+    pub preferred_sample_rate: u32,
+    /// Preferred channels, or required count under [`FormatNegotiation::Exact`].
+    #[serde(rename = "channels")]
+    pub preferred_channels: u16,
+    #[serde(default)]
+    pub negotiation: FormatNegotiation,
+}
+
+impl OpenSource {
+    #[must_use]
+    pub fn exact(
+        device_id: impl Into<String>,
+        kind: SourceKind,
+        sample_rate: u32,
+        channels: u16,
+    ) -> Self {
+        Self {
+            device_id: device_id.into(),
+            kind,
+            preferred_sample_rate: sample_rate,
+            preferred_channels: channels,
+            negotiation: FormatNegotiation::Exact,
+        }
+    }
+
+    #[must_use]
+    pub fn nearest(
+        device_id: impl Into<String>,
+        kind: SourceKind,
+        preferred_sample_rate: u32,
+        preferred_channels: u16,
+    ) -> Self {
+        Self {
+            device_id: device_id.into(),
+            kind,
+            preferred_sample_rate,
+            preferred_channels,
+            negotiation: FormatNegotiation::Nearest,
+        }
+    }
 }
 
 /// Packaging-time trust policy for host-wide Linux audio access.
@@ -191,12 +247,16 @@ pub trait AudioBackend {
         &self,
         kind: SourceKind,
     ) -> Result<Vec<AudioDevice>, AudioError>;
-    /// Opens exactly the requested device; non-persistent IDs must be selected
-    /// again from the current process enumeration.
+    /// Opens the requested device using its explicit format negotiation policy;
+    /// non-persistent IDs must be selected again from current enumeration.
+    /// Inspect [`AudioStream::sample_rate`] and [`AudioStream::channels`] for
+    /// the selected native format. Backends minimize channel-count difference
+    /// first, then distance from the supported rate range, and finally prefer
+    /// signed 16-bit, 32-bit float, then unsigned 16-bit samples.
     ///
     /// # Errors
     ///
-    /// Returns an adapter error if the exact device or format cannot be opened.
+    /// Returns an adapter error if the device or a compatible format cannot be opened.
     fn open(
         &self,
         request: &OpenSource,
@@ -563,14 +623,20 @@ impl AudioBackend for CpalBackend {
                 matches!(
                     range.sample_format(),
                     cpal::SampleFormat::I16 | cpal::SampleFormat::U16 | cpal::SampleFormat::F32
-                )
+                ) && (request.negotiation == FormatNegotiation::Nearest
+                    || range.channels() == request.preferred_channels
+                        && range.min_sample_rate() <= request.preferred_sample_rate
+                        && request.preferred_sample_rate <= range.max_sample_rate())
             })
             .min_by_key(|range| {
-                let channel_penalty = u32::from(range.channels().abs_diff(request.channels));
-                let rate_distance = if request.sample_rate < range.min_sample_rate() {
-                    range.min_sample_rate() - request.sample_rate
+                let channel_penalty =
+                    u32::from(range.channels().abs_diff(request.preferred_channels));
+                let rate_distance = if request.preferred_sample_rate < range.min_sample_rate() {
+                    range.min_sample_rate() - request.preferred_sample_rate
                 } else {
-                    request.sample_rate.saturating_sub(range.max_sample_rate())
+                    request
+                        .preferred_sample_rate
+                        .saturating_sub(range.max_sample_rate())
                 };
                 let format_penalty = match range.sample_format() {
                     cpal::SampleFormat::I16 => 0,
@@ -583,7 +649,7 @@ impl AudioBackend for CpalBackend {
             .ok_or(AudioError::UnsupportedFormat)?;
         let sample_format = supported.sample_format();
         let selected_rate = request
-            .sample_rate
+            .preferred_sample_rate
             .clamp(supported.min_sample_rate(), supported.max_sample_rate());
         let config = supported.with_sample_rate(selected_rate).config();
         let source_id = stable_source_id(&id);
@@ -1081,6 +1147,40 @@ impl CanonicalNormalizer {
         self.drift_ppm = drift_ppm.clamp(-2_000.0, 2_000.0);
     }
 
+    /// Returns the exact initialized output length required for an interleaved input.
+    ///
+    /// Pass a slice of this length to [`Self::process`], for example by using
+    /// `vec![0; normalizer.required_output_len(input.len())?]`; reserving vector
+    /// capacity alone does not create writable elements.
+    ///
+    /// # Errors
+    ///
+    /// Rejects incomplete interleaved frames or an unrepresentable output size.
+    #[allow(
+        clippy::cast_possible_truncation,
+        clippy::cast_precision_loss,
+        clippy::cast_sign_loss
+    )]
+    pub fn required_output_len(
+        &self,
+        input_samples: usize,
+    ) -> Result<usize, AudioError> {
+        let channels = usize::from(self.channels);
+        if !input_samples.is_multiple_of(channels) {
+            return Err(AudioError::UnsupportedFormat);
+        }
+        let frames = input_samples / channels;
+        if frames == 0 || self.phase >= frames as f64 {
+            return Ok(0);
+        }
+        let step = f64::from(self.source_rate) / 16_000.0 * (1.0 + self.drift_ppm / 1_000_000.0);
+        let required = ((frames as f64 - self.phase) / step).ceil();
+        if !required.is_finite() || required > usize::MAX as f64 {
+            return Err(AudioError::InvalidBuffer);
+        }
+        Ok(required as usize)
+    }
+
     /// Downmixes, applies drift correction, and resamples into caller storage.
     ///
     /// Returns the number of output samples. No internal allocation occurs.
@@ -1108,24 +1208,26 @@ impl CanonicalNormalizer {
             return Ok(0);
         }
         let step = f64::from(self.source_rate) / 16_000.0 * (1.0 + self.drift_ppm / 1_000_000.0);
-        let mut produced = 0_usize;
-        while self.phase < frames as f64 {
-            let frame = self.phase.floor() as usize;
+        let required = self.required_output_len(input.len())?;
+        if output.len() < required {
+            return Err(AudioError::InvalidBuffer);
+        }
+
+        for (produced, slot) in output.iter_mut().take(required).enumerate() {
+            let phase = (produced as f64).mul_add(step, self.phase);
+            let frame = phase.floor() as usize;
             let next = frame.saturating_add(1).min(frames - 1);
-            let fraction = self.phase - frame as f64;
+            let fraction = phase - frame as f64;
             let current = downmix_frame(input, frame, channels);
             let following = downmix_frame(input, next, channels);
             let sample = (f64::from(following) - f64::from(current))
                 .mul_add(fraction, f64::from(current))
                 .round()
                 .clamp(f64::from(i16::MIN), f64::from(i16::MAX));
-            let slot = output.get_mut(produced).ok_or(AudioError::InvalidBuffer)?;
             *slot = sample as i16;
-            produced += 1;
-            self.phase += step;
         }
-        self.phase -= frames as f64;
-        Ok(produced)
+        self.phase = (required as f64).mul_add(step, self.phase) - frames as f64;
+        Ok(required)
     }
 }
 
@@ -1692,6 +1794,32 @@ mod tests {
             .unwrap_or_else(|error| panic!("{error}"));
         assert_eq!(count, 2);
         assert_eq!(&output[..count], &[2_000, 5_000]);
+    }
+
+    #[test]
+    fn insufficient_normalizer_output_does_not_advance_state() {
+        let input = [
+            1_000, 3_000, 2_000, 4_000, 3_000, 5_000, 4_000, 6_000, 5_000, 7_000, 6_000, 8_000,
+        ];
+        let mut retried =
+            CanonicalNormalizer::new(48_000, 2).unwrap_or_else(|error| panic!("{error}"));
+        assert_eq!(
+            retried.process(&input, &mut [0_i16; 1]),
+            Err(AudioError::InvalidBuffer)
+        );
+        let mut retry_output = [0_i16; 4];
+        let retry_count = retried
+            .process(&input, &mut retry_output)
+            .unwrap_or_else(|error| panic!("{error}"));
+
+        let mut reference =
+            CanonicalNormalizer::new(48_000, 2).unwrap_or_else(|error| panic!("{error}"));
+        let mut reference_output = [0_i16; 4];
+        let reference_count = reference
+            .process(&input, &mut reference_output)
+            .unwrap_or_else(|error| panic!("{error}"));
+        assert_eq!(retry_count, reference_count);
+        assert_eq!(retry_output, reference_output);
     }
 
     #[test]

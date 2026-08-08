@@ -2,18 +2,65 @@
 
 use std::{
     collections::BTreeMap,
-    fs::{self, File, OpenOptions},
-    io::{BufWriter, Write},
+    fs::{self, File},
+    io::{BufRead, BufReader, BufWriter, Read, Write},
     path::{Path, PathBuf},
 };
+
+#[cfg(not(unix))]
+use std::fs::OpenOptions;
+#[cfg(unix)]
+use std::os::fd::OwnedFd;
+#[cfg(windows)]
+use std::os::windows::fs::OpenOptionsExt;
 
 use uuid::Uuid;
 
 use super::types::{SegmentId, TranscriptError, TranscriptSegment};
 
 const EVENTS_FILE: &str = "events.jsonl";
+const LOCK_FILE: &str = ".events.lock";
 const FINAL_JSON: &str = "final.json";
 const FINAL_TEXT: &str = "final.txt";
+/// Maximum encoded JSONL bytes for one transcript event (4 MiB).
+pub const MAX_EVENT_RECORD_BYTES: usize = 4 * 1024 * 1024;
+
+struct LimitedRecordWriter {
+    bytes: Vec<u8>,
+    limit: usize,
+    exceeded: bool,
+}
+
+impl LimitedRecordWriter {
+    fn new(limit: usize) -> Self {
+        Self {
+            bytes: Vec::with_capacity(limit.min(8 * 1024)),
+            limit,
+            exceeded: false,
+        }
+    }
+}
+
+impl Write for LimitedRecordWriter {
+    fn write(
+        &mut self,
+        buffer: &[u8],
+    ) -> std::io::Result<usize> {
+        if buffer.len() > self.limit.saturating_sub(self.bytes.len()) {
+            self.exceeded = true;
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "transcript record too large",
+            ));
+        }
+        self.bytes.extend_from_slice(buffer);
+        Ok(buffer.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
 
 /// Materialized view written by [`TranscriptStore::finalize`].
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -26,7 +73,10 @@ pub struct TranscriptReport {
 /// Append-only transcript log for one session directory.
 pub struct TranscriptStore {
     directory: PathBuf,
+    #[cfg(unix)]
+    directory_handle: OwnedFd,
     writer: Option<BufWriter<File>>,
+    lock_file: Option<File>,
     /// Latest revision per segment id.
     latest: BTreeMap<SegmentId, TranscriptSegment>,
     /// First-seen append order of segment ids.
@@ -35,27 +85,71 @@ pub struct TranscriptStore {
 }
 
 impl TranscriptStore {
-    /// Opens a transcript directory, creating it if absent.
+    /// Opens a transcript directory, creating its final component if absent.
+    ///
+    /// Recovery durably truncates a final record lacking a newline. Complete
+    /// malformed or oversized records are treated as corruption and preserved
+    /// to avoid destructive automatic recovery.
     ///
     /// # Errors
     ///
-    /// Returns [`TranscriptError::PathRejected`] when the directory is a
-    /// symlink and [`TranscriptError::WriteFailed`] on I/O errors.
+    /// Returns [`TranscriptError::PathRejected`] when the directory is unsafe
+    /// or `events.jsonl` is a symlink/non-file,
+    /// [`TranscriptError::StoreLocked`] when another store owns the log,
+    /// [`TranscriptError::CorruptLog`] for malformed/oversized complete
+    /// records, and [`TranscriptError::WriteFailed`] on I/O errors.
     pub fn open(directory: impl Into<PathBuf>) -> Result<Self, TranscriptError> {
         let directory = directory.into();
-        let metadata =
-            fs::symlink_metadata(&directory).map_err(|_| TranscriptError::PathRejected)?;
+        let metadata = match fs::symlink_metadata(&directory) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                fs::create_dir(&directory).map_err(|_| TranscriptError::WriteFailed)?;
+                fs::symlink_metadata(&directory).map_err(|_| TranscriptError::PathRejected)?
+            },
+            Err(_) => return Err(TranscriptError::PathRejected),
+        };
         if metadata.file_type().is_symlink() || !metadata.is_dir() {
             return Err(TranscriptError::PathRejected);
         }
+        #[cfg(unix)]
+        let directory_handle = open_directory_handle(&directory)?;
         let log_path = directory.join(EVENTS_FILE);
+        match fs::symlink_metadata(&log_path) {
+            Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_file() => {
+                return Err(TranscriptError::PathRejected);
+            },
+            Ok(_) => {},
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {},
+            Err(_) => return Err(TranscriptError::WriteFailed),
+        }
+        let lock_path = directory.join(LOCK_FILE);
+        match fs::symlink_metadata(&lock_path) {
+            Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_file() => {
+                return Err(TranscriptError::PathRejected);
+            },
+            Ok(_) => {},
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {},
+            Err(_) => return Err(TranscriptError::WriteFailed),
+        }
         let mut store = Self {
             directory,
+            #[cfg(unix)]
+            directory_handle,
             writer: None,
+            lock_file: None,
             latest: BTreeMap::new(),
             order: Vec::new(),
             finalized: false,
         };
+        let lock_file = store.open_lock_file()?;
+        fs2::FileExt::try_lock_exclusive(&lock_file).map_err(|error| {
+            if error.kind() == std::io::ErrorKind::WouldBlock {
+                TranscriptError::StoreLocked
+            } else {
+                TranscriptError::WriteFailed
+            }
+        })?;
+        store.lock_file = Some(lock_file);
         store.recover_log(&log_path)?;
         Ok(store)
     }
@@ -71,28 +165,69 @@ impl TranscriptStore {
         &mut self,
         log_path: &Path,
     ) -> Result<(), TranscriptError> {
-        let content = match fs::read(log_path) {
-            Ok(content) => content,
+        match fs::symlink_metadata(log_path) {
+            Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_file() => {
+                return Err(TranscriptError::PathRejected);
+            },
+            Ok(_) => {},
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                 self.open_writer(log_path)?;
                 return Ok(());
             },
             Err(_) => return Err(TranscriptError::WriteFailed),
-        };
-        // `split_inclusive` keeps the newline on every complete line. A final
-        // line without a trailing newline is a torn write from a crash and is
-        // ignored; a complete line that fails to parse is corruption.
-        let mut lines = content.split_inclusive(|byte| *byte == b'\n');
-        let mut pending = lines.next();
-        while let Some(line) = pending.take() {
-            pending = lines.next();
+        }
+        let mut file = self.open_log_file(false, false)?;
+        if !file
+            .metadata()
+            .map_err(|_| TranscriptError::WriteFailed)?
+            .is_file()
+        {
+            return Err(TranscriptError::PathRejected);
+        }
+        let file_len = file
+            .metadata()
+            .map_err(|_| TranscriptError::WriteFailed)?
+            .len();
+        let mut reader = BufReader::new(&mut file);
+        let mut valid_len = 0_u64;
+        let mut line = Vec::new();
+        loop {
+            line.clear();
+            let mut limited = (&mut reader).take(
+                u64::try_from(MAX_EVENT_RECORD_BYTES + 1)
+                    .map_err(|_| TranscriptError::WriteFailed)?,
+            );
+            let read = limited
+                .read_until(b'\n', &mut line)
+                .map_err(|_| TranscriptError::WriteFailed)?;
+            if read == 0 {
+                break;
+            }
+            if line.len() > MAX_EVENT_RECORD_BYTES {
+                if line.ends_with(b"\n") || scan_to_record_end(&mut reader)? {
+                    return Err(TranscriptError::CorruptLog);
+                }
+                break;
+            }
             if !line.ends_with(b"\n") {
-                continue;
+                break;
             }
             let record = &line[..line.len() - 1];
             let segment = serde_json::from_slice::<TranscriptSegment>(record)
                 .map_err(|_| TranscriptError::CorruptLog)?;
+            if segment.validate().is_err() {
+                return Err(TranscriptError::CorruptLog);
+            }
             self.insert(segment);
+            valid_len = valid_len
+                .checked_add(u64::try_from(read).map_err(|_| TranscriptError::WriteFailed)?)
+                .ok_or(TranscriptError::WriteFailed)?;
+        }
+        drop(reader);
+        if valid_len != file_len {
+            file.set_len(valid_len)
+                .map_err(|_| TranscriptError::WriteFailed)?;
+            file.sync_all().map_err(|_| TranscriptError::WriteFailed)?;
         }
         self.open_writer(log_path)
     }
@@ -101,8 +236,12 @@ impl TranscriptStore {
     ///
     /// # Errors
     ///
-    /// Returns [`TranscriptError::AlreadyFinalized`] after finalize and
-    /// [`TranscriptError::WriteFailed`] on I/O errors.
+    /// Returns [`TranscriptError::AlreadyFinalized`] after finalize,
+    /// [`TranscriptError::InvalidSegment`] unless schema version is 1,
+    /// timestamps are ordered, and source/model identity fields are nonempty
+    /// and control-free, [`TranscriptError::RecordTooLarge`] above
+    /// [`MAX_EVENT_RECORD_BYTES`], and [`TranscriptError::WriteFailed`] on I/O
+    /// errors.
     pub fn append(
         &mut self,
         segment: TranscriptSegment,
@@ -110,10 +249,22 @@ impl TranscriptStore {
         if self.finalized {
             return Err(TranscriptError::AlreadyFinalized);
         }
-        let writer = self.writer.as_mut().ok_or(TranscriptError::WriteFailed)?;
-        serde_json::to_writer(&mut *writer, &segment).map_err(|_| TranscriptError::WriteFailed)?;
-        writer
-            .write_all(b"\n")
+        if let Err(reason) = segment.validate() {
+            return Err(TranscriptError::InvalidSegment(reason));
+        }
+        let mut serialized = LimitedRecordWriter::new(MAX_EVENT_RECORD_BYTES - 1);
+        if serde_json::to_writer(&mut serialized, &segment).is_err() {
+            return Err(if serialized.exceeded {
+                TranscriptError::RecordTooLarge
+            } else {
+                TranscriptError::WriteFailed
+            });
+        }
+        serialized.bytes.push(b'\n');
+        self.writer
+            .as_mut()
+            .ok_or(TranscriptError::WriteFailed)?
+            .write_all(&serialized.bytes)
             .map_err(|_| TranscriptError::WriteFailed)?;
         self.insert(segment);
         Ok(())
@@ -166,14 +317,14 @@ impl TranscriptStore {
         if self.finalized {
             return Err(TranscriptError::AlreadyFinalized);
         }
-        if let Some(writer) = self.writer.take() {
-            let mut writer = writer;
+        if let Some(writer) = self.writer.as_mut() {
             writer.flush().map_err(|_| TranscriptError::WriteFailed)?;
             writer
                 .get_ref()
                 .sync_all()
                 .map_err(|_| TranscriptError::WriteFailed)?;
         }
+        drop(self.writer.take());
         let final_segments = self
             .order
             .iter()
@@ -182,7 +333,7 @@ impl TranscriptStore {
             .cloned()
             .collect::<Vec<_>>();
         let json_path = self.directory.join(FINAL_JSON);
-        write_temp_then_rename(&json_path, &mut |writer| {
+        self.write_output_atomic(FINAL_JSON, &mut |writer| {
             serde_json::to_writer_pretty(&mut *writer, &final_segments)
                 .map_err(|_| TranscriptError::WriteFailed)?;
             writer
@@ -190,7 +341,7 @@ impl TranscriptStore {
                 .map_err(|_| TranscriptError::WriteFailed)
         })?;
         let text_path = self.directory.join(FINAL_TEXT);
-        write_temp_then_rename(&text_path, &mut |writer| {
+        self.write_output_atomic(FINAL_TEXT, &mut |writer| {
             for segment in &final_segments {
                 writer
                     .write_all(segment.text.as_bytes())
@@ -230,20 +381,213 @@ impl TranscriptStore {
         self.latest.is_empty()
     }
 
+    fn write_output_atomic(
+        &self,
+        file_name: &str,
+        write: &mut dyn FnMut(&mut BufWriter<File>) -> Result<(), TranscriptError>,
+    ) -> Result<(), TranscriptError> {
+        #[cfg(unix)]
+        {
+            use rustix::fs::{AtFlags, Mode, OFlags, fsync, openat, renameat, unlinkat};
+
+            let temporary = format!(".{file_name}.{}.tmp", Uuid::new_v4());
+            let descriptor = openat(
+                &self.directory_handle,
+                temporary.as_str(),
+                OFlags::CLOEXEC | OFlags::NOFOLLOW | OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL,
+                Mode::from_bits_truncate(0o600),
+            )
+            .map_err(|_| TranscriptError::WriteFailed)?;
+            let mut writer = BufWriter::new(File::from(descriptor));
+            let result = write(&mut writer).and_then(|()| {
+                writer.flush().map_err(|_| TranscriptError::WriteFailed)?;
+                writer
+                    .get_ref()
+                    .sync_all()
+                    .map_err(|_| TranscriptError::WriteFailed)
+            });
+            if result.is_err() {
+                let _ignored =
+                    unlinkat(&self.directory_handle, temporary.as_str(), AtFlags::empty());
+                return result;
+            }
+            if renameat(
+                &self.directory_handle,
+                temporary.as_str(),
+                &self.directory_handle,
+                file_name,
+            )
+            .is_err()
+            {
+                let _ignored =
+                    unlinkat(&self.directory_handle, temporary.as_str(), AtFlags::empty());
+                return Err(TranscriptError::WriteFailed);
+            }
+            fsync(&self.directory_handle).map_err(|_| TranscriptError::WriteFailed)
+        }
+        #[cfg(not(unix))]
+        {
+            write_temp_then_rename(&self.directory.join(file_name), write)
+        }
+    }
+
+    fn sync_directory(&self) -> Result<(), TranscriptError> {
+        #[cfg(unix)]
+        {
+            rustix::fs::fsync(&self.directory_handle).map_err(|_| TranscriptError::WriteFailed)
+        }
+        #[cfg(not(unix))]
+        {
+            Ok(())
+        }
+    }
+
+    fn classify_lock_open_error(&self) -> TranscriptError {
+        match fs::symlink_metadata(self.directory.join(LOCK_FILE)) {
+            Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_file() => {
+                TranscriptError::PathRejected
+            },
+            _ => TranscriptError::WriteFailed,
+        }
+    }
+
+    fn open_lock_file(&self) -> Result<File, TranscriptError> {
+        #[cfg(unix)]
+        {
+            use rustix::fs::{Mode, OFlags, openat};
+            let descriptor = openat(
+                &self.directory_handle,
+                LOCK_FILE,
+                OFlags::CLOEXEC | OFlags::NOFOLLOW | OFlags::RDWR | OFlags::CREATE,
+                Mode::from_bits_truncate(0o600),
+            )
+            .map_err(|_| self.classify_lock_open_error())?;
+            let file = File::from(descriptor);
+            if !file
+                .metadata()
+                .map_err(|_| TranscriptError::WriteFailed)?
+                .is_file()
+            {
+                return Err(TranscriptError::PathRejected);
+            }
+            Ok(file)
+        }
+        #[cfg(not(unix))]
+        {
+            let mut options = OpenOptions::new();
+            options.read(true).write(true).create(true);
+            set_no_follow(&mut options);
+            let file = options
+                .open(self.directory.join(LOCK_FILE))
+                .map_err(|_| self.classify_lock_open_error())?;
+            if !file
+                .metadata()
+                .map_err(|_| TranscriptError::WriteFailed)?
+                .is_file()
+            {
+                return Err(TranscriptError::PathRejected);
+            }
+            Ok(file)
+        }
+    }
+
+    fn open_log_file(
+        &self,
+        append: bool,
+        create: bool,
+    ) -> Result<File, TranscriptError> {
+        #[cfg(unix)]
+        {
+            use rustix::fs::{Mode, OFlags, openat};
+
+            let mut flags = OFlags::CLOEXEC | OFlags::NOFOLLOW | OFlags::RDWR;
+            if append {
+                flags |= OFlags::APPEND;
+            }
+            if create {
+                flags |= OFlags::CREATE;
+            }
+            let descriptor = openat(
+                &self.directory_handle,
+                EVENTS_FILE,
+                flags,
+                Mode::from_bits_truncate(0o600),
+            )
+            .map_err(|_| TranscriptError::WriteFailed)?;
+            Ok(File::from(descriptor))
+        }
+        #[cfg(not(unix))]
+        {
+            let mut options = OpenOptions::new();
+            options
+                .read(!append)
+                .write(!append)
+                .append(append)
+                .create(create);
+            set_no_follow(&mut options);
+            options
+                .open(self.directory.join(EVENTS_FILE))
+                .map_err(|_| TranscriptError::WriteFailed)
+        }
+    }
+
     fn open_writer(
         &mut self,
         log_path: &Path,
     ) -> Result<(), TranscriptError> {
-        let mut options = OpenOptions::new();
-        options.append(true).create(true);
-        let file = options
-            .open(log_path)
-            .map_err(|_| TranscriptError::WriteFailed)?;
+        let created = match fs::symlink_metadata(log_path) {
+            Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_file() => {
+                return Err(TranscriptError::PathRejected);
+            },
+            Ok(_) => false,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => true,
+            Err(_) => return Err(TranscriptError::WriteFailed),
+        };
+        let file = self.open_log_file(true, true)?;
         self.writer = Some(BufWriter::new(file));
+        if created {
+            self.sync_directory()?;
+        }
         Ok(())
     }
 }
 
+fn scan_to_record_end(reader: &mut impl BufRead) -> Result<bool, TranscriptError> {
+    loop {
+        let buffer = reader
+            .fill_buf()
+            .map_err(|_| TranscriptError::WriteFailed)?;
+        if buffer.is_empty() {
+            return Ok(false);
+        }
+        if let Some(index) = buffer.iter().position(|byte| *byte == b'\n') {
+            reader.consume(index + 1);
+            return Ok(true);
+        }
+        let consumed = buffer.len();
+        reader.consume(consumed);
+    }
+}
+
+#[cfg(unix)]
+fn open_directory_handle(path: &Path) -> Result<OwnedFd, TranscriptError> {
+    use rustix::fs::{Mode, OFlags, open};
+
+    open(
+        path,
+        OFlags::CLOEXEC | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::RDONLY,
+        Mode::empty(),
+    )
+    .map_err(|_| TranscriptError::PathRejected)
+}
+
+#[cfg(not(unix))]
+fn set_no_follow(options: &mut OpenOptions) {
+    #[cfg(windows)]
+    options.custom_flags(0x0020_0000); // FILE_FLAG_OPEN_REPARSE_POINT
+}
+
+#[cfg(not(unix))]
 fn write_temp_then_rename(
     destination: &Path,
     write: &mut dyn FnMut(&mut BufWriter<File>) -> Result<(), TranscriptError>,
@@ -272,7 +616,32 @@ fn write_temp_then_rename(
         let _ignored = fs::remove_file(&temporary);
         return result;
     }
-    fs::rename(&temporary, destination).map_err(|_| TranscriptError::WriteFailed)
+    replace_file(&temporary, destination)
+}
+
+#[cfg(not(any(unix, windows)))]
+fn replace_file(
+    source: &Path,
+    destination: &Path,
+) -> Result<(), TranscriptError> {
+    fs::rename(source, destination).map_err(|_| TranscriptError::WriteFailed)
+}
+
+#[cfg(windows)]
+fn replace_file(
+    source: &Path,
+    destination: &Path,
+) -> Result<(), TranscriptError> {
+    use atomicwrites::{AllowOverwrite, AtomicFile};
+    let atomic = AtomicFile::new(destination, AllowOverwrite);
+    atomic
+        .write(|output| {
+            let mut input = File::open(source)?;
+            std::io::copy(&mut input, output)?;
+            Ok::<(), std::io::Error>(())
+        })
+        .map_err(|_| TranscriptError::WriteFailed)?;
+    fs::remove_file(source).map_err(|_| TranscriptError::WriteFailed)
 }
 
 impl From<std::io::Error> for TranscriptError {
@@ -287,6 +656,17 @@ mod tests {
 
     use super::TranscriptStore;
     use crate::{TranscriptModel, TranscriptSegment};
+
+    fn final_segment(
+        start_ms: u64,
+        end_ms: u64,
+        text: String,
+        model: Option<TranscriptModel>,
+        audio_discontinuities: Vec<u64>,
+    ) -> TranscriptSegment {
+        TranscriptSegment::final_segment(start_ms, end_ms, text, model, audio_discontinuities)
+            .expect("valid segment")
+    }
 
     fn model() -> TranscriptModel {
         TranscriptModel {
@@ -307,7 +687,7 @@ mod tests {
         std::fs::create_dir(&directory).expect("create");
         let mut store = open(&directory);
         store
-            .append(TranscriptSegment::final_segment(
+            .append(final_segment(
                 0,
                 1000,
                 "hello".to_owned(),
@@ -316,7 +696,7 @@ mod tests {
             ))
             .expect("append");
         store
-            .append(TranscriptSegment::final_segment(
+            .append(final_segment(
                 1000,
                 2000,
                 "world".to_owned(),
@@ -343,17 +723,15 @@ mod tests {
         let directory = root.path().join("transcript");
         std::fs::create_dir(&directory).expect("create");
         let mut store = open(&directory);
-        let interim = TranscriptSegment::final_segment(
-            0,
-            500,
-            "partial".to_owned(),
-            Some(model()),
-            Vec::new(),
-        );
+        let interim = final_segment(0, 500, "partial".to_owned(), Some(model()), Vec::new());
         let id = interim.segment_id;
         store.append(interim.clone()).expect("interim");
         store
-            .append(interim.revise(1000, "final text".to_owned(), true, Vec::new()))
+            .append(
+                interim
+                    .revise(1000, "final text".to_owned(), true, Vec::new())
+                    .expect("valid revision"),
+            )
             .expect("revision");
         store.checkpoint().expect("checkpoint");
         let report = store.finalize().expect("finalize");
@@ -373,7 +751,7 @@ mod tests {
         let directory = root.path().join("transcript");
         std::fs::create_dir(&directory).expect("create");
         let log = directory.join("events.jsonl");
-        let complete = serde_json::to_string(&TranscriptSegment::final_segment(
+        let complete = serde_json::to_string(&final_segment(
             0,
             1000,
             "kept".to_owned(),
@@ -390,7 +768,7 @@ mod tests {
         assert_eq!(store.segments().len(), 1, "torn tail must be ignored");
         assert_eq!(store.segments()[0].text, "kept");
         store
-            .append(TranscriptSegment::final_segment(
+            .append(final_segment(
                 5000,
                 6000,
                 "after".to_owned(),
@@ -399,6 +777,10 @@ mod tests {
             ))
             .expect("append");
         store.checkpoint().expect("checkpoint");
+        drop(store);
+
+        let mut store = open(&directory);
+        assert_eq!(store.segments().len(), 2, "recovered log must remain valid");
         let report = store.finalize().expect("finalize");
         let json: Vec<TranscriptSegment> =
             serde_json::from_slice(&std::fs::read(report.json_path).expect("json"))
@@ -423,25 +805,13 @@ mod tests {
         std::fs::create_dir(&directory).expect("create");
         let mut store = open(&directory);
         store
-            .append(TranscriptSegment::final_segment(
-                0,
-                1,
-                "x".to_owned(),
-                None,
-                Vec::new(),
-            ))
+            .append(final_segment(0, 1, "x".to_owned(), None, Vec::new()))
             .expect("append");
         store.finalize().expect("finalize");
         assert!(store.finalize().is_err());
         assert!(
             store
-                .append(TranscriptSegment::final_segment(
-                    1,
-                    2,
-                    "y".to_owned(),
-                    None,
-                    Vec::new()
-                ))
+                .append(final_segment(1, 2, "y".to_owned(), None, Vec::new()))
                 .is_err()
         );
     }
