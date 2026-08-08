@@ -163,6 +163,8 @@
           };
         in
         {
+          packages.default = self'.packages.koe-cli;
+
           checks = {
             foundry-native = foundryNative;
           }
@@ -186,6 +188,7 @@
 
           rust-project = {
             toolchain = pkgs.rust-bin.fromRustupToolchainFile ./rust-toolchain.toml;
+            crates.koe-cli.crane.args.meta.mainProgram = "koe";
             defaults.perCrate.crane.args = {
               BINDGEN_EXTRA_CLANG_ARGS = pkgs.lib.optionalString pkgs.stdenv.isLinux "-isystem ${pkgs.llvmPackages_18.clang-unwrapped.lib}/lib/clang/18/include";
               LIBCLANG_PATH = "${pkgs.llvmPackages_18.libclang.lib}/lib";

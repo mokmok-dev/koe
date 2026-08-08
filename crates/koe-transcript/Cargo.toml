@@ -1,5 +1,6 @@
 [package]
 name = "koe-transcript"
+description = "Transcript storage and processing for koe"
 version.workspace = true
 edition.workspace = true
 
