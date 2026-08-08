@@ -2400,7 +2400,7 @@ fn append_asr_event(
     }
     store.append(TranscriptSegment {
         schema_version: 1,
-        segment_id: SegmentId::new(),
+        segment_id: SegmentId::from(event.segment_id),
         source: "mixed".to_owned(),
         start_ms: event.start_us / 1_000,
         end_ms: event.end_us / 1_000,
