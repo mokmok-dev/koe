@@ -6,6 +6,13 @@
     treefmt-nix.inputs.nixpkgs.follows = "nixpkgs";
     git-hooks.url = "github:cachix/git-hooks.nix";
     git-hooks.inputs.nixpkgs.follows = "nixpkgs";
+    rust-overlay.url = "github:oxalica/rust-overlay";
+    rust-overlay.inputs.nixpkgs.follows = "nixpkgs";
+    rust-flake = {
+      url = "github:juspay/rust-flake";
+      inputs.nixpkgs.follows = "nixpkgs";
+      inputs.rust-overlay.follows = "rust-overlay";
+    };
   };
 
   outputs =
@@ -14,37 +21,72 @@
       imports = [
         inputs.treefmt-nix.flakeModule
         inputs.git-hooks.flakeModule
+        inputs.rust-flake.flakeModules.default
+        inputs.rust-flake.flakeModules.nixpkgs
       ];
 
-      perSystem = { pkgs, config, ... }: {
-        devShells.default = pkgs.mkShellNoCC {
-          inputsFrom = [ config.pre-commit.devShell ];
+      perSystem =
+        {
+          self',
+          pkgs,
+          config,
+          lib,
+          ...
+        }:
+        {
+          devShells.default = pkgs.mkShellNoCC {
+            inputsFrom = [
+              config.pre-commit.devShell
+              self'.devShells.rust
+            ];
 
-          packages = [ ];
-        };
+            packages = [ ];
+          };
 
-        pre-commit.settings = {
-          hooks = {
-            actionlint.enable = true;
-            deadnix.enable = true;
-            statix = {
-              enable = true;
-              settings.ignore = [
-                ".direnv/**"
-              ];
+          checks = lib.mapAttrs' (
+            name: crate:
+            let
+              crane-lib = config.rust-project.crane-lib;
+              args = crate.crane.args // {
+                src = config.rust-project.src;
+                pname = name;
+                cargoExtraArgs = "-p ${name}";
+                strictDeps = true;
+              };
+              cargoArtifacts = crane-lib.buildDepsOnly args;
+            in
+            lib.nameValuePair "${name}-test" (crane-lib.cargoTest (args // { inherit cargoArtifacts; }))
+          ) config.rust-project.crates;
+
+          pre-commit.settings = {
+            hooks = {
+              actionlint.enable = true;
+              deadnix.enable = true;
+              statix = {
+                enable = true;
+                settings.ignore = [
+                  ".direnv/**"
+                ];
+              };
+            };
+            package = pkgs.prek;
+          };
+
+          rust-project = {
+            toolchain = pkgs.rust-bin.fromRustupToolchainFile ./rust-toolchain.toml;
+          };
+
+          treefmt = {
+            projectRootFile = "flake.nix";
+            programs = {
+              nixfmt.enable = true;
+              rustfmt.enable = true;
+              rustfmt.package = config.rust-project.toolchain;
+              taplo.enable = true;
+              yamlfmt.enable = true;
             };
           };
-          package = pkgs.prek;
         };
-
-        treefmt = {
-          projectRootFile = "flake.nix";
-          programs = {
-            nixfmt.enable = true;
-            yamlfmt.enable = true;
-          };
-        };
-      };
 
       systems = [
         "aarch64-darwin"
