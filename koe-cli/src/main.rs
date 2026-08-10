@@ -1,3 +1,5 @@
+//! koe-cli — command-line interface for Koe.
+
 use clap::{Parser, Subcommand};
 use thiserror::Error;
 
