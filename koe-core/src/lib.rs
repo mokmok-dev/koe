@@ -1,6 +1,7 @@
 //! koe-core — shared pipeline, AEC, codecs, and state.
 
-pub fn add(
+#[must_use]
+pub const fn add(
     left: u64,
     right: u64,
 ) -> u64 {
