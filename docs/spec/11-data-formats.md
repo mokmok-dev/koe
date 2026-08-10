@@ -14,9 +14,9 @@ Three output formats, selected via `--format <FORMAT>`:
 
 | Format | Extension | Compression | Container | Metadata Support |
 |--------|-----------|-------------|-----------|-----------------|
-| **FLAC** (default) | `.flac` | Lossless (~50–60% of raw PCM) | Native FLAC | Vorbis Comment |
+| **OGG** (default) | `.ogg` | Lossy (~8–12% of raw PCM) | OGG container | Vorbis Comment |
 | **WAV** | `.wav` | None (raw PCM) | RIFF/WAVE | RIFF INFO chunks |
-| **ALAC** | `.m4a` / `.caf` | Lossless (~50–60% of raw PCM) | MPEG-4 / CAF | iTunes metadata |
+| **FLAC** | `.flac` | Lossless (~50–60% of raw PCM) | Native FLAC | Vorbis Comment |
 
 ### Canonical PCM Specification
 
@@ -29,10 +29,66 @@ All encoders receive the same input:
 | Channels | 2 (stereo, interleaved L/R) |
 | Byte order | Native endian (little-endian on Apple Silicon) |
 
-Encoders handle conversion to their target format (FLAC → i16/i24, ALAC →
-i16, WAV → user-configured bit depth).
+Encoders handle conversion to their target format (OGG → f32 passthrough to
+Vorbis encoder, FLAC → i24, WAV → user-configured bit depth).
+
+### OGG Vorbis Details (Default)
+
+OGG Vorbis is an open, patent-free lossy codec in an OGG container. It
+provides excellent speech quality at a fraction of raw PCM size — ideal for
+long recording sessions.
+
+```mermaid
+flowchart LR
+    subgraph OGG["OGG Container"]
+        direction LR
+        ID["Identification<br/>Header"]
+        COMMENT["Vorbis Comment<br/>(metadata)"]
+        SETUP["Setup Header<br/>(codebooks)"]
+        PAGES["Audio Pages<br/>page₀ │ page₁ │ ... │ pageₙ"]
+    end
+
+    ID --> COMMENT --> SETUP --> PAGES
+```
+
+- **Quality level:** 0.4 (speech-optimized; roughly equivalent to ~128 kbps
+  nominal). Balances quality, file size, and encode speed.
+- **Block size:** 256–2048 samples (Vorbis adaptive; small for transients,
+  large for tonal)
+- **Sample format:** Float32 (Vorbis encoder accepts f32 natively — no
+  quantization loss in encoding step)
+- **Vorbis Comment tags written:**
+
+| Tag | Source |
+|-----|--------|
+| `TITLE` | `{app_name} recording — {date} {time}` |
+| `ARTIST` | `Koe` |
+| `DATE` | ISO 8601 recording start |
+| `DESCRIPTION` | `Source: {source_config}, Locale: {locale}` |
+| `ENCODER` | `koe v{version}` |
+| `KOE_SOURCE` | JSON of `AudioSourceConfig` |
+
+### WAV Details
+
+WAV is available as a lossless fallback. It writes raw PCM with no compression.
+
+```mermaid
+flowchart LR
+    RIFF["RIFF header<br/>'RIFF' + file size"]
+    FMT["fmt  chunk<br/>PCM, 48k/2ch/f32"]
+    FACT["fact chunk<br/>sample count"]
+    DATA["data chunk<br/>raw interleaved PCM f32"]
+
+    RIFF --> FMT --> FACT --> DATA
+```
+
+- **Fact chunk** is always written.
+- **No size limit** in v1 (WAV format's 4 GB limit via RIFF64 not implemented;
+  users recording > ~6 hours at 48 kHz stereo f32 should use OGG or FLAC).
 
 ### FLAC Details
+
+FLAC is available as a lossless archival option.
 
 ```mermaid
 flowchart LR
@@ -48,60 +104,6 @@ flowchart LR
 - **Compression level:** 5 (default; balances speed and ratio)
 - **Block size:** 4096 samples (~85 ms at 48 kHz)
 - **Bits per sample:** 24 (converted from f32; preserves full dynamic range)
-- **Vorbis Comment tags written:**
-
-| Tag | Source |
-|-----|--------|
-| `TITLE` | `{app_name} recording — {date} {time}` |
-| `ARTIST` | `Koe` |
-| `DATE` | ISO 8601 recording start |
-| `DESCRIPTION` | `Source: {source_config}, Locale: {locale}` |
-| `ENCODER` | `koe v{version}` |
-| `KOE_SOURCE` | JSON of `AudioSourceConfig` |
-
-### WAV Details
-
-```mermaid
-flowchart LR
-    RIFF["RIFF header<br/>'RIFF' + file size"]
-    FMT["fmt  chunk<br/>PCM, 48k/2ch/f32"]
-    FACT["fact chunk<br/>sample count"]
-    DATA["data chunk<br/>raw interleaved PCM f32"]
-
-    RIFF --> FMT --> FACT --> DATA
-```
-
-- **Fact chunk** is always written (required for non-PCM or to satisfy tools).
-- **No size limit** in v1 (WAV format's 4 GB limit via RIFF64 not implemented;
-  users recording > ~6 hours at 48 kHz stereo f32 should use FLAC).
-
-### ALAC Details
-
-ALAC (Apple Lossless Audio Codec) via `AudioConverter` with
-`kAudioFormatAppleLossless`. Encoded in a Core Audio Format (`.caf`) container:
-
-```mermaid
-flowchart LR
-    subgraph HEADER["CAF Header"]
-        CAF["CAF 'caff'"]
-        DESC["Audio Description chunk"]
-        CH["Channel Layout"]
-    end
-
-    subgraph BODY["Audio Data"]
-        MC["Magic Cookie<br/>(ALAC config)"]
-        PT["Packet Table"]
-        AD["Audio Data<br/>(ALAC frames)"]
-    end
-
-    CAF --> DESC --> CH
-    CH --> MC --> PT --> AD
-```
-
-- Output: `.caf` with ALAC codec
-- **Why CAF not M4A:** Avoids the MPEG-4 container dependency (requires
-  `AVAssetWriter`, async, heavier). CAF is simpler and natively supported by
-  Core Audio.
 
 ### Encoder Crate
 
@@ -109,15 +111,15 @@ flowchart LR
 graph TD
     CODEC["koe-core/src/codec/"]
     MOD["mod.rs — Codec trait + registry"]
-    FLAC["flac.rs — FLAC encoder"]
-    WAV["wav.rs — WAV writer"]
-    ALAC["alac.rs — ALAC encoder<br/>(via koe-native AudioConverter FFI)"]
+    OGG["ogg.rs — OGG Vorbis encoder (via libvorbis)"]
+    WAV["wav.rs — WAV writer (RIFF header + raw PCM)"]
+    FLAC["flac.rs — FLAC encoder (via libflac)"]
     PL["pipeline.rs — Re-exports"]
 
     CODEC --> MOD
-    CODEC --> FLAC
+    CODEC --> OGG
     CODEC --> WAV
-    CODEC --> ALAC
+    CODEC --> FLAC
     CODEC --> PL
 ```
 
@@ -131,9 +133,9 @@ pub trait AudioEncoder: Send {
 }
 
 pub enum OutputFormat {
-    Flac { compression_level: u8 },
+    Ogg { quality: f32 },
     Wav { bits_per_sample: u16 },
-    Alac,
+    Flac { compression_level: u8 },
 }
 ```
 
@@ -241,7 +243,7 @@ Default output file names when `--output` is not specified:
 {output_directory}/{app_name}_{date}_{time}.{ext}
 
 Examples:
-~/Recordings/Koe/Google Chrome_2025-08-10_153000.flac
+~/Recordings/Koe/Google Chrome_2025-08-10_153000.ogg
 ~/Recordings/Koe/Google Chrome_2025-08-10_153000.srt
 ```
 
@@ -250,12 +252,12 @@ When `--output` is a full path, it is used as-is.
 
 ## File Size Estimates
 
-| Duration | FLAC (stereo speech) | WAV (f32 stereo) | Transcript (SRT) |
-|----------|---------------------|-------------------|-------------------|
-| 10 min | ~35 MB | ~345 MB | ~20 KB |
-| 30 min | ~105 MB | ~1.0 GB | ~60 KB |
-| 1 hour | ~210 MB | ~2.1 GB | ~120 KB |
-| 2 hours | ~420 MB | ~4.1 GB | ~240 KB |
+| Duration | OGG Vorbis (q=0.4) | FLAC (lossless) | WAV (f32 stereo) | Transcript (SRT) |
+|----------|---------------------|-----------------|-------------------|-------------------|
+| 10 min | ~7 MB | ~35 MB | ~345 MB | ~20 KB |
+| 30 min | ~21 MB | ~105 MB | ~1.0 GB | ~60 KB |
+| 1 hour | ~42 MB | ~210 MB | ~2.1 GB | ~120 KB |
+| 2 hours | ~84 MB | ~420 MB | ~4.1 GB | ~240 KB |
 
 **Disk space check:** Before recording starts, Koe checks available disk
 space on the output volume. If free space < estimated size × 2, it warns the

@@ -62,7 +62,7 @@ Rust binary with a thin native `.dylib` shim for macOS frameworks.
 flowchart LR
     SRC["🎤 Audio Source<br/>(CAPT / SCK / Mic)"]
     AEC["🔇 AEC Stage<br/>(optional)"]
-    ENC["🗜️ Encoder<br/>(FLAC / WAV / ALAC)"]
+    ENC["🗜️ Encoder<br/>(OGG / WAV / FLAC)"]
     ASR["📝 Speech Analyzer"]
     DISK["💾 File I/O<br/>(disk)"]
     FMT["📄 Transcript Formatter<br/>(SRT / VTT / TXT)"]
@@ -124,7 +124,7 @@ flowchart TD
 | Feature | Default | Description |
 |---------|---------|-------------|
 | `aec` | on | Echo cancellation (pulls in DSP dep) |
-| `flac` | on | FLAC encoder support |
+| `ogg` | on | OGG Vorbis encoder support |
 | `system-audio` | on | Core Audio Process Tap capture |
 | `screen-audio` | on | ScreenCaptureKit capture |
 | `cli` | on | Build `koe-cli` binary |

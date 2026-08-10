@@ -16,13 +16,8 @@ depends: []
 that removes far-end (speaker output) audio from the near-end (microphone)
 signal. See [05-echo-cancellation](./05-echo-cancellation.md).
 
-**ALAC** — Apple Lossless Audio Codec. Lossless compressed audio format
-developed by Apple. Koe outputs ALAC in Core Audio Format (`.caf`)
-containers.
-
 **AudioConverter** — Core Audio API for converting between audio formats
-(sample rate, bit depth, codec). Used by Koe for resampling and ALAC
-encoding.
+(sample rate, bit depth, codec). Used by Koe for resampling.
 
 **AudioQueue** — Higher-level Core Audio API for playback and recording.
 Used by Koe for audio monitoring (pass-through to output device).
@@ -69,8 +64,13 @@ recording, and audio tap access.
 through the local speakers. In AEC terms, this is the reference signal that
 must be removed from the microphone.
 
-**FLAC** — Free Lossless Audio Codec. Koe's default audio output format.
-Compresses PCM audio losslessly to ~50–60% of original size.
+**FLAC** — Free Lossless Audio Codec. Lossless compressed audio format.
+Available as an archival option in Koe. Compresses PCM audio losslessly
+to ~50–60% of original size.
+
+**OGG Vorbis** — Open, patent-free lossy audio codec in an OGG container.
+Koe's default output format. Provides excellent speech quality at ~8–12%
+of raw PCM size.
 
 **Frontmatter** — YAML metadata block at the top of Markdown files, delimited
 by `---`. Used in Koe's spec documents for title, topic, status, and
@@ -171,7 +171,6 @@ supports VTT as a transcript output format.
 |---------|-----------|
 | ABI | Application Binary Interface |
 | AEC | Acoustic Echo Cancellation |
-| ALAC | Apple Lossless Audio Codec |
 | ASR | Automatic Speech Recognition |
 | CAF | Core Audio Format |
 | CAPT | Core Audio Process Tap |
@@ -179,6 +178,7 @@ supports VTT as a transcript output format.
 | ERLE | Echo Return Loss Enhancement |
 | FFI | Foreign Function Interface |
 | FLAC | Free Lossless Audio Codec |
+| OGG | OGG container format (not an acronym) |
 | GPUI | (Not an acronym; Zed's GPU UI framework) |
 | HAL | Hardware Abstraction Layer |
 | PCM | Pulse-Code Modulation |

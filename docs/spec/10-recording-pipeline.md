@@ -20,7 +20,7 @@ flowchart TD
     HAL["AudioQueue / HAL Input"]
     RING["🔄 Ring Buffer (Swift)<br/>Lock-free SPSC<br/>4×20ms, f32, 48kHz, interleaved"]
     AEC["🔇 AEC Stage (Rust)<br/>if system + mic<br/>Far-end + Near-end → NLMS → Clean"]
-    ENC["🗜️ Audio Encoder<br/>(Rust, blocking)<br/>FLAC / WAV / ALAC"]
+    ENC["🗜️ Audio Encoder<br/>(Rust, blocking)<br/>OGG / WAV / FLAC"]
     ASR["📝 Speech Analyzer Feeder<br/>(Rust)<br/>Chunks → FFI → SFSpeechAnalyzer"]
     DISK["💾 File Writer<br/>(tokio fs)<br/>Async writes to output"]
     FMT["📄 Transcription Formatter<br/>(Rust)<br/>TXT / SRT / VTT / JSON"]
@@ -142,7 +142,7 @@ impl RecordingPipeline {
         // 1. Signal native capture to stop
         // 2. Drain ring buffer (process remaining frames)
         // 3. Finalize speech analyzer (flush partial segment)
-        // 4. Finalize encoder (write trailer / padding)
+        // 4. Finalize encoder (write trailer / finalize OGG stream)
         // 5. Flush and close files
         // 6. Return summary
     }
@@ -215,7 +215,7 @@ flowchart TD
     ASR["Finalize speech analyzer"]
     ASR_OUT["SFSpeechAnalyzer.finalize()<br/>→ emit final segment"]
     ENC["Finalize encoder"]
-    ENC_OUT["Write FLAC/WAV trailer, flush"]
+    ENC_OUT["Write OGG/WAV/FLAC trailer, flush"]
     FMT["Finalize transcript"]
     FMT_OUT["Write last segment, close file"]
     SUMMARY["Emit summary"]

@@ -62,7 +62,7 @@ Transcription Options:
 
 Output Options:
   --output, -o <PATH>            Output file path (required)
-  --format <FORMAT>              Audio format: flac, wav, alac (default: flac)
+  --format <FORMAT>              Audio format: ogg, wav, flac (default: ogg)
   --transcript-format <FMT>      Transcript format: txt, srt, vtt, json (default: txt)
   --transcript-output <PATH>     Transcript file path (default: <output>.<fmt>)
 
@@ -104,14 +104,14 @@ Recording | ⣾ 00:02:34 | FLAC 48kHz stereo | App: Google Chrome (PID 4201)
 
 ```bash
 # Record system audio from Chrome, transcribe en-US
-koe record --source system --app-id com.google.Chrome --output meeting.flac
+koe record --source system --app-id com.google.Chrome --output meeting.ogg
 
 # Record microphone only, no transcription, 30 minutes max
 koe record --source mic --no-transcribe --duration 30m --output voice-memo.wav
 
 # Record a Zoom call (system + mic) with AEC, Japanese transcription
 koe record --source both --app-id us.zoom.xos --locale ja-JP \
-  --output zoom-call.flac --transcript-format srt
+  --output zoom-call.ogg --transcript-format srt
 
 # Interactive source selection
 koe record --list-sources
@@ -150,7 +150,7 @@ Options:
   --end-at <TIMESTAMP>        Stop transcribing at offset
 ```
 
-Supported input formats: WAV (PCM, Float32), FLAC, ALAC, MP3, AAC, AIFF.
+Supported input formats: WAV (PCM, Float32), FLAC, OGG, MP3, AAC, AIFF.
 
 ## `koe permissions`
 
@@ -196,7 +196,7 @@ Prints:
 
 [defaults]
 source = "system"
-format = "flac"
+format = "ogg"
 locale = "en-US"
 transcript-format = "txt"
 sample-rate = 48000

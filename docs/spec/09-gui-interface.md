@@ -95,7 +95,7 @@ block-beta
 
     block:controls:1
         columns 3
-        status["⏺ Recording | 00:02:34 | FLAC 48kHz | 24.3 MB"]
+        status["⏺ Recording | 00:02:34 | OGG 48kHz | 7.8 MB"]
         pauseBtn["[⏸ Pause]"]
         stopBtn["[⏹ Stop & Save]"]
     end
@@ -186,7 +186,7 @@ graph TD
     subgraph GENERAL["🛠 General"]
         LOCALE["Default Locale: [English (US) ▼]"]
         DIR["Output Directory: [~/Recordings/Koe…]"]
-        FMT["Audio Format: [FLAC ▼] [48kHz ▼]"]
+        FMT["Audio Format: [OGG ▼] [48kHz ▼]"]
         TFMT["Transcript Format: [SRT ▼]"]
     end
 

@@ -172,9 +172,9 @@ import KoeFfi
 
 let handle = try KoeFfi.startRecording(
     source: .appAudio(bundleId: "com.google.Chrome"),
-    outputPath: "/Users/me/recording.flac",
+    outputPath: "/Users/me/recording.ogg",
     locale: "en-US",
-    format: .flac,
+    format: .ogg,
     enableAec: true,
     comfortNoise: false,
     progressCallback: MyProgressCallback()
