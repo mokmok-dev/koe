@@ -2,7 +2,7 @@
 title: Speech Recognition
 topic: speech-recognition
 status: draft
-date: 2025-08-10
+date: 2026-08-10
 depends: [01-architecture, 07-native-bridge]
 ---
 

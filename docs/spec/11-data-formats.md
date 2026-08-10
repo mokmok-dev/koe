@@ -2,7 +2,7 @@
 title: Data Formats
 topic: data-formats
 status: draft
-date: 2025-08-10
+date: 2026-08-10
 depends: [01-architecture]
 ---
 
@@ -196,7 +196,7 @@ This is the <i>second</i> utterance, which is longer.
   "format": "koe-transcript",
   "version": 1,
   "locale": "en-US",
-  "created_at": "2025-08-10T15:30:00+09:00",
+  "created_at": "2026-08-10T15:30:00+09:00",
   "source": {
     "type": "system",
     "app_bundle_id": "com.google.Chrome"
@@ -243,8 +243,8 @@ Default output file names when `--output` is not specified:
 {output_directory}/{app_name}_{date}_{time}.{ext}
 
 Examples:
-~/Recordings/Koe/Google Chrome_2025-08-10_153000.ogg
-~/Recordings/Koe/Google Chrome_2025-08-10_153000.srt
+~/Recordings/Koe/Google Chrome_2026-08-10_153000.ogg
+~/Recordings/Koe/Google Chrome_2026-08-10_153000.srt
 ```
 
 When `--output` is a directory, the default name is used within that directory.
