@@ -1,0 +1,22 @@
+[package]
+edition.workspace = true
+name = "koe-core"
+version.workspace = true
+
+[features]
+default = ["aec", "ogg", "system-audio", "screen-audio", "cli"]
+aec = []
+cli = []
+gui = []
+ogg = []
+screen-audio = []
+system-audio = []
+
+[dependencies]
+koe-ffi = { path = "../koe-ffi" }
+log = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "sync"] }
+
+[lints]
+workspace = true

@@ -5,6 +5,7 @@ version.workspace = true
 
 [dependencies]
 clap = { workspace = true, features = ["derive"] }
+koe-core = { path = "../koe-core" }
 thiserror = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 
