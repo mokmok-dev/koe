@@ -1,0 +1,12 @@
+[package]
+edition.workspace = true
+name = "koe-cli"
+version.workspace = true
+
+[dependencies]
+clap = { workspace = true, features = ["derive"] }
+thiserror = { workspace = true }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+
+[lints]
+workspace = true
