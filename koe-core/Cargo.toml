@@ -4,9 +4,9 @@ name = "koe-core"
 version.workspace = true
 
 [features]
-default = ["aec", "ogg", "system-audio", "screen-audio", "cli"]
 aec = []
 cli = []
+default = ["aec", "cli", "ogg", "screen-audio", "system-audio"]
 gui = []
 ogg = []
 screen-audio = []
