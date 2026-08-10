@@ -2,7 +2,7 @@
 title: CLI Interface
 topic: cli
 status: draft
-date: 2025-08-10
+date: 2026-08-10
 depends: [01-architecture, 06-permission-model, 11-data-formats]
 ---
 

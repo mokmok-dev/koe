@@ -2,7 +2,7 @@
 title: Koe — Specification Index
 topic: index
 status: draft
-date: 2025-08-10
+date: 2026-08-10
 ---
 
 # Koe — macOS Offline Transcription & Recording Tool

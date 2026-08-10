@@ -2,7 +2,7 @@
 title: Glossary
 topic: glossary
 status: draft
-date: 2025-08-10
+date: 2026-08-10
 depends: []
 ---
 

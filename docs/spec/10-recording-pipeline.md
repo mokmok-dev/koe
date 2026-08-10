@@ -2,7 +2,7 @@
 title: Recording Pipeline
 topic: pipeline
 status: draft
-date: 2025-08-10
+date: 2026-08-10
 depends: [01-architecture, 02-core-audio-process-tap, 03-screen-capture-kit, 04-speech-recognition, 05-echo-cancellation]
 ---
 
