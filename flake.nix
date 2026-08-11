@@ -84,6 +84,7 @@
               nixfmt.enable = true;
               rustfmt.enable = true;
               rustfmt.package = config.rust-project.toolchain;
+              swift-format.enable = true;
               taplo.enable = true;
               yamlfmt.enable = true;
             };
