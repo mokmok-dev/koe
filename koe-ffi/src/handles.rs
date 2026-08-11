@@ -150,8 +150,13 @@ mod tests {
     use crate::callbacks::{AudioCallback, ProgressCallback, TranscriptionCallback};
     use crate::types::RecordingState;
 
+    type AudioCalls = Arc<Mutex<Vec<(Vec<f32>, u64)>>>;
+    type SegmentLog = Arc<Mutex<Vec<TranscriptionSegment>>>;
+    type StatusLog = Arc<Mutex<Vec<RecordingStatus>>>;
+    type ErrorLog = Arc<Mutex<Vec<String>>>;
+
     struct MockAudio {
-        calls: Arc<Mutex<Vec<(Vec<f32>, u64)>>>,
+        calls: AudioCalls,
     }
 
     impl AudioCallback for MockAudio {
@@ -165,8 +170,8 @@ mod tests {
     }
 
     struct MockTranscription {
-        segments: Arc<Mutex<Vec<TranscriptionSegment>>>,
-        errors: Arc<Mutex<Vec<String>>>,
+        segments: SegmentLog,
+        errors: ErrorLog,
     }
 
     impl TranscriptionCallback for MockTranscription {
@@ -186,8 +191,8 @@ mod tests {
     }
 
     struct MockProgress {
-        statuses: Arc<Mutex<Vec<RecordingStatus>>>,
-        errors: Arc<Mutex<Vec<String>>>,
+        statuses: StatusLog,
+        errors: ErrorLog,
     }
 
     impl ProgressCallback for MockProgress {
@@ -214,7 +219,7 @@ mod tests {
 
     #[test]
     fn deliver_audio_preserves_pcm_and_monotonic_timestamps() {
-        let calls = Arc::new(Mutex::new(Vec::new()));
+        let calls: AudioCalls = Arc::new(Mutex::new(Vec::new()));
         let handle = CaptureHandle::new(
             AudioSourceConfig::Microphone,
             Box::new(MockAudio {
@@ -225,19 +230,19 @@ mod tests {
         handle.deliver_audio(vec![0.1, -0.1], 10);
         handle.deliver_audio(vec![0.2, -0.2], 20);
 
-        let calls = calls.lock().expect("lock");
-        assert_eq!(calls.len(), 2);
-        assert_eq!(calls[0].0, vec![0.1, -0.1]);
-        assert_eq!(calls[0].1, 10);
-        assert_eq!(calls[1].0, vec![0.2, -0.2]);
-        assert_eq!(calls[1].1, 20);
-        assert!(calls[0].1 < calls[1].1);
+        let recorded = calls.lock().expect("lock").clone();
+        assert_eq!(recorded.len(), 2);
+        assert_eq!(recorded[0].0, vec![0.1, -0.1]);
+        assert_eq!(recorded[0].1, 10);
+        assert_eq!(recorded[1].0, vec![0.2, -0.2]);
+        assert_eq!(recorded[1].1, 20);
+        assert!(recorded[0].1 < recorded[1].1);
     }
 
     #[test]
     fn deliver_transcription_segment_and_error() {
-        let segments = Arc::new(Mutex::new(Vec::new()));
-        let errors = Arc::new(Mutex::new(Vec::new()));
+        let segments: SegmentLog = Arc::new(Mutex::new(Vec::new()));
+        let errors: ErrorLog = Arc::new(Mutex::new(Vec::new()));
         let handle = TranscriptionHandle::new(
             "en-US".into(),
             Box::new(MockTranscription {
@@ -261,8 +266,8 @@ mod tests {
 
     #[test]
     fn deliver_progress_status_and_error() {
-        let statuses = Arc::new(Mutex::new(Vec::new()));
-        let errors = Arc::new(Mutex::new(Vec::new()));
+        let statuses: StatusLog = Arc::new(Mutex::new(Vec::new()));
+        let errors: ErrorLog = Arc::new(Mutex::new(Vec::new()));
         let handle = RecordingHandle::new(
             AudioSourceConfig::Microphone,
             "/tmp/out.ogg".into(),
