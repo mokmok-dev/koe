@@ -275,6 +275,7 @@ dependencies = [
 name = "koe-ffi"
 version = "0.0.0"
 dependencies = [
+ "thiserror 2.0.20",
  "uniffi",
 ]
 
