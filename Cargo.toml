@@ -9,6 +9,7 @@ log = "0.4"
 thiserror = "2.0.20"
 tokio = "1.53.1"
 uniffi = "0.28"
+vorbis_rs = "0.5.6"
 
 [workspace.lints.clippy]
 all = "deny"

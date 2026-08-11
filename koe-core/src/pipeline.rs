@@ -22,7 +22,7 @@ use tokio::sync::{Mutex as AsyncMutex, broadcast};
 use tokio::task::JoinHandle;
 
 use crate::aec::{AcousticEchoCanceller, AecConfig};
-use crate::codec::{AudioEncoder, create_encoder};
+use crate::codec::{AudioEncoder, OggComments, create_encoder};
 use crate::transcript::{TranscriptFormatter, create_formatter};
 
 pub use chunk::AudioChunk;
@@ -182,7 +182,8 @@ impl RecordingPipeline {
             .into());
         }
 
-        let encoder = create_encoder(&audio_format)?;
+        let comments = OggComments::for_session(&config.source, &config.locale);
+        let encoder = create_encoder(&audio_format, Some(&comments))?;
         let file_writer = FileWriter::create(&config.output_path).await?;
         let transcript_fmt = create_formatter(config.transcript_format);
 

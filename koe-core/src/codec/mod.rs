@@ -1,11 +1,17 @@
-//! Audio encoding abstractions (full OGG/WAV/FLAC in tasks 17–19).
+//! Audio encoding abstractions (WAV/FLAC follow-ups in tasks 18–19).
 
 mod wav;
+
+#[cfg(feature = "ogg")]
+mod ogg;
 
 use koe_ffi::OutputFormat;
 use thiserror::Error;
 
 pub use wav::WavEncoder;
+
+#[cfg(feature = "ogg")]
+pub use ogg::{OggComments, OggEncoder};
 
 /// Errors raised while encoding audio.
 #[derive(Debug, Error)]
@@ -47,20 +53,70 @@ pub trait AudioEncoder: Send {
 
 /// Creates an encoder for the requested output format.
 ///
+/// When `comments` is `None` and the format is OGG, a minimal default comment
+/// set is used. WAV/FLAC ignore comments.
+///
 /// # Errors
 ///
-/// Returns [`CodecError`] when the format is unsupported.
-pub fn create_encoder(format: &OutputFormat) -> Result<Box<dyn AudioEncoder>, CodecError> {
+/// Returns [`CodecError`] when the format is unsupported or encoder setup fails.
+pub fn create_encoder(
+    format: &OutputFormat,
+    comments: Option<&OggComments>,
+) -> Result<Box<dyn AudioEncoder>, CodecError> {
     match format {
         OutputFormat::Wav { bits_per_sample } => Ok(Box::new(WavEncoder::new(*bits_per_sample)?)),
-        OutputFormat::Ogg { quality } => Ok(Box::new(PlaceholderEncoder::ogg(*quality))),
+        OutputFormat::Ogg { quality } => {
+            let comments = comments.cloned().unwrap_or_else(OggComments::basic);
+            create_ogg_encoder(*quality, &comments)
+        },
         OutputFormat::Flac { compression_level } => {
             Ok(Box::new(PlaceholderEncoder::flac(*compression_level)))
         },
     }
 }
 
-/// Placeholder encoder until tasks 17/19 land. Writes raw little-endian PCM.
+#[cfg(feature = "ogg")]
+fn create_ogg_encoder(
+    quality: f32,
+    comments: &OggComments,
+) -> Result<Box<dyn AudioEncoder>, CodecError> {
+    Ok(Box::new(OggEncoder::with_comments(quality, comments)?))
+}
+
+#[cfg(not(feature = "ogg"))]
+fn create_ogg_encoder(
+    _quality: f32,
+    _comments: &OggComments,
+) -> Result<Box<dyn AudioEncoder>, CodecError> {
+    Err(CodecError::Encoder(
+        "OGG support requires the `ogg` feature".to_owned(),
+    ))
+}
+
+#[cfg(not(feature = "ogg"))]
+/// Vorbis Comment tags (no-op stub when the `ogg` feature is disabled).
+#[derive(Debug, Clone, Default)]
+pub struct OggComments;
+
+#[cfg(not(feature = "ogg"))]
+impl OggComments {
+    /// Minimal tags used when no session metadata is available.
+    #[must_use]
+    pub fn basic() -> Self {
+        Self
+    }
+
+    /// Builds session tags; ignored without the `ogg` feature.
+    #[must_use]
+    pub fn for_session(
+        _source: &koe_ffi::AudioSourceConfig,
+        _locale: &str,
+    ) -> Self {
+        Self
+    }
+}
+
+/// Placeholder encoder until task 19 lands. Writes raw little-endian PCM.
 struct PlaceholderEncoder {
     format: OutputFormat,
     sample_rate: u32,
@@ -68,14 +124,6 @@ struct PlaceholderEncoder {
 }
 
 impl PlaceholderEncoder {
-    const fn ogg(quality: f32) -> Self {
-        Self {
-            format: OutputFormat::Ogg { quality },
-            sample_rate: 48_000,
-            channel_count: 2,
-        }
-    }
-
     const fn flac(compression_level: u8) -> Self {
         Self {
             format: OutputFormat::Flac { compression_level },
@@ -124,5 +172,28 @@ mod tests {
         let _ = encoder.encode(&[0.0, 0.0]).expect("encode");
         let trailer = encoder.finalize().expect("finalize");
         assert!(trailer.len() >= 44);
+    }
+
+    #[test]
+    fn create_encoder_wav_ignores_comments() {
+        let encoder = create_encoder(
+            &OutputFormat::Wav {
+                bits_per_sample: 16,
+            },
+            None,
+        )
+        .expect("wav");
+        assert_eq!(encoder.sample_rate(), 48_000);
+        assert_eq!(encoder.channel_count(), 2);
+    }
+
+    #[cfg(feature = "ogg")]
+    #[test]
+    fn create_encoder_ogg_emits_ogg_capture_pattern() {
+        let mut encoder = create_encoder(&OutputFormat::Ogg { quality: 0.4 }, None).expect("ogg");
+        let pcm = vec![0.0_f32; 960 * 2];
+        let mut out = encoder.encode(&pcm).expect("encode");
+        out.extend(encoder.finalize().expect("finalize"));
+        assert_eq!(&out[..4], b"OggS");
     }
 }
