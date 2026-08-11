@@ -181,7 +181,7 @@ impl WavEncoder {
 }
 
 /// Clamp finite samples to `[-1, 1]` for integer PCM; non-finite → silence.
-fn sanitize_for_pcm(sample: f32) -> f32 {
+const fn sanitize_for_pcm(sample: f32) -> f32 {
     if sample.is_finite() {
         sample.clamp(-1.0, 1.0)
     } else {
