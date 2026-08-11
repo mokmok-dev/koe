@@ -84,8 +84,10 @@ pub enum PipelineState {
 pub struct RecordingPipeline {
     config: PipelineConfig,
     state: PipelineState,
-    /// Reserved for task 21 (AEC); initialized when source is `Both`.
-    #[expect(dead_code, reason = "wired in task 21 echo cancellation")]
+    /// Echo canceller when capturing `Both` with AEC enabled.
+    ///
+    /// Dual-stream (far/near) delivery from capture is not wired yet; the
+    /// canceller is constructed so ERLE / reset are available to callers.
     aec: Option<AcousticEchoCanceller>,
     encoder: Arc<Mutex<Box<dyn AudioEncoder>>>,
     transcript_fmt: Arc<Mutex<Box<dyn TranscriptFormatter>>>,
@@ -268,6 +270,19 @@ impl RecordingPipeline {
             started_at,
             bytes_written,
         })
+    }
+
+    /// Current AEC Echo Return Loss Enhancement in dB, if AEC is active.
+    #[must_use]
+    pub fn aec_erle(&self) -> Option<f32> {
+        self.aec.as_ref().map(AcousticEchoCanceller::erle)
+    }
+
+    /// Resets the adaptive echo canceller (no-op when AEC is inactive).
+    pub fn reset_aec(&mut self) {
+        if let Some(aec) = self.aec.as_mut() {
+            aec.reset();
+        }
     }
 
     /// Stops capture, drains remaining audio, finalizes outputs, and returns a summary.
