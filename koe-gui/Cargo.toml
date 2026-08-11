@@ -1,0 +1,15 @@
+[package]
+edition.workspace = true
+name = "koe-gui"
+version.workspace = true
+
+[[bin]]
+name = "koe-gui"
+path = "src/main.rs"
+
+[dependencies]
+koe-core = { path = "../koe-core" }
+log = { workspace = true }
+
+[lints]
+workspace = true

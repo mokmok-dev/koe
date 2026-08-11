@@ -40,7 +40,9 @@
               self'.devShells.rust
             ];
 
-            packages = [ ];
+            packages = lib.optionals pkgs.stdenv.isDarwin [
+              pkgs.swift
+            ];
           };
 
           checks = lib.mapAttrs' (
