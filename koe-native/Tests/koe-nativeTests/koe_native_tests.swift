@@ -3,12 +3,12 @@ import XCTest
 @testable import koe_native
 
 final class KoeNativeTests: XCTestCase {
-  func testAudioTapInitialization() {
-    let tap = AudioTap(pid: 1234)
-    XCTAssertNotNil(tap)
-    if case .idle = tap.status {
-    } else {
-      XCTFail("expected idle status")
+  func testAudioTapRejectsUnknownProcess() {
+    // PID 0 has no audio object; tap creation must fail cleanly.
+    XCTAssertThrowsError(try AudioTap(pid: 0)) { error in
+      guard case AudioTap.Error.processNotFound = error else {
+        return XCTFail("expected processNotFound, got \(error)")
+      }
     }
   }
 
