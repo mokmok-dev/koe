@@ -25,6 +25,7 @@ tokio = { workspace = true, features = [
   "sync",
   "time",
 ] }
+flacenc = { workspace = true }
 vorbis_rs = { workspace = true, optional = true }
 
 [lints]

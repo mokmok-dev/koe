@@ -1,5 +1,6 @@
-//! Audio encoding abstractions (FLAC follow-up in task 19).
+//! Audio encoding abstractions.
 
+mod flac;
 mod wav;
 
 #[cfg(feature = "ogg")]
@@ -8,6 +9,7 @@ mod ogg;
 use koe_ffi::OutputFormat;
 use thiserror::Error;
 
+pub use flac::FlacEncoder;
 pub use wav::WavEncoder;
 
 #[cfg(feature = "ogg")]
@@ -57,8 +59,8 @@ pub trait AudioEncoder: Send {
 
 /// Creates an encoder for the requested output format.
 ///
-/// When `comments` is `None` and the format is OGG, a minimal default comment
-/// set is used. WAV/FLAC ignore comments.
+/// When `comments` is `None`, a minimal default comment set is used for OGG and
+/// FLAC. WAV ignores comments.
 ///
 /// # Errors
 ///
@@ -74,7 +76,11 @@ pub fn create_encoder(
             create_ogg_encoder(*quality, &comments)
         },
         OutputFormat::Flac { compression_level } => {
-            Ok(Box::new(PlaceholderEncoder::flac(*compression_level)))
+            let comments = comments.cloned().unwrap_or_else(OggComments::basic);
+            Ok(Box::new(FlacEncoder::with_comments(
+                *compression_level,
+                &comments,
+            )?))
         },
     }
 }
@@ -118,51 +124,18 @@ impl OggComments {
     ) -> Self {
         Self
     }
-}
 
-/// Placeholder encoder until task 19 lands. Writes raw little-endian PCM.
-struct PlaceholderEncoder {
-    format: OutputFormat,
-    sample_rate: u32,
-    channel_count: u16,
-}
-
-impl PlaceholderEncoder {
-    const fn flac(compression_level: u8) -> Self {
-        Self {
-            format: OutputFormat::Flac { compression_level },
-            sample_rate: 48_000,
-            channel_count: 2,
-        }
-    }
-}
-
-impl AudioEncoder for PlaceholderEncoder {
-    fn encode(
-        &mut self,
-        pcm: &[f32],
-    ) -> Result<Vec<u8>, CodecError> {
-        let mut bytes = Vec::with_capacity(pcm.len() * 4);
-        for sample in pcm {
-            bytes.extend_from_slice(&sample.to_le_bytes());
-        }
-        Ok(bytes)
-    }
-
-    fn finalize(&mut self) -> Result<Vec<u8>, CodecError> {
-        Ok(Vec::new())
-    }
-
-    fn format(&self) -> OutputFormat {
-        self.format.clone()
-    }
-
-    fn sample_rate(&self) -> u32 {
-        self.sample_rate
-    }
-
-    fn channel_count(&self) -> u16 {
-        self.channel_count
+    /// Vorbis Comment tag pairs shared with the FLAC encoder.
+    #[must_use]
+    pub const fn tag_pairs(&self) -> [(&'static str, &'static str); 6] {
+        [
+            ("TITLE", "Koe recording"),
+            ("ARTIST", "Koe"),
+            ("DATE", ""),
+            ("DESCRIPTION", ""),
+            ("ENCODER", "koe"),
+            ("KOE_SOURCE", r#"{"type":"unknown"}"#),
+        ]
     }
 }
 
@@ -189,6 +162,24 @@ mod tests {
         .expect("wav");
         assert_eq!(encoder.sample_rate(), 48_000);
         assert_eq!(encoder.channel_count(), 2);
+    }
+
+    #[test]
+    fn create_encoder_flac_emits_flac_magic() {
+        let mut encoder = create_encoder(
+            &OutputFormat::Flac {
+                compression_level: 5,
+            },
+            None,
+        )
+        .expect("flac");
+        assert_eq!(encoder.sample_rate(), 48_000);
+        assert_eq!(encoder.channel_count(), 2);
+        let _ = encoder
+            .encode(&[0.0_f32; 4096 * 2])
+            .expect("encode");
+        let out = encoder.finalize().expect("finalize");
+        assert_eq!(&out[..4], b"fLaC");
     }
 
     #[cfg(feature = "ogg")]
