@@ -8,16 +8,15 @@ mod file_writer;
 mod metrics;
 
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use koe_ffi::{
     AudioCallback, AudioSourceConfig, OutputFormat, Permission, PermissionStatus, RecordingError,
-    RecordingStatus, RecordingSummary, TranscriptFormat, TranscriptionCallback,
-    TranscriptionSegment, check_permission, finalize_transcription, start_capture,
-    start_transcription, stop_capture, validate_capture_source, validate_locale,
-    validate_output_path,
+    RecordingSummary, TranscriptFormat, TranscriptionCallback, TranscriptionSegment,
+    check_permission, finalize_transcription, start_capture, start_transcription, stop_capture,
+    validate_capture_source, validate_locale, validate_output_path,
 };
 use tokio::sync::{Mutex as AsyncMutex, broadcast};
 use tokio::task::JoinHandle;
@@ -31,6 +30,8 @@ pub use consumer::{ConsumerContext, SpeechFeeder, TranscriptionFeeder, spawn_con
 pub use disk_check::check_disk_space;
 pub use error::PipelineError;
 pub use file_writer::FileWriter;
+/// Progress payload types for [`RecordingPipeline::subscribe_progress`].
+pub use koe_ffi::{RecordingState, RecordingStatus};
 pub use metrics::{PipelineMetrics, PipelineMetricsSnapshot};
 
 /// Configuration for a recording session.
@@ -98,6 +99,9 @@ pub struct RecordingPipeline {
     metrics: Arc<PipelineMetrics>,
     segments: Arc<Mutex<Vec<TranscriptionSegment>>>,
     progress_tx: broadcast::Sender<RecordingStatus>,
+    /// Pause-aware origin shared with the consumer progress clock.
+    started_at: Arc<Mutex<Instant>>,
+    bytes_written: Arc<AtomicU64>,
 }
 
 struct PipelineAudioCallback {
@@ -218,6 +222,8 @@ impl RecordingPipeline {
         let file_writer = Arc::new(AsyncMutex::new(file_writer));
         let (progress_tx, _) = broadcast::channel(32);
         let started_at = Instant::now();
+        let started_at = Arc::new(Mutex::new(started_at));
+        let bytes_written = Arc::new(AtomicU64::new(0));
 
         let consumer_ctx = ConsumerContext {
             encoder: Arc::clone(&encoder),
@@ -227,14 +233,18 @@ impl RecordingPipeline {
             shutdown: Arc::clone(&shutdown),
             paused: Arc::clone(&paused),
             progress_tx: progress_tx.clone(),
-            started_at,
+            started_at: Arc::clone(&started_at),
+            bytes_written: Arc::clone(&bytes_written),
         };
         let consumer_task = spawn_consumer(audio_tx.subscribe(), consumer_ctx);
+        let start_time = *started_at
+            .lock()
+            .map_err(|_| PipelineError::InvalidState("started_at lock poisoned".to_owned()))?;
 
         Ok(Self {
             config,
             state: PipelineState::Recording {
-                start_time: started_at,
+                start_time,
                 bytes_written: 0,
                 segments: Vec::new(),
             },
@@ -251,6 +261,8 @@ impl RecordingPipeline {
             metrics,
             segments,
             progress_tx,
+            started_at,
+            bytes_written,
         })
     }
 
@@ -261,13 +273,22 @@ impl RecordingPipeline {
     /// Returns [`PipelineError`] when shutdown or finalization fails.
     pub async fn stop(&mut self) -> Result<RecordingSummary, PipelineError> {
         self.shutdown.store(true, Ordering::Relaxed);
+        self.publish_status(RecordingState::Stopping, 0.0, 0.0);
 
         if let Some(handle) = self.capture_handle.take() {
             stop_capture(handle);
         }
 
         if let Some(task) = self.consumer_task.take() {
-            let _ = task.await;
+            match task.await {
+                Ok(Ok(())) => {},
+                Ok(Err(err)) => return Err(err),
+                Err(err) => {
+                    return Err(PipelineError::InvalidState(format!(
+                        "consumer task join failed: {err}"
+                    )));
+                },
+            }
         }
 
         if let Some(handle) = self.transcription_handle.take() {
@@ -285,11 +306,14 @@ impl RecordingPipeline {
         let bytes_written = {
             let mut writer = self.file_writer.lock().await;
             if !trailer.is_empty() {
+                let written = u64::try_from(trailer.len()).unwrap_or(u64::MAX);
                 writer.write(&trailer).await?;
+                self.bytes_written.fetch_add(written, Ordering::Relaxed);
             }
             writer.flush().await?;
             writer.bytes_written()
         };
+        self.bytes_written.store(bytes_written, Ordering::Relaxed);
 
         if let Some(transcript_path) = &self.config.transcript_output_path {
             let body = {
@@ -317,6 +341,7 @@ impl RecordingPipeline {
             .len();
 
         self.state = PipelineState::Stopped;
+        self.publish_status(RecordingState::Stopped, 0.0, 0.0);
 
         Ok(RecordingSummary {
             duration_sec,
@@ -341,6 +366,7 @@ impl RecordingPipeline {
                 bytes_written,
                 segments,
             };
+            self.publish_status(RecordingState::Paused, 0.0, 0.0);
         }
     }
 
@@ -353,13 +379,18 @@ impl RecordingPipeline {
         } = std::mem::replace(&mut self.state, PipelineState::Idle)
         {
             self.paused.store(false, Ordering::Relaxed);
+            let start_time = Instant::now()
+                .checked_sub(elapsed_before_pause)
+                .unwrap_or_else(Instant::now);
+            if let Ok(mut origin) = self.started_at.lock() {
+                *origin = start_time;
+            }
             self.state = PipelineState::Recording {
-                start_time: Instant::now()
-                    .checked_sub(elapsed_before_pause)
-                    .unwrap_or_else(Instant::now),
+                start_time,
                 bytes_written,
                 segments,
             };
+            self.publish_status(RecordingState::Recording, 0.0, 0.0);
         }
     }
 
@@ -393,10 +424,33 @@ impl RecordingPipeline {
         self.capture_handle.as_ref()
     }
 
-    /// Subscribes to consumer progress updates for CLI/GUI surfaces.
+    /// Subscribes to recording progress for CLI/GUI surfaces.
+    ///
+    /// Delivery is best-effort over a bounded broadcast channel: a slow
+    /// subscriber may observe [`broadcast::error::RecvError::Lagged`] and miss
+    /// intermediate meter updates. Lifecycle transitions (`Paused`, `Stopping`,
+    /// `Stopped`) are emitted explicitly from pause/resume/stop.
     #[must_use]
     pub fn subscribe_progress(&self) -> broadcast::Receiver<RecordingStatus> {
         self.progress_tx.subscribe()
+    }
+
+    fn publish_status(
+        &self,
+        state: RecordingState,
+        level_left: f32,
+        level_right: f32,
+    ) {
+        let elapsed_ms = self.started_at.lock().map_or(0, |started_at| {
+            u64::try_from(started_at.elapsed().as_millis()).unwrap_or(u64::MAX)
+        });
+        let _ = self.progress_tx.send(RecordingStatus {
+            elapsed_ms,
+            bytes_written: self.bytes_written.load(Ordering::Relaxed),
+            level_left,
+            level_right,
+            state,
+        });
     }
 }
 
@@ -562,6 +616,45 @@ mod tests {
         }
 
         let _ = pipeline.stop().await.expect("stop");
+        let _ = std::fs::remove_file(output);
+    }
+
+    #[tokio::test]
+    async fn progress_emits_lifecycle_states() {
+        install_provider(vec![(Permission::Microphone, PermissionStatus::Authorized)]);
+        let output = std::env::temp_dir().join(format!(
+            "koe-pipeline-progress-{}-{}.wav",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+
+        let mut pipeline = RecordingPipeline::start(test_config(&output))
+            .await
+            .expect("start");
+        let mut progress = pipeline.subscribe_progress();
+
+        pipeline.pause();
+        let paused = progress.try_recv().expect("paused status");
+        assert_eq!(paused.state, RecordingState::Paused);
+
+        pipeline.resume();
+        let resumed = progress.try_recv().expect("recording status");
+        assert_eq!(resumed.state, RecordingState::Recording);
+
+        let _ = pipeline.stop().await.expect("stop");
+
+        let mut saw_stopping = false;
+        let mut saw_stopped = false;
+        while let Ok(status) = progress.try_recv() {
+            saw_stopping |= status.state == RecordingState::Stopping;
+            saw_stopped |= status.state == RecordingState::Stopped;
+        }
+        assert!(saw_stopping);
+        assert!(saw_stopped);
+
         let _ = std::fs::remove_file(output);
     }
 

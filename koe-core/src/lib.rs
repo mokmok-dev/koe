@@ -6,6 +6,6 @@ pub mod pipeline;
 pub mod transcript;
 
 pub use pipeline::{
-    AudioChunk, ConsumerContext, FileWriter, PipelineConfig, PipelineError, PipelineMetrics,
-    PipelineMetricsSnapshot, PipelineState, RecordingPipeline, SpeechFeeder, TranscriptionFeeder,
+    AudioChunk, FileWriter, PipelineConfig, PipelineError, PipelineMetrics,
+    PipelineMetricsSnapshot, PipelineState, RecordingPipeline, RecordingState, RecordingStatus,
 };

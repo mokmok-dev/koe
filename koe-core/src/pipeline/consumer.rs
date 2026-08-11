@@ -2,7 +2,7 @@
 //!
 //! Flow: broadcast → encode (`spawn_blocking`) → async disk write → ASR feed → progress.
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
@@ -20,6 +20,9 @@ use super::metrics::PipelineMetrics;
 /// Feeds canonical PCM into the speech analyzer (non-blocking on the Rust side).
 pub trait SpeechFeeder: Send + Sync {
     /// Accepts one interleaved stereo chunk for recognition.
+    ///
+    /// Implementations must not block: the consumer awaits this call on its
+    /// critical path between encode/write and the next chunk.
     fn feed_audio(
         &self,
         pcm: Vec<f32>,
@@ -57,7 +60,10 @@ pub struct ConsumerContext {
     pub shutdown: Arc<AtomicBool>,
     pub paused: Arc<AtomicBool>,
     pub progress_tx: broadcast::Sender<RecordingStatus>,
-    pub started_at: Instant,
+    /// Pause-aware session origin shared with [`super::RecordingPipeline`].
+    pub started_at: Arc<Mutex<Instant>>,
+    /// Running total of encoded bytes written (avoids re-locking the writer).
+    pub bytes_written: Arc<AtomicU64>,
 }
 
 /// Spawns the background consumer that encodes audio and feeds transcription.
@@ -134,9 +140,11 @@ async fn process_chunk(
     .map_err(|err| PipelineError::InvalidState(format!("encode task join failed: {err}")))??;
 
     if !encoded_bytes.is_empty() {
+        let written = u64::try_from(encoded_bytes.len()).unwrap_or(u64::MAX);
         let mut writer = ctx.writer.lock().await;
         writer.write(&encoded_bytes).await?;
         drop(writer);
+        ctx.bytes_written.fetch_add(written, Ordering::Relaxed);
     }
 
     ctx.speech.feed_audio(pcm);
@@ -144,39 +152,45 @@ async fn process_chunk(
     ctx.metrics
         .record_frames(u64::try_from(frame_count).unwrap_or(0));
 
-    emit_progress(ctx, level_left, level_right).await;
+    emit_progress(ctx, level_left, level_right, None)?;
 
     Ok(())
 }
 
-async fn emit_progress(
+/// Builds and sends a [`RecordingStatus`] update (best-effort; lag is ignored).
+fn emit_progress(
     ctx: &ConsumerContext,
     level_left: f32,
     level_right: f32,
-) {
-    let bytes_written = {
-        let writer = ctx.writer.lock().await;
-        writer.bytes_written()
-    };
+    state_override: Option<RecordingState>,
+) -> Result<(), PipelineError> {
+    let state = state_override.unwrap_or_else(|| {
+        if ctx.shutdown.load(Ordering::Relaxed) {
+            RecordingState::Stopping
+        } else if ctx.paused.load(Ordering::Relaxed) {
+            RecordingState::Paused
+        } else {
+            RecordingState::Recording
+        }
+    });
 
-    let state = if ctx.shutdown.load(Ordering::Relaxed) {
-        RecordingState::Stopping
-    } else if ctx.paused.load(Ordering::Relaxed) {
-        RecordingState::Paused
-    } else {
-        RecordingState::Recording
-    };
+    let started_at = ctx
+        .started_at
+        .lock()
+        .map_err(|_| PipelineError::InvalidState("started_at lock poisoned".to_owned()))?;
+    let elapsed_ms = u64::try_from(started_at.elapsed().as_millis()).unwrap_or(u64::MAX);
+    drop(started_at);
 
     let status = RecordingStatus {
-        elapsed_ms: u64::try_from(ctx.started_at.elapsed().as_millis()).unwrap_or(u64::MAX),
-        bytes_written,
+        elapsed_ms,
+        bytes_written: ctx.bytes_written.load(Ordering::Relaxed),
         level_left,
         level_right,
         state,
     };
 
-    // No subscribers (or a full lagging subscriber) is fine — progress is best-effort.
     let _ = ctx.progress_tx.send(status);
+    Ok(())
 }
 
 fn peak_levels(samples: &[f32]) -> (f32, f32) {
@@ -283,7 +297,8 @@ mod tests {
             shutdown,
             paused: Arc::new(AtomicBool::new(false)),
             progress_tx,
-            started_at: Instant::now(),
+            started_at: Arc::new(Mutex::new(Instant::now())),
+            bytes_written: Arc::new(AtomicU64::new(0)),
         };
         (ctx, metrics)
     }
@@ -420,8 +435,7 @@ mod tests {
         let task = spawn_consumer(rx, ctx);
 
         for i in 0..8 {
-            tx.send(AudioChunk::new(vec![0.2, -0.2], i))
-                .expect("send");
+            tx.send(AudioChunk::new(vec![0.2, -0.2], i)).expect("send");
         }
 
         shutdown.store(true, Ordering::Relaxed);
