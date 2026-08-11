@@ -95,4 +95,102 @@ final class KoeNativeTests: XCTestCase {
     let apps = ProcessEnumerator.enumerateApps()
     XCTAssertEqual(apps, [])
   }
+
+  func testCaptureErrorVariantsAreDistinguishable() {
+    let errors: [CaptureError] = [
+      .PermissionDenied("microphone"),
+      .NoAudioSource(bundleId: "com.example.app"),
+      .StreamError(msg: "underrun"),
+      .Internal(msg: "boom"),
+    ]
+
+    XCTAssertEqual(errors.count, Set(errors.map { String(describing: $0) }).count)
+
+    switch errors[0] {
+    case .PermissionDenied(let msg):
+      XCTAssertEqual(msg, "microphone")
+    default:
+      XCTFail("expected PermissionDenied")
+    }
+    switch errors[1] {
+    case .NoAudioSource(let bundleId):
+      XCTAssertEqual(bundleId, "com.example.app")
+    default:
+      XCTFail("expected NoAudioSource")
+    }
+    switch errors[2] {
+    case .StreamError(let msg):
+      XCTAssertEqual(msg, "underrun")
+    default:
+      XCTFail("expected StreamError")
+    }
+    switch errors[3] {
+    case .Internal(let msg):
+      XCTAssertEqual(msg, "boom")
+    default:
+      XCTFail("expected Internal")
+    }
+  }
+
+  func testStartCaptureThrowsNoAudioSource() {
+    XCTAssertThrowsError(
+      try startCapture(
+        source: .appAudio(bundleId: ""),
+        callback: NoopAudioCallback()
+      )
+    ) { error in
+      guard let captureError = error as? CaptureError,
+        case .NoAudioSource = captureError
+      else {
+        return XCTFail("expected CaptureError.NoAudioSource, got \(error)")
+      }
+    }
+  }
+
+  func testStartTranscriptionThrowsUnsupportedLocale() {
+    XCTAssertThrowsError(
+      try startTranscription(locale: "", callback: NoopTranscriptionCallback())
+    ) { error in
+      guard let transcriptionError = error as? TranscriptionError,
+        case .UnsupportedLocale = transcriptionError
+      else {
+        return XCTFail("expected TranscriptionError.UnsupportedLocale, got \(error)")
+      }
+    }
+  }
+
+  func testStartRecordingThrowsConfigError() {
+    XCTAssertThrowsError(
+      try startRecording(
+        source: .microphone,
+        outputPath: "",
+        locale: "en-US",
+        format: .ogg(quality: 0.5),
+        enableAec: false,
+        comfortNoise: false,
+        progressCallback: NoopProgressCallback()
+      )
+    ) { error in
+      guard let recordingError = error as? RecordingError,
+        case .ConfigError = recordingError
+      else {
+        return XCTFail("expected RecordingError.ConfigError, got \(error)")
+      }
+    }
+  }
+}
+
+private final class NoopAudioCallback: AudioCallback {
+  func onAudio(pcm: [Float], timestampMs: UInt64) {}
+}
+
+private final class NoopTranscriptionCallback: TranscriptionCallback {
+  func onSegment(segment: TranscriptionSegment) {}
+  func onError(error: String) {}
+}
+
+private final class NoopProgressCallback: ProgressCallback {
+  func onStatus(status: RecordingStatus) {}
+  func onSegment(segment: TranscriptionSegment) {}
+  func onError(error: String) {}
 }
