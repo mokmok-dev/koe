@@ -2,7 +2,7 @@
 
 use std::fmt::Write as _;
 use std::io::{self, Write};
-use std::num::{NonZeroU32, NonZeroU8};
+use std::num::{NonZeroU8, NonZeroU32};
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -124,13 +124,11 @@ impl OggEncoder {
             )));
         }
 
-        let sample_rate = NonZeroU32::new(SAMPLE_RATE).ok_or_else(|| {
-            CodecError::Encoder("sample rate must be non-zero".to_owned())
-        })?;
+        let sample_rate = NonZeroU32::new(SAMPLE_RATE)
+            .ok_or_else(|| CodecError::Encoder("sample rate must be non-zero".to_owned()))?;
         let channels = NonZeroU8::new(
-            u8::try_from(CHANNELS).map_err(|_| {
-                CodecError::Encoder("channel count exceeds u8".to_owned())
-            })?,
+            u8::try_from(CHANNELS)
+                .map_err(|_| CodecError::Encoder("channel count exceeds u8".to_owned()))?,
         )
         .ok_or_else(|| CodecError::Encoder("channel count must be non-zero".to_owned()))?;
 
@@ -213,9 +211,10 @@ impl AudioEncoder for OggEncoder {
         let left = std::mem::take(&mut self.left);
         let right = std::mem::take(&mut self.right);
         let encode_result = {
-            let encoder = self.encoder.as_mut().ok_or_else(|| {
-                CodecError::Encoder("OGG encoder already finalized".to_owned())
-            })?;
+            let encoder = self
+                .encoder
+                .as_mut()
+                .ok_or_else(|| CodecError::Encoder("OGG encoder already finalized".to_owned()))?;
             encoder
                 .encode_audio_block([&left[..], &right[..]])
                 .map_err(|err| CodecError::Encoder(err.to_string()))
@@ -450,10 +449,13 @@ mod tests {
         // 2024-02-29 (leap day): 19782 days after epoch.
         assert_eq!(civil_from_days(19_782), (2024, 2, 29));
         assert_eq!(civil_from_days(20_161), (2025, 3, 14));
-        assert_eq!(unix_to_civil(0), (
-            "1970-01-01".to_owned(),
-            "00:00:00".to_owned(),
-            "1970-01-01T00:00:00Z".to_owned(),
-        ));
+        assert_eq!(
+            unix_to_civil(0),
+            (
+                "1970-01-01".to_owned(),
+                "00:00:00".to_owned(),
+                "1970-01-01T00:00:00Z".to_owned(),
+            )
+        );
     }
 }
