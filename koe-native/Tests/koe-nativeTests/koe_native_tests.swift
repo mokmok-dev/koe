@@ -1,8 +1,12 @@
+import KoeFfi
 import XCTest
 
 @testable import koe_native
 
 final class KoeNativeTests: XCTestCase {
+  func testKoeFfiAdd() {
+    XCTAssertEqual(add(left: 2, right: 2), 4)
+  }
   func testAudioTapRejectsUnknownProcess() {
     // PID 0 has no audio object; tap creation must fail cleanly.
     XCTAssertThrowsError(try AudioTap(pid: 0)) { error in
