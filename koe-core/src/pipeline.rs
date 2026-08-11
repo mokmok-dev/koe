@@ -84,8 +84,13 @@ pub enum PipelineState {
 pub struct RecordingPipeline {
     config: PipelineConfig,
     state: PipelineState,
-    /// Reserved for task 21 (AEC); initialized when source is `Both`.
-    #[expect(dead_code, reason = "wired in task 21 echo cancellation")]
+    /// Reserved until dual-stream (far/near) capture is wired into the consumer.
+    /// Constructed for `Both` + `enable_aec` so the pipeline is ready; audio is
+    /// not processed through it yet.
+    #[expect(
+        dead_code,
+        reason = "AEC audio path needs separate far/near FFI streams"
+    )]
     aec: Option<AcousticEchoCanceller>,
     encoder: Arc<Mutex<Box<dyn AudioEncoder>>>,
     transcript_fmt: Arc<Mutex<Box<dyn TranscriptFormatter>>>,

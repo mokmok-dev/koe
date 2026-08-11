@@ -5,6 +5,7 @@ pub mod codec;
 pub mod pipeline;
 pub mod transcript;
 
+pub use aec::{AcousticEchoCanceller, AecConfig};
 pub use pipeline::{
     AudioChunk, FileWriter, PipelineConfig, PipelineError, PipelineMetrics,
     PipelineMetricsSnapshot, PipelineState, RecordingPipeline, RecordingState, RecordingStatus,
