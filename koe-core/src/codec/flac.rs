@@ -4,7 +4,7 @@ use flacenc::bitsink::ByteSink;
 use flacenc::component::{BitRepr, MetadataBlockData, Stream};
 use flacenc::config;
 use flacenc::encode_fixed_size_frame;
-use flacenc::error::{Verify, Verified};
+use flacenc::error::{Verified, Verify};
 use flacenc::source::{Context, Fill, FrameBuf};
 use koe_ffi::OutputFormat;
 
@@ -225,9 +225,12 @@ fn padding_block(size: usize) -> Result<MetadataBlockData, CodecError> {
 fn vorbis_comment_block(comments: &OggComments) -> Result<MetadataBlockData, CodecError> {
     let mut payload = Vec::new();
     let vendor = format!("koe v{}", env!("CARGO_PKG_VERSION"));
-    write_le_u32(&mut payload, u32::try_from(vendor.len()).map_err(|_| {
-        CodecError::Encoder("FLAC vendor string length exceeds u32::MAX".to_owned())
-    })?);
+    write_le_u32(
+        &mut payload,
+        u32::try_from(vendor.len()).map_err(|_| {
+            CodecError::Encoder("FLAC vendor string length exceeds u32::MAX".to_owned())
+        })?,
+    );
     payload.extend_from_slice(vendor.as_bytes());
 
     let pairs = comments.tag_pairs();
@@ -248,8 +251,7 @@ fn vorbis_comment_block(comments: &OggComments) -> Result<MetadataBlockData, Cod
         payload.extend_from_slice(field.as_bytes());
     }
 
-    MetadataBlockData::new_unknown(4, &payload)
-        .map_err(|err| CodecError::Encoder(err.to_string()))
+    MetadataBlockData::new_unknown(4, &payload).map_err(|err| CodecError::Encoder(err.to_string()))
 }
 
 fn write_le_u32(
@@ -332,10 +334,12 @@ mod tests {
     #[test]
     fn encode_returns_empty_until_finalize() {
         let mut encoder = FlacEncoder::new(5).expect("encoder");
-        assert!(encoder
-            .encode(&sine_stereo(BLOCK_SIZE, 440.0))
-            .expect("encode")
-            .is_empty());
+        assert!(
+            encoder
+                .encode(&sine_stereo(BLOCK_SIZE, 440.0))
+                .expect("encode")
+                .is_empty()
+        );
         let out = encoder.finalize().expect("finalize");
         assert!(out.len() > 4);
         assert!(encoder.finalize().expect("idempotent").is_empty());
@@ -372,8 +376,7 @@ mod tests {
 
     #[test]
     fn ffprobe_accepts_generated_flac() {
-        let flac = encode_all(5, &session_comments(), &sine_stereo(4_800, 440.0))
-            .expect("encode");
+        let flac = encode_all(5, &session_comments(), &sine_stereo(4_800, 440.0)).expect("encode");
         let path = std::env::temp_dir().join(format!(
             "koe-flac-encoder-{}-{}.flac",
             std::process::id(),
