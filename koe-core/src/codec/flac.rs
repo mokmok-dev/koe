@@ -362,6 +362,7 @@ mod tests {
         }
         let raw_bytes = pcm.len() * 4;
         let flac = encode_all(5, &session_comments(), &pcm).expect("encode");
+        #[allow(clippy::cast_precision_loss)]
         let ratio = flac.len() as f64 / raw_bytes as f64;
         assert!(
             ratio < 0.75,
@@ -429,6 +430,7 @@ mod tests {
             let _ = encoder.encode(&block).expect("encode");
         }
         let elapsed = start.elapsed();
+        #[allow(clippy::cast_precision_loss)]
         let block_duration = BLOCK_SIZE as f64 / f64::from(SAMPLE_RATE);
         let encoded_duration = block_duration * f64::from(iterations);
         assert!(

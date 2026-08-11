@@ -175,7 +175,8 @@ mod tests {
         .expect("flac");
         assert_eq!(encoder.sample_rate(), 48_000);
         assert_eq!(encoder.channel_count(), 2);
-        let _ = encoder.encode(&[0.0_f32; 4096 * 2]).expect("encode");
+        let pcm = vec![0.0_f32; 4096 * 2];
+        let _ = encoder.encode(&pcm).expect("encode");
         let out = encoder.finalize().expect("finalize");
         assert_eq!(&out[..4], b"fLaC");
     }
