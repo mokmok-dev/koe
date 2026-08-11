@@ -285,10 +285,10 @@ mod tests {
         u32::from_le_bytes(buf[at..at + 4].try_into().expect("u32"))
     }
 
-    fn find_chunk<'a>(
-        wav: &'a [u8],
-        id: &[u8; 4],
-    ) -> &'a [u8] {
+    fn find_chunk(
+        wav: &[u8],
+        id: [u8; 4],
+    ) -> &[u8] {
         assert_eq!(&wav[0..4], b"RIFF");
         assert_eq!(&wav[8..12], b"WAVE");
         let mut offset = 12usize;
@@ -304,7 +304,7 @@ mod tests {
             // Chunks are word-aligned.
             offset = data_end + (size % 2);
         }
-        panic!("chunk {} not found", String::from_utf8_lossy(id));
+        panic!("chunk {} not found", String::from_utf8_lossy(&id));
     }
 
     fn sine(
@@ -343,7 +343,7 @@ mod tests {
         assert_eq!(wav.len(), HEADER_LEN + 480 * 2 * 4);
         assert_eq!(read_u32(&wav, 4), u32::try_from(wav.len() - 8).unwrap());
 
-        let fmt = find_chunk(&wav, b"fmt ");
+        let fmt = find_chunk(&wav, *b"fmt ");
         assert_eq!(fmt.len(), 16);
         assert_eq!(read_u16(fmt, 0), WAVE_FORMAT_IEEE_FLOAT);
         assert_eq!(read_u16(fmt, 2), 2);
@@ -352,21 +352,21 @@ mod tests {
         assert_eq!(read_u16(fmt, 12), 8); // block align: 2 ch * 4 bytes
         assert_eq!(read_u16(fmt, 14), 32);
 
-        let fact = find_chunk(&wav, b"fact");
+        let fact = find_chunk(&wav, *b"fact");
         assert_eq!(fact.len(), 4);
         assert_eq!(read_u32(fact, 0), 480);
 
-        let data = find_chunk(&wav, b"data");
+        let data = find_chunk(&wav, *b"data");
         assert_eq!(data.len(), 480 * 2 * 4);
     }
 
     #[test]
     fn writes_pcm_i16_and_i24() {
         let i16_wav = encode_all(16, 2, &[0.0, 0.0, 1.0, -1.0]);
-        let fmt16 = find_chunk(&i16_wav, b"fmt ");
+        let fmt16 = find_chunk(&i16_wav, *b"fmt ");
         assert_eq!(read_u16(fmt16, 0), WAVE_FORMAT_PCM);
         assert_eq!(read_u16(fmt16, 14), 16);
-        let data16 = find_chunk(&i16_wav, b"data");
+        let data16 = find_chunk(&i16_wav, *b"data");
         assert_eq!(data16.len(), 8);
         assert_eq!(
             i16::from_le_bytes(data16[4..6].try_into().unwrap()),
@@ -378,17 +378,17 @@ mod tests {
         );
 
         let i24_wav = encode_all(24, 2, &[0.0, 0.0]);
-        let fmt24 = find_chunk(&i24_wav, b"fmt ");
+        let fmt24 = find_chunk(&i24_wav, *b"fmt ");
         assert_eq!(read_u16(fmt24, 0), WAVE_FORMAT_PCM);
         assert_eq!(read_u16(fmt24, 14), 24);
-        assert_eq!(find_chunk(&i24_wav, b"data").len(), 6);
-        assert_eq!(read_u32(find_chunk(&i24_wav, b"fact"), 0), 1);
+        assert_eq!(find_chunk(&i24_wav, *b"data").len(), 6);
+        assert_eq!(read_u32(find_chunk(&i24_wav, *b"fact"), 0), 1);
     }
 
     #[test]
     fn float_preserves_peaks_outside_unit_range() {
         let wav = encode_all(32, 1, &[1.5]);
-        let data = find_chunk(&wav, b"data");
+        let data = find_chunk(&wav, *b"data");
         let value = f32::from_le_bytes(data[0..4].try_into().unwrap());
         assert!((value - 1.5).abs() < f32::EPSILON);
     }
@@ -396,10 +396,10 @@ mod tests {
     #[test]
     fn mono_input_writes_one_channel_fmt() {
         let wav = encode_all(32, 1, &sine(100, 1, 220.0));
-        let fmt = find_chunk(&wav, b"fmt ");
+        let fmt = find_chunk(&wav, *b"fmt ");
         assert_eq!(read_u16(fmt, 2), 1);
-        assert_eq!(read_u32(find_chunk(&wav, b"fact"), 0), 100);
-        assert_eq!(find_chunk(&wav, b"data").len(), 100 * 4);
+        assert_eq!(read_u32(find_chunk(&wav, *b"fact"), 0), 100);
+        assert_eq!(find_chunk(&wav, *b"data").len(), 100 * 4);
     }
 
     #[test]
@@ -428,8 +428,8 @@ mod tests {
         let mut encoder = WavEncoder::new(16).expect("encoder");
         let wav = encoder.finalize().expect("finalize");
         assert_eq!(wav.len(), HEADER_LEN);
-        assert_eq!(read_u32(find_chunk(&wav, b"fact"), 0), 0);
-        assert!(find_chunk(&wav, b"data").is_empty());
+        assert_eq!(read_u32(find_chunk(&wav, *b"fact"), 0), 0);
+        assert!(find_chunk(&wav, *b"data").is_empty());
     }
 
     #[test]
@@ -440,8 +440,7 @@ mod tests {
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_nanos())
-                .unwrap_or(0)
+                .map_or(0, |d| d.as_nanos())
         ));
         std::fs::write(&path, &wav).expect("write wav");
 
