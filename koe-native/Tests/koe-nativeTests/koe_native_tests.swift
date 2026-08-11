@@ -1,7 +1,7 @@
+import KoeFfi
 import XCTest
 
 @testable import koe_native
-import KoeFfi
 
 final class KoeNativeTests: XCTestCase {
   func testKoeFfiAdd() {
