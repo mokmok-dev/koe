@@ -1,0 +1,586 @@
+//! Recording pipeline orchestration.
+
+mod chunk;
+mod consumer;
+mod disk_check;
+mod error;
+mod file_writer;
+mod metrics;
+
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
+
+use koe_ffi::{
+    check_permission, finalize_transcription, start_capture, start_transcription, stop_capture,
+    validate_capture_source, validate_locale, validate_output_path, AudioCallback,
+    AudioSourceConfig, OutputFormat, Permission, PermissionStatus, RecordingError,
+    RecordingSummary, TranscriptFormat, TranscriptionCallback, TranscriptionSegment,
+};
+use tokio::sync::{broadcast, Mutex as AsyncMutex};
+use tokio::task::JoinHandle;
+
+use crate::aec::{AcousticEchoCanceller, AecConfig};
+use crate::codec::{create_encoder, AudioEncoder};
+use crate::transcript::{create_formatter, TranscriptFormatter};
+
+pub use chunk::AudioChunk;
+pub use consumer::{spawn_consumer, ConsumerContext};
+pub use disk_check::check_disk_space;
+pub use error::PipelineError;
+pub use file_writer::FileWriter;
+pub use metrics::{PipelineMetrics, PipelineMetricsSnapshot};
+
+/// Configuration for a recording session.
+#[derive(Debug, Clone)]
+pub struct PipelineConfig {
+    /// Audio capture source.
+    pub source: AudioSourceConfig,
+    /// Path for encoded audio output.
+    pub output_path: PathBuf,
+    /// Optional path for transcript output.
+    pub transcript_output_path: Option<PathBuf>,
+    /// BCP-47 locale for speech recognition.
+    pub locale: String,
+    /// Encoded audio format.
+    pub audio_format: OutputFormat,
+    /// Transcript file format.
+    pub transcript_format: TranscriptFormat,
+    /// Enable acoustic echo cancellation (for `Both` sources).
+    pub enable_aec: bool,
+    /// Inject comfort noise during echo-only periods.
+    pub comfort_noise: bool,
+    /// Route clean audio to the default output device.
+    pub monitor: bool,
+    /// Optional estimated recording duration for disk-space checks.
+    pub estimated_duration_hours: Option<f64>,
+}
+
+/// Lifecycle state of the recording pipeline.
+#[derive(Debug)]
+pub enum PipelineState {
+    /// Pipeline created but not yet recording.
+    Idle,
+    /// Actively recording.
+    Recording {
+        start_time: Instant,
+        bytes_written: u64,
+        segments: Vec<TranscriptionSegment>,
+    },
+    /// Recording paused; tap remains alive.
+    Paused {
+        elapsed_before_pause: Duration,
+        bytes_written: u64,
+        segments: Vec<TranscriptionSegment>,
+    },
+    /// Recording has been stopped.
+    Stopped,
+}
+
+/// Central orchestrator for capture, encoding, transcription, and file output.
+pub struct RecordingPipeline {
+    config: PipelineConfig,
+    state: PipelineState,
+    /// Reserved for task 21 (AEC); initialized when source is `Both`.
+    #[expect(dead_code, reason = "wired in task 21 echo cancellation")]
+    aec: Option<AcousticEchoCanceller>,
+    encoder: Arc<Mutex<Box<dyn AudioEncoder>>>,
+    transcript_fmt: Arc<Mutex<Box<dyn TranscriptFormatter>>>,
+    file_writer: Arc<AsyncMutex<FileWriter>>,
+    capture_handle: Option<Arc<koe_ffi::CaptureHandle>>,
+    transcription_handle: Option<Arc<koe_ffi::TranscriptionHandle>>,
+    consumer_task: Option<JoinHandle<Result<(), PipelineError>>>,
+    shutdown: Arc<AtomicBool>,
+    paused: Arc<AtomicBool>,
+    drop_counter: Arc<std::sync::atomic::AtomicU64>,
+    metrics: Arc<PipelineMetrics>,
+    segments: Arc<Mutex<Vec<TranscriptionSegment>>>,
+}
+
+struct PipelineAudioCallback {
+    tx: broadcast::Sender<AudioChunk>,
+    paused: Arc<AtomicBool>,
+    drop_counter: Arc<std::sync::atomic::AtomicU64>,
+}
+
+impl AudioCallback for PipelineAudioCallback {
+    fn on_audio(
+        &self,
+        pcm: Vec<f32>,
+        timestamp_ms: u64,
+    ) {
+        if self.paused.load(Ordering::Relaxed) {
+            return;
+        }
+        if self.tx.send(AudioChunk::new(pcm, timestamp_ms)).is_err() {
+            self.drop_counter.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+}
+
+struct PipelineTranscriptionCallback {
+    segments: Arc<Mutex<Vec<TranscriptionSegment>>>,
+    transcript: Arc<Mutex<Box<dyn TranscriptFormatter>>>,
+    metrics: Arc<PipelineMetrics>,
+}
+
+impl TranscriptionCallback for PipelineTranscriptionCallback {
+    fn on_segment(
+        &self,
+        segment: TranscriptionSegment,
+    ) {
+        if segment.is_final {
+            if let Ok(mut transcript) = self.transcript.lock() {
+                transcript.write_segment(&segment);
+            }
+            if let Ok(mut segments) = self.segments.lock() {
+                segments.push(segment);
+            }
+            self.metrics.record_segment();
+        }
+    }
+
+    fn on_error(
+        &self,
+        error: String,
+    ) {
+        log::error!("transcription error: {error}");
+    }
+}
+
+impl RecordingPipeline {
+    /// Validates configuration, starts native capture, and spawns the consumer.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PipelineError`] when validation, permissions, or setup fails.
+    pub async fn start(config: PipelineConfig) -> Result<Self, PipelineError> {
+        validate_config(&config)?;
+        check_permissions(&config.source)?;
+        let audio_format = config.audio_format.clone();
+        check_disk_space(
+            &config.output_path,
+            &audio_format,
+            config.estimated_duration_hours,
+        )?;
+
+        if config.output_path.exists() {
+            return Err(RecordingError::OutputExists {
+                path: config
+                    .output_path
+                    .to_str()
+                    .unwrap_or("<invalid utf-8>")
+                    .to_owned(),
+            }
+            .into());
+        }
+
+        let encoder = create_encoder(&audio_format)?;
+        let file_writer = FileWriter::create(&config.output_path).await?;
+        let transcript_fmt = create_formatter(config.transcript_format);
+
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let paused = Arc::new(AtomicBool::new(false));
+        let drop_counter = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let metrics = PipelineMetrics::new();
+        let segments = Arc::new(Mutex::new(Vec::new()));
+        let transcript = Arc::new(Mutex::new(transcript_fmt));
+
+        let transcription_callback = PipelineTranscriptionCallback {
+            segments: Arc::clone(&segments),
+            transcript: Arc::clone(&transcript),
+            metrics: Arc::clone(&metrics),
+        };
+        let transcription_handle = start_transcription(
+            config.locale.clone(),
+            Box::new(transcription_callback),
+        )?;
+
+        let (audio_tx, _audio_rx) = broadcast::channel(64);
+        let audio_callback = PipelineAudioCallback {
+            tx: audio_tx.clone(),
+            paused: Arc::clone(&paused),
+            drop_counter: Arc::clone(&drop_counter),
+        };
+        let capture_handle = start_capture(config.source.clone(), Box::new(audio_callback))?;
+
+        let aec = if matches!(config.source, AudioSourceConfig::Both { .. }) && config.enable_aec
+        {
+            Some(AcousticEchoCanceller::new(AecConfig {
+                comfort_noise: config.comfort_noise,
+                ..AecConfig::default()
+            }))
+        } else {
+            None
+        };
+
+        let encoder = Arc::new(Mutex::new(encoder));
+        let file_writer = Arc::new(AsyncMutex::new(file_writer));
+
+        let consumer_ctx = ConsumerContext {
+            encoder: Arc::clone(&encoder),
+            transcription: Arc::clone(&transcription_handle),
+            writer: Arc::clone(&file_writer),
+            metrics: Arc::clone(&metrics),
+            shutdown: Arc::clone(&shutdown),
+        };
+        let consumer_task = spawn_consumer(audio_tx.subscribe(), consumer_ctx);
+
+        Ok(Self {
+            config,
+            state: PipelineState::Recording {
+                start_time: Instant::now(),
+                bytes_written: 0,
+                segments: Vec::new(),
+            },
+            aec,
+            encoder,
+            transcript_fmt: transcript,
+            file_writer,
+            capture_handle: Some(capture_handle),
+            transcription_handle: Some(transcription_handle),
+            consumer_task: Some(consumer_task),
+            shutdown,
+            paused,
+            drop_counter,
+            metrics,
+            segments,
+        })
+    }
+
+    /// Stops capture, drains remaining audio, finalizes outputs, and returns a summary.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PipelineError`] when shutdown or finalization fails.
+    pub async fn stop(&mut self) -> Result<RecordingSummary, PipelineError> {
+        self.shutdown.store(true, Ordering::Relaxed);
+
+        if let Some(handle) = self.capture_handle.take() {
+            stop_capture(handle);
+        }
+
+        if let Some(task) = self.consumer_task.take() {
+            let _ = task.await;
+        }
+
+        if let Some(handle) = self.transcription_handle.take() {
+            finalize_transcription(handle);
+        }
+
+        let trailer = {
+            let mut encoder = self.encoder.lock().map_err(|_| {
+                PipelineError::InvalidState("encoder lock poisoned".to_owned())
+            })?;
+            encoder.finalize()?
+        };
+
+        let bytes_written = {
+            let mut writer = self.file_writer.lock().await;
+            if !trailer.is_empty() {
+                writer.write(&trailer).await?;
+            }
+            writer.flush().await?;
+            writer.bytes_written()
+        };
+
+        if let Some(transcript_path) = &self.config.transcript_output_path {
+            let body = {
+                let transcript = self.transcript_fmt.lock().map_err(|_| {
+                    PipelineError::InvalidState("transcript lock poisoned".to_owned())
+                })?;
+                transcript.current_output()
+            };
+            tokio::fs::write(transcript_path, body).await?;
+        }
+
+        let duration_sec = match &self.state {
+            PipelineState::Recording { start_time, .. } => start_time.elapsed().as_secs_f64(),
+            PipelineState::Paused {
+                elapsed_before_pause,
+                ..
+            } => elapsed_before_pause.as_secs_f64(),
+            _ => 0.0,
+        };
+
+        let segment_count = self
+            .segments
+            .lock()
+            .map_err(|_| PipelineError::InvalidState("segments lock poisoned".to_owned()))?
+            .len();
+
+        self.state = PipelineState::Stopped;
+
+        Ok(RecordingSummary {
+            duration_sec,
+            bytes_written,
+            transcript_segment_count: u64::try_from(segment_count).unwrap_or(u64::MAX),
+            dropped_audio_frames: self.drop_counter.load(Ordering::Relaxed),
+            format: self.config.audio_format.clone(),
+        })
+    }
+
+    /// Pauses audio production while keeping the native tap alive.
+    pub fn pause(&mut self) {
+        if let PipelineState::Recording {
+            start_time,
+            bytes_written,
+            segments,
+        } = std::mem::replace(&mut self.state, PipelineState::Idle)
+        {
+            self.paused.store(true, Ordering::Relaxed);
+            self.state = PipelineState::Paused {
+                elapsed_before_pause: start_time.elapsed(),
+                bytes_written,
+                segments,
+            };
+        }
+    }
+
+    /// Resumes recording after a pause.
+    pub fn resume(&mut self) {
+        if let PipelineState::Paused {
+            elapsed_before_pause,
+            bytes_written,
+            segments,
+        } = std::mem::replace(&mut self.state, PipelineState::Idle)
+        {
+            self.paused.store(false, Ordering::Relaxed);
+            self.state = PipelineState::Recording {
+                start_time: Instant::now()
+                    .checked_sub(elapsed_before_pause)
+                    .unwrap_or_else(Instant::now),
+                bytes_written,
+                segments,
+            };
+        }
+    }
+
+    /// Returns whether the pipeline is paused.
+    #[must_use]
+    pub const fn is_paused(&self) -> bool {
+        matches!(self.state, PipelineState::Paused { .. })
+    }
+
+    /// Current lifecycle state.
+    #[must_use]
+    pub const fn state(&self) -> &PipelineState {
+        &self.state
+    }
+
+    /// Active configuration.
+    #[must_use]
+    pub const fn config(&self) -> &PipelineConfig {
+        &self.config
+    }
+
+    /// Runtime metrics snapshot.
+    #[must_use]
+    pub fn metrics(&self) -> PipelineMetricsSnapshot {
+        self.metrics.snapshot()
+    }
+
+    /// Capture handle for test injection of PCM frames.
+    #[must_use]
+    pub const fn capture_handle(&self) -> Option<&Arc<koe_ffi::CaptureHandle>> {
+        self.capture_handle.as_ref()
+    }
+}
+
+fn validate_config(config: &PipelineConfig) -> Result<(), PipelineError> {
+    validate_capture_source(&config.source)?;
+    validate_locale(&config.locale)?;
+    let output = config
+        .output_path
+        .to_str()
+        .ok_or_else(|| RecordingError::ConfigError {
+            msg: "output path is not valid UTF-8".to_owned(),
+        })?;
+    validate_output_path(output)?;
+    Ok(())
+}
+
+fn check_permissions(source: &AudioSourceConfig) -> Result<(), PipelineError> {
+    for permission in required_permissions(source) {
+        let status = check_permission(permission);
+        if status != PermissionStatus::Authorized {
+            let name = permission_name(permission);
+            return Err(PipelineError::PermissionDenied(name.to_owned()));
+        }
+    }
+    Ok(())
+}
+
+fn required_permissions(source: &AudioSourceConfig) -> Vec<Permission> {
+    match source {
+        AudioSourceConfig::Microphone => vec![Permission::Microphone],
+        AudioSourceConfig::AppAudio { .. } | AudioSourceConfig::PidAudio { .. } => {
+            vec![Permission::ScreenRecording]
+        },
+        AudioSourceConfig::Both { .. } => {
+            vec![Permission::Microphone, Permission::ScreenRecording]
+        },
+    }
+}
+
+const fn permission_name(permission: Permission) -> &'static str {
+    match permission {
+        Permission::Microphone => "microphone",
+        Permission::ScreenRecording => "screen recording",
+        Permission::Accessibility => "accessibility",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::Path;
+
+    use koe_ffi::{
+        register_native_provider, AppInfo, NativeProvider, Permission, PermissionStatus,
+    };
+
+    use super::*;
+
+    struct TestProvider {
+        permissions: Vec<(Permission, PermissionStatus)>,
+    }
+
+    impl NativeProvider for TestProvider {
+        fn check_permission(
+            &self,
+            permission: Permission,
+        ) -> PermissionStatus {
+            self.permissions
+                .iter()
+                .find(|(perm, _)| *perm == permission)
+                .map_or(PermissionStatus::NotDetermined, |(_, status)| *status)
+        }
+
+        fn request_permission(
+            &self,
+            permission: Permission,
+        ) -> PermissionStatus {
+            self.check_permission(permission)
+        }
+
+        fn enumerate_apps(&self) -> Vec<AppInfo> {
+            Vec::new()
+        }
+    }
+
+    fn install_provider(permissions: Vec<(Permission, PermissionStatus)>) {
+        register_native_provider(Box::new(TestProvider { permissions }));
+    }
+
+    fn test_config(output: &Path) -> PipelineConfig {
+        PipelineConfig {
+            source: AudioSourceConfig::Microphone,
+            output_path: output.to_path_buf(),
+            transcript_output_path: None,
+            locale: "en-US".into(),
+            audio_format: OutputFormat::Wav {
+                bits_per_sample: 16,
+            },
+            transcript_format: TranscriptFormat::Txt,
+            enable_aec: false,
+            comfort_noise: false,
+            monitor: false,
+            estimated_duration_hours: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn start_stop_with_authorized_permissions() {
+        install_provider(vec![(Permission::Microphone, PermissionStatus::Authorized)]);
+        let output = std::env::temp_dir().join(format!(
+            "koe-pipeline-{}-{}.wav",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+
+        let mut pipeline = RecordingPipeline::start(test_config(&output))
+            .await
+            .expect("start");
+
+        if let Some(handle) = pipeline.capture_handle() {
+            handle.deliver_audio(vec![0.1, -0.1, 0.2, -0.2], 10);
+            handle.deliver_audio(vec![0.3, -0.3], 20);
+        }
+
+        let summary = pipeline.stop().await.expect("stop");
+        assert!(summary.bytes_written > 0);
+        assert_eq!(summary.dropped_audio_frames, 0);
+
+        let _ = std::fs::remove_file(output);
+    }
+
+    #[tokio::test]
+    async fn pause_resume_cycle() {
+        install_provider(vec![(Permission::Microphone, PermissionStatus::Authorized)]);
+        let output = std::env::temp_dir().join(format!(
+            "koe-pipeline-pause-{}-{}.wav",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+
+        let mut pipeline = RecordingPipeline::start(test_config(&output))
+            .await
+            .expect("start");
+        assert!(!pipeline.is_paused());
+
+        pipeline.pause();
+        assert!(pipeline.is_paused());
+
+        if let Some(handle) = pipeline.capture_handle() {
+            handle.deliver_audio(vec![1.0, -1.0], 30);
+        }
+
+        pipeline.resume();
+        assert!(!pipeline.is_paused());
+
+        if let Some(handle) = pipeline.capture_handle() {
+            handle.deliver_audio(vec![0.5, -0.5], 40);
+        }
+
+        let _ = pipeline.stop().await.expect("stop");
+        let _ = std::fs::remove_file(output);
+    }
+
+    #[tokio::test]
+    async fn start_with_denied_permission_fails() {
+        install_provider(vec![(Permission::Microphone, PermissionStatus::Denied)]);
+        let output = std::env::temp_dir().join("koe-pipeline-denied.wav");
+        let err = match RecordingPipeline::start(test_config(&output)).await {
+            Err(err) => err,
+            Ok(_) => panic!("permission denied"),
+        };
+        assert!(matches!(err, PipelineError::PermissionDenied(_)));
+    }
+
+    #[tokio::test]
+    async fn start_with_insufficient_disk_space_fails() {
+        install_provider(vec![(Permission::Microphone, PermissionStatus::Authorized)]);
+        let output = std::env::temp_dir().join("koe-pipeline-disk.wav");
+        let mut config = test_config(&output);
+        config.estimated_duration_hours = Some(1_000_000.0);
+        config.audio_format = OutputFormat::Wav {
+            bits_per_sample: 32,
+        };
+
+        let err = match RecordingPipeline::start(config).await {
+            Err(err) => err,
+            Ok(_) => panic!("disk full"),
+        };
+        assert!(matches!(
+            err,
+            PipelineError::Recording(RecordingError::InsufficientDiskSpace { .. })
+        ));
+    }
+}

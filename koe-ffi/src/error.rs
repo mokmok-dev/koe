@@ -50,6 +50,10 @@ pub struct RecordingSummary {
 }
 
 /// Rejects capture sources that cannot produce audio.
+///
+/// # Errors
+///
+/// Returns [`CaptureError`] when the source configuration is invalid.
 pub fn validate_capture_source(source: &AudioSourceConfig) -> Result<(), CaptureError> {
     match source {
         AudioSourceConfig::AppAudio { bundle_id } | AudioSourceConfig::Both { bundle_id }
@@ -67,6 +71,10 @@ pub fn validate_capture_source(source: &AudioSourceConfig) -> Result<(), Capture
 }
 
 /// Rejects empty or whitespace-only locale tags.
+///
+/// # Errors
+///
+/// Returns [`TranscriptionError::UnsupportedLocale`] for empty locales.
 pub fn validate_locale(locale: &str) -> Result<(), TranscriptionError> {
     if locale.trim().is_empty() {
         return Err(TranscriptionError::UnsupportedLocale {
@@ -77,6 +85,10 @@ pub fn validate_locale(locale: &str) -> Result<(), TranscriptionError> {
 }
 
 /// Rejects empty recording output paths.
+///
+/// # Errors
+///
+/// Returns [`RecordingError::ConfigError`] when the path is empty.
 pub fn validate_output_path(path: &str) -> Result<(), RecordingError> {
     if path.trim().is_empty() {
         return Err(RecordingError::ConfigError {
