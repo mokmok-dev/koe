@@ -170,8 +170,7 @@ impl AcousticEchoCanceller {
 
             // Echo-only: far-end active, no double-talk, residual near the floor.
             let floor = self.comfort.noise_floor().max(1e-4);
-            let echo_only =
-                !double_talk && self.far_power > 1e-6 && error.abs() <= 4.0 * floor;
+            let echo_only = !double_talk && self.far_power > 1e-6 && error.abs() <= 4.0 * floor;
             let sample = self.comfort.maybe_mix(error, echo_only);
             out.push(sample);
 

@@ -106,7 +106,11 @@ impl NlmsFilter {
             self.peak_q.pop_back();
         }
         self.peak_q.push_back((abs_far, expiry));
-        while self.peak_q.front().is_some_and(|&(_, exp)| exp <= self.time) {
+        while self
+            .peak_q
+            .front()
+            .is_some_and(|&(_, exp)| exp <= self.time)
+        {
             self.peak_q.pop_front();
         }
     }
