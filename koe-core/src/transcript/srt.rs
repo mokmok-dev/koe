@@ -20,9 +20,7 @@ impl SrtFormatter {
         }
     }
 
-    fn render<'a>(
-        segments: impl IntoIterator<Item = &'a TranscriptionSegment>,
-    ) -> String {
+    fn render<'a>(segments: impl IntoIterator<Item = &'a TranscriptionSegment>) -> String {
         let mut out = String::new();
         for (index, segment) in segments.into_iter().enumerate() {
             if index > 0 {

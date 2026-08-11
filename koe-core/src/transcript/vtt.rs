@@ -20,9 +20,7 @@ impl VttFormatter {
         }
     }
 
-    fn render<'a>(
-        segments: impl IntoIterator<Item = &'a TranscriptionSegment>,
-    ) -> String {
+    fn render<'a>(segments: impl IntoIterator<Item = &'a TranscriptionSegment>) -> String {
         let mut out = String::from("WEBVTT\n");
         for (index, segment) in segments.into_iter().enumerate() {
             out.push('\n');
