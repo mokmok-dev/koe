@@ -6,7 +6,8 @@ final class KoeNativeTests: XCTestCase {
   func testAudioTapInitialization() {
     let tap = AudioTap(pid: 1234)
     XCTAssertNotNil(tap)
-    if case .idle = tap.status { } else {
+    if case .idle = tap.status {
+    } else {
       XCTFail("expected idle status")
     }
   }

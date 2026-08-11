@@ -7,25 +7,25 @@ import Foundation
 /// Used internally by the GUI binary; not part of the C ABI surface
 /// exposed to Rust.
 public final class StatusBarController: Sendable {
-    /// The current recording state displayed in the menu bar.
-    public enum RecordingState {
-        case idle
-        case recording
-        case paused
-    }
+  /// The current recording state displayed in the menu bar.
+  public enum RecordingState {
+    case idle
+    case recording
+    case paused
+  }
 
-    /// Creates a status bar controller.
-    public init() {}
+  /// Creates a status bar controller.
+  public init() {}
 
-    /// Shows the status bar item.
-    public func show() {}
+  /// Shows the status bar item.
+  public func show() {}
 
-    /// Hides the status bar item.
-    public func hide() {}
+  /// Hides the status bar item.
+  public func hide() {}
 
-    /// Updates the displayed recording state.
-    public func updateState(_ state: RecordingState) {}
+  /// Updates the displayed recording state.
+  public func updateState(_ state: RecordingState) {}
 
-    /// Updates the duration label (e.g., "00:12:34").
-    public func updateDuration(_ durationString: String) {}
+  /// Updates the duration label (e.g., "00:12:34").
+  public func updateDuration(_ durationString: String) {}
 }
