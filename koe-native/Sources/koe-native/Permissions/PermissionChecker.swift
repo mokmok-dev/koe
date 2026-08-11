@@ -1,5 +1,5 @@
-import ApplicationServices
 import AVFoundation
+import ApplicationServices
 import Foundation
 
 /// Checks and requests macOS TCC (Transparency, Consent, and Control)
