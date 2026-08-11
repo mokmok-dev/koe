@@ -1,4 +1,4 @@
-//! Audio encoding abstractions (WAV/FLAC follow-ups in tasks 18–19).
+//! Audio encoding abstractions (FLAC follow-up in task 19).
 
 mod wav;
 
