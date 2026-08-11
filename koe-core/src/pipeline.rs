@@ -23,7 +23,7 @@ use tokio::task::JoinHandle;
 
 use crate::aec::{AcousticEchoCanceller, AecConfig};
 use crate::codec::{AudioEncoder, OggComments, create_encoder};
-use crate::transcript::{TranscriptFormatter, create_formatter};
+use crate::transcript::{TranscriptFormatter, TranscriptMeta, create_formatter};
 
 pub use chunk::AudioChunk;
 pub use consumer::{ConsumerContext, SpeechFeeder, TranscriptionFeeder, spawn_consumer};
@@ -136,10 +136,12 @@ impl TranscriptionCallback for PipelineTranscriptionCallback {
         &self,
         segment: TranscriptionSegment,
     ) {
+        // Forward partials for live preview (`current_output`); finals also
+        // update the durable segment list and metrics.
+        if let Ok(mut transcript) = self.transcript.lock() {
+            transcript.write_segment(&segment);
+        }
         if segment.is_final {
-            if let Ok(mut transcript) = self.transcript.lock() {
-                transcript.write_segment(&segment);
-            }
             if let Ok(mut segments) = self.segments.lock() {
                 segments.push(segment);
             }
@@ -185,7 +187,8 @@ impl RecordingPipeline {
         let comments = OggComments::for_session(&config.source, &config.locale);
         let encoder = create_encoder(&audio_format, Some(&comments))?;
         let file_writer = FileWriter::create(&config.output_path).await?;
-        let transcript_fmt = create_formatter(config.transcript_format);
+        let transcript_meta = TranscriptMeta::for_session(&config.source, &config.locale);
+        let transcript_fmt = create_formatter(config.transcript_format, &transcript_meta);
 
         let shutdown = Arc::new(AtomicBool::new(false));
         let paused = Arc::new(AtomicBool::new(false));
@@ -321,7 +324,7 @@ impl RecordingPipeline {
                 let transcript = self.transcript_fmt.lock().map_err(|_| {
                     PipelineError::InvalidState("transcript lock poisoned".to_owned())
                 })?;
-                transcript.current_output()
+                transcript.committed_output()
             };
             tokio::fs::write(transcript_path, body).await?;
         }

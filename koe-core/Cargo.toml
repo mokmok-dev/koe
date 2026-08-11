@@ -17,6 +17,7 @@ flacenc = { workspace = true }
 fs2 = { workspace = true }
 koe-ffi = { path = "../koe-ffi" }
 log = { workspace = true }
+serde_json = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true, features = [
   "fs",
