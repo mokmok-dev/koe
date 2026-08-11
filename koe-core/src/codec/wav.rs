@@ -130,9 +130,9 @@ impl WavEncoder {
         let channels = u32::from(self.channel_count);
         let byte_rate = SAMPLE_RATE * channels * bytes_per_sample;
         let block_align = self.channel_count * (self.bits_per_sample / 8);
-        let riff_size = RIFF_SIZE_OVERHEAD.checked_add(data_size).ok_or_else(|| {
-            CodecError::Encoder("WAV RIFF size exceeds u32::MAX".to_owned())
-        })?;
+        let riff_size = RIFF_SIZE_OVERHEAD
+            .checked_add(data_size)
+            .ok_or_else(|| CodecError::Encoder("WAV RIFF size exceeds u32::MAX".to_owned()))?;
 
         let mut header = Vec::with_capacity(HEADER_LEN);
         header.extend_from_slice(b"RIFF");
@@ -173,8 +173,7 @@ impl WavEncoder {
             .ok_or_else(|| CodecError::Encoder("WAV size underflow".to_owned()))?;
         if riff_size > u32::MAX as usize {
             return Err(CodecError::Encoder(
-                "WAV payload would exceed the 4 GiB RIFF limit; use OGG or FLAC instead"
-                    .to_owned(),
+                "WAV payload would exceed the 4 GiB RIFF limit; use OGG or FLAC instead".to_owned(),
             ));
         }
         Ok(())
@@ -218,12 +217,12 @@ impl AudioEncoder for WavEncoder {
         self.ensure_riff_capacity(add_bytes)?;
 
         let frames = pcm.len() / channels;
-        let new_frames = u32::try_from(frames).map_err(|_| {
-            CodecError::Encoder("WAV frame count exceeds u32::MAX".to_owned())
-        })?;
-        self.frame_count = self.frame_count.checked_add(new_frames).ok_or_else(|| {
-            CodecError::Encoder("WAV frame count exceeds u32::MAX".to_owned())
-        })?;
+        let new_frames = u32::try_from(frames)
+            .map_err(|_| CodecError::Encoder("WAV frame count exceeds u32::MAX".to_owned()))?;
+        self.frame_count = self
+            .frame_count
+            .checked_add(new_frames)
+            .ok_or_else(|| CodecError::Encoder("WAV frame count exceeds u32::MAX".to_owned()))?;
 
         self.pcm_bytes.reserve(add_bytes);
         let bits = self.bits_per_sample;
@@ -272,11 +271,17 @@ mod tests {
 
     use super::*;
 
-    fn read_u16(buf: &[u8], at: usize) -> u16 {
+    fn read_u16(
+        buf: &[u8],
+        at: usize,
+    ) -> u16 {
         u16::from_le_bytes(buf[at..at + 2].try_into().expect("u16"))
     }
 
-    fn read_u32(buf: &[u8], at: usize) -> u32 {
+    fn read_u32(
+        buf: &[u8],
+        at: usize,
+    ) -> u32 {
         u32::from_le_bytes(buf[at..at + 4].try_into().expect("u32"))
     }
 
@@ -363,8 +368,14 @@ mod tests {
         assert_eq!(read_u16(fmt16, 14), 16);
         let data16 = find_chunk(&i16_wav, b"data");
         assert_eq!(data16.len(), 8);
-        assert_eq!(i16::from_le_bytes(data16[4..6].try_into().unwrap()), i16::MAX);
-        assert_eq!(i16::from_le_bytes(data16[6..8].try_into().unwrap()), -i16::MAX);
+        assert_eq!(
+            i16::from_le_bytes(data16[4..6].try_into().unwrap()),
+            i16::MAX
+        );
+        assert_eq!(
+            i16::from_le_bytes(data16[6..8].try_into().unwrap()),
+            -i16::MAX
+        );
 
         let i24_wav = encode_all(24, 2, &[0.0, 0.0]);
         let fmt24 = find_chunk(&i24_wav, b"fmt ");
