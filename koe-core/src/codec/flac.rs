@@ -204,7 +204,6 @@ fn build_config(compression_level: u8) -> Result<Verified<config::Encoder>, Code
             encoder.subframe_coding.use_lpc = false;
             encoder.subframe_coding.fixed.max_order = 2;
         },
-        3..=5 => {},
         6..=8 => {
             encoder.subframe_coding.fixed.max_order = 4;
             encoder.subframe_coding.qlpc.lpc_order = 12;
@@ -283,16 +282,6 @@ const fn sanitize_for_pcm(sample: f32) -> f32 {
     }
 }
 
-fn encode_all(
-    level: u8,
-    comments: &OggComments,
-    pcm: &[f32],
-) -> Result<Vec<u8>, CodecError> {
-    let mut encoder = FlacEncoder::with_comments(level, comments)?;
-    encoder.encode(pcm)?;
-    encoder.finalize()
-}
-
 #[cfg(test)]
 mod tests {
     use std::process::Command;
@@ -300,6 +289,16 @@ mod tests {
     use koe_ffi::AudioSourceConfig;
 
     use super::*;
+
+    fn encode_all(
+        level: u8,
+        comments: &OggComments,
+        pcm: &[f32],
+    ) -> Result<Vec<u8>, CodecError> {
+        let mut encoder = FlacEncoder::with_comments(level, comments)?;
+        encoder.encode(pcm)?;
+        encoder.finalize()
+    }
 
     fn sine_stereo(
         frames: usize,
