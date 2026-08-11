@@ -16,7 +16,20 @@ let package = Package(
     targets: [
         .target(
             name: "koe-native",
-            path: "Sources/koe-native"
-        )
+            path: "Sources/koe-native",
+            linkerSettings: [
+                .linkedFramework("ApplicationServices"),
+                .linkedFramework("AudioToolbox"),
+                .linkedFramework("AVFoundation"),
+                .linkedFramework("CoreAudio"),
+                .linkedFramework("ScreenCaptureKit"),
+                .linkedFramework("Speech"),
+            ]
+        ),
+        .testTarget(
+            name: "koe-nativeTests",
+            dependencies: ["koe-native"],
+            path: "Tests/koe-nativeTests"
+        ),
     ]
 )
