@@ -555,9 +555,8 @@ mod tests {
     async fn start_with_denied_permission_fails() {
         install_provider(vec![(Permission::Microphone, PermissionStatus::Denied)]);
         let output = std::env::temp_dir().join("koe-pipeline-denied.wav");
-        let err = match RecordingPipeline::start(test_config(&output)).await {
-            Err(err) => err,
-            Ok(_) => panic!("permission denied"),
+        let Err(err) = RecordingPipeline::start(test_config(&output)).await else {
+            panic!("permission denied");
         };
         assert!(matches!(err, PipelineError::PermissionDenied(_)));
     }
@@ -572,9 +571,8 @@ mod tests {
             bits_per_sample: 32,
         };
 
-        let err = match RecordingPipeline::start(config).await {
-            Err(err) => err,
-            Ok(_) => panic!("disk full"),
+        let Err(err) = RecordingPipeline::start(config).await else {
+            panic!("disk full");
         };
         assert!(matches!(
             err,
