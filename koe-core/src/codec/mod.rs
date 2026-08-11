@@ -1,4 +1,4 @@
-//! Audio encoding abstractions (WAV/FLAC follow-ups in tasks 18–19).
+//! Audio encoding abstractions (FLAC follow-up in task 19).
 
 mod wav;
 
@@ -22,7 +22,11 @@ pub enum CodecError {
     Io(#[from] std::io::Error),
 }
 
-/// Encodes canonical PCM (48 kHz, stereo, interleaved `f32`) into a container.
+/// Encodes canonical PCM into a container.
+///
+/// Input is 48 kHz interleaved `f32`, typically stereo. WAV may be constructed
+/// mono via [`WavEncoder::with_channels`]; the pipeline / [`create_encoder`] path
+/// stays stereo.
 pub trait AudioEncoder: Send {
     /// Encode a chunk of PCM audio.
     ///
