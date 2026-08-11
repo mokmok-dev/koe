@@ -3,11 +3,15 @@ edition.workspace = true
 name = "koe-cli"
 version.workspace = true
 
+[[bin]]
+name = "koe"
+path = "src/main.rs"
+
 [dependencies]
 clap = { workspace = true, features = ["derive"] }
 koe-core = { path = "../koe-core" }
+serde_json = { workspace = true }
 thiserror = { workspace = true }
-tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 
 [lints]
 workspace = true
