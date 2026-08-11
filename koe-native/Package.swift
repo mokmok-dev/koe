@@ -1,6 +1,8 @@
 // swift-tools-version: 5.9
 import PackageDescription
 
+let rustLibSearchPath = "../target/debug"
+
 let package = Package(
   name: "koe-native",
   platforms: [
@@ -15,7 +17,17 @@ let package = Package(
   ],
   targets: [
     .target(
+      name: "KoeFfi",
+      path: "generated",
+      publicHeadersPath: ".",
+      linkerSettings: [
+        .linkedLibrary("koe_ffi"),
+        .unsafeFlags(["-L", rustLibSearchPath], .when(platforms: [.macOS])),
+      ]
+    ),
+    .target(
       name: "koe-native",
+      dependencies: ["KoeFfi"],
       path: "Sources/koe-native",
       linkerSettings: [
         .linkedFramework("ApplicationServices"),
@@ -28,7 +40,7 @@ let package = Package(
     ),
     .testTarget(
       name: "koe-nativeTests",
-      dependencies: ["koe-native"],
+      dependencies: ["koe-native", "KoeFfi"],
       path: "Tests/koe-nativeTests"
     ),
   ]
