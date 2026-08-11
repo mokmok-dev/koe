@@ -1,4 +1,5 @@
 .direnv
 .pre-commit-config.yaml
 koe-native/.build/
+koe-native/generated/
 target

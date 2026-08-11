@@ -1,4 +1,0 @@
-module koe_ffiFFI {
-    header "koe_ffiFFI.h"
-    export *
-}

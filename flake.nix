@@ -33,7 +33,20 @@
           lib,
           ...
         }:
+        let
+          koeFfiBindings = import ./nix/koe-ffi-bindings.nix {
+            inherit lib pkgs;
+            inherit (config) rust-project;
+          };
+        in
         {
+          apps = lib.optionalAttrs pkgs.stdenv.isDarwin {
+            generate-ffi-bindings = {
+              type = "app";
+              program = "${koeFfiBindings.packages.koe-ffi-populate}/bin/populate-koe-ffi-bindings";
+            };
+          };
+
           devShells.default = pkgs.mkShellNoCC {
             inputsFrom = [
               config.pre-commit.devShell
@@ -43,22 +56,28 @@
             packages = lib.optionals pkgs.stdenv.isDarwin [
               pkgs.swift
             ];
+
+            shellHook = koeFfiBindings.devShellHook;
           };
 
-          checks = lib.mapAttrs' (
-            name: crate:
-            let
-              crane-lib = config.rust-project.crane-lib;
-              args = crate.crane.args // {
-                src = config.rust-project.src;
-                pname = name;
-                cargoExtraArgs = "-p ${name}";
-                strictDeps = true;
-              };
-              cargoArtifacts = crane-lib.buildDepsOnly args;
-            in
-            lib.nameValuePair "${name}-test" (crane-lib.cargoTest (args // { inherit cargoArtifacts; }))
-          ) config.rust-project.crates;
+          inherit (koeFfiBindings) packages;
+
+          checks =
+            lib.mapAttrs' (
+              name: crate:
+              let
+                crane-lib = config.rust-project.crane-lib;
+                args = crate.crane.args // {
+                  src = config.rust-project.src;
+                  pname = name;
+                  cargoExtraArgs = "-p ${name}";
+                  strictDeps = true;
+                };
+                cargoArtifacts = crane-lib.buildDepsOnly args;
+              in
+              lib.nameValuePair "${name}-test" (crane-lib.cargoTest (args // { inherit cargoArtifacts; }))
+            ) config.rust-project.crates
+            // koeFfiBindings.checks;
 
           pre-commit.settings = {
             hooks = {
@@ -80,6 +99,9 @@
 
           treefmt = {
             projectRootFile = "flake.nix";
+            settings.global.excludes = [
+              "koe-native/generated/**"
+            ];
             programs = {
               nixfmt.enable = true;
               rustfmt.enable = true;
