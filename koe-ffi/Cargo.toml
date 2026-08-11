@@ -14,5 +14,24 @@ path = "src/bin/uniffi-bindgen.rs"
 thiserror = { workspace = true }
 uniffi = { workspace = true, features = ["cli"] }
 
+[target.'cfg(target_os = "macos")'.dependencies]
+block2 = { workspace = true }
+objc2 = { workspace = true }
+objc2-app-kit = { workspace = true, features = [
+  "NSRunningApplication",
+  "NSWorkspace",
+  "libc",
+] }
+objc2-av-foundation = { workspace = true, features = [
+  "AVCaptureDevice",
+  "AVMediaFormat",
+  "block2",
+] }
+objc2-foundation = { workspace = true, features = [
+  "NSArray",
+  "NSEnumerator",
+  "NSString",
+] }
+
 [lints]
 workspace = true

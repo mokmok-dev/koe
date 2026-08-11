@@ -17,12 +17,29 @@ const fn estimated_bytes_per_hour(format: &OutputFormat) -> u64 {
 }
 
 /// Returns available bytes on the volume containing `path`.
+///
+/// Directories (and existing volume roots) are queried themselves; for files
+/// (including not-yet-created output paths) the parent directory is used.
 fn available_space(path: &Path) -> Result<u64, RecordingError> {
-    let parent = path.parent().filter(|p| !p.as_os_str().is_empty());
-    let check_path = parent.unwrap_or_else(|| Path::new("."));
+    let check_path = if path.is_dir() {
+        path
+    } else {
+        path.parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."))
+    };
     fs2::available_space(check_path).map_err(|err| RecordingError::Internal {
         msg: format!("disk space check failed: {err}"),
     })
+}
+
+/// Reports free space on the volume that contains `path`.
+///
+/// # Errors
+///
+/// Returns [`RecordingError::Internal`] when the filesystem query fails.
+pub fn available_disk_space(path: &Path) -> Result<u64, RecordingError> {
+    available_space(path)
 }
 
 /// Validates that the output volume has enough free space for recording.
@@ -71,5 +88,16 @@ mod tests {
         )
         .expect_err("should fail on insufficient space");
         assert!(matches!(err, RecordingError::InsufficientDiskSpace { .. }));
+    }
+
+    #[test]
+    fn available_disk_space_reports_ok() {
+        available_disk_space(Path::new(".")).expect("current volume should report free space");
+    }
+
+    #[test]
+    fn available_disk_space_accepts_directory_path() {
+        let dir = std::env::temp_dir();
+        available_disk_space(&dir).expect("temp dir volume should report free space");
     }
 }

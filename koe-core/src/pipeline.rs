@@ -27,7 +27,7 @@ use crate::transcript::{TranscriptFormatter, create_formatter};
 
 pub use chunk::AudioChunk;
 pub use consumer::{ConsumerContext, SpeechFeeder, TranscriptionFeeder, spawn_consumer};
-pub use disk_check::check_disk_space;
+pub use disk_check::{available_disk_space, check_disk_space};
 pub use error::PipelineError;
 pub use file_writer::FileWriter;
 /// Progress payload types for [`RecordingPipeline::subscribe_progress`].

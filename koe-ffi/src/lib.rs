@@ -7,6 +7,9 @@ mod handles;
 mod native;
 mod types;
 
+#[cfg(target_os = "macos")]
+mod macos_discovery;
+
 pub use api::{
     check_permission, enumerate_apps, feed_transcription_audio, finalize_transcription,
     pause_recording, request_permission, resume_recording, start_capture, start_recording,
@@ -21,11 +24,21 @@ pub use error::{
     validate_locale, validate_output_path,
 };
 pub use handles::{CaptureHandle, RecordingHandle, TranscriptionHandle};
-pub use native::{NativeProvider, register_native_provider};
+pub use native::{NativeProvider, native_provider_registered, register_native_provider};
 pub use types::{
     AppInfo, AudioSourceConfig, OutputFormat, Permission, PermissionStatus, RecordingState,
     RecordingStatus, TranscriptFormat, TranscriptionSegment,
 };
+
+#[cfg(target_os = "macos")]
+pub use macos_discovery::install_default_native_provider;
+
+/// No-op on non-macOS targets.
+#[cfg(not(target_os = "macos"))]
+#[must_use]
+pub fn install_default_native_provider() -> bool {
+    false
+}
 
 uniffi::setup_scaffolding!();
 
@@ -59,5 +72,11 @@ mod tests {
     #[test]
     fn enumerate_apps_empty_without_provider() {
         assert!(enumerate_apps().is_empty());
+    }
+
+    #[test]
+    fn native_provider_starts_unregistered() {
+        // Other tests in this crate do not register a provider.
+        assert!(!native_provider_registered());
     }
 }

@@ -34,3 +34,13 @@ pub fn register_native_provider(provider: Box<dyn NativeProvider>) {
 pub fn provider() -> Option<Arc<dyn NativeProvider>> {
     NATIVE_PROVIDER.read().ok().and_then(|guard| guard.clone())
 }
+
+/// Returns whether a [`NativeProvider`] has been registered.
+///
+/// CLI and other Rust hosts that do not link `koe-native` can probe this
+/// before calling [`crate::enumerate_apps`] / [`crate::check_permission`],
+/// which otherwise silently degrade to empty / `NotDetermined`.
+#[must_use]
+pub fn native_provider_registered() -> bool {
+    provider().is_some()
+}
