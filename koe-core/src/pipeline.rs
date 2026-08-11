@@ -14,9 +14,10 @@ use std::time::{Duration, Instant};
 
 use koe_ffi::{
     AudioCallback, AudioSourceConfig, OutputFormat, Permission, PermissionStatus, RecordingError,
-    RecordingSummary, TranscriptFormat, TranscriptionCallback, TranscriptionSegment,
-    check_permission, finalize_transcription, start_capture, start_transcription, stop_capture,
-    validate_capture_source, validate_locale, validate_output_path,
+    RecordingStatus, RecordingSummary, TranscriptFormat, TranscriptionCallback,
+    TranscriptionSegment, check_permission, finalize_transcription, start_capture,
+    start_transcription, stop_capture, validate_capture_source, validate_locale,
+    validate_output_path,
 };
 use tokio::sync::{Mutex as AsyncMutex, broadcast};
 use tokio::task::JoinHandle;
@@ -26,7 +27,7 @@ use crate::codec::{AudioEncoder, create_encoder};
 use crate::transcript::{TranscriptFormatter, create_formatter};
 
 pub use chunk::AudioChunk;
-pub use consumer::{ConsumerContext, spawn_consumer};
+pub use consumer::{ConsumerContext, SpeechFeeder, TranscriptionFeeder, spawn_consumer};
 pub use disk_check::check_disk_space;
 pub use error::PipelineError;
 pub use file_writer::FileWriter;
@@ -96,6 +97,7 @@ pub struct RecordingPipeline {
     drop_counter: Arc<std::sync::atomic::AtomicU64>,
     metrics: Arc<PipelineMetrics>,
     segments: Arc<Mutex<Vec<TranscriptionSegment>>>,
+    progress_tx: broadcast::Sender<RecordingStatus>,
 }
 
 struct PipelineAudioCallback {
@@ -214,20 +216,25 @@ impl RecordingPipeline {
 
         let encoder = Arc::new(Mutex::new(encoder));
         let file_writer = Arc::new(AsyncMutex::new(file_writer));
+        let (progress_tx, _) = broadcast::channel(32);
+        let started_at = Instant::now();
 
         let consumer_ctx = ConsumerContext {
             encoder: Arc::clone(&encoder),
-            transcription: Arc::clone(&transcription_handle),
+            speech: Arc::new(TranscriptionFeeder::new(Arc::clone(&transcription_handle))),
             writer: Arc::clone(&file_writer),
             metrics: Arc::clone(&metrics),
             shutdown: Arc::clone(&shutdown),
+            paused: Arc::clone(&paused),
+            progress_tx: progress_tx.clone(),
+            started_at,
         };
         let consumer_task = spawn_consumer(audio_tx.subscribe(), consumer_ctx);
 
         Ok(Self {
             config,
             state: PipelineState::Recording {
-                start_time: Instant::now(),
+                start_time: started_at,
                 bytes_written: 0,
                 segments: Vec::new(),
             },
@@ -243,6 +250,7 @@ impl RecordingPipeline {
             drop_counter,
             metrics,
             segments,
+            progress_tx,
         })
     }
 
@@ -383,6 +391,12 @@ impl RecordingPipeline {
     #[must_use]
     pub const fn capture_handle(&self) -> Option<&Arc<koe_ffi::CaptureHandle>> {
         self.capture_handle.as_ref()
+    }
+
+    /// Subscribes to consumer progress updates for CLI/GUI surfaces.
+    #[must_use]
+    pub fn subscribe_progress(&self) -> broadcast::Receiver<RecordingStatus> {
+        self.progress_tx.subscribe()
     }
 }
 
