@@ -22,9 +22,20 @@ final class KoeNativeTests: XCTestCase {
     XCTAssertNotNil(analyzer)
   }
 
-  func testScreenCaptureInitialization() {
-    let capture = ScreenAudioCapture(bundleID: "com.example.app")
+  func testScreenAudioCaptureInitialization() {
+    // Stream setup requires Screen Recording permission (interactive), so only
+    // verify construction and the value type used to deliver chunks.
+    let capture = ScreenAudioCapture()
     XCTAssertNotNil(capture)
+
+    let buffer = ScreenAudioCapture.AudioBuffer(
+      samples: [0.0, 0.0],
+      frameCount: 1,
+      timestampMilliseconds: 123
+    )
+    XCTAssertEqual(buffer.frameCount, 1)
+    XCTAssertEqual(buffer.samples.count, 2)
+    XCTAssertEqual(buffer.timestampMilliseconds, 123)
   }
 
   func testProcessEnumeratorEmpty() {
