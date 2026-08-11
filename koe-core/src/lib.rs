@@ -7,5 +7,5 @@ pub mod transcript;
 
 pub use pipeline::{
     AudioChunk, FileWriter, PipelineConfig, PipelineError, PipelineMetrics,
-    PipelineMetricsSnapshot, PipelineState, RecordingPipeline,
+    PipelineMetricsSnapshot, PipelineState, RecordingPipeline, RecordingState, RecordingStatus,
 };
