@@ -3,7 +3,10 @@
 use std::sync::Arc;
 
 use crate::callbacks::{AudioCallbackRef, ProgressCallbackRef, TranscriptionCallbackRef};
-use crate::error::{CaptureError, RecordingError, RecordingSummary, TranscriptionError};
+use crate::error::{
+    CaptureError, RecordingError, RecordingSummary, TranscriptionError, validate_capture_source,
+    validate_locale, validate_output_path,
+};
 use crate::handles::{CaptureHandle, RecordingHandle, TranscriptionHandle};
 use crate::native;
 use crate::types::{AppInfo, AudioSourceConfig, OutputFormat, Permission, PermissionStatus};
@@ -36,6 +39,7 @@ pub fn start_capture(
     source: AudioSourceConfig,
     callback: AudioCallbackRef,
 ) -> Result<Arc<CaptureHandle>, CaptureError> {
+    validate_capture_source(&source)?;
     Ok(Arc::new(CaptureHandle::new(source, callback)))
 }
 
@@ -51,6 +55,7 @@ pub fn start_transcription(
     locale: String,
     callback: TranscriptionCallbackRef,
 ) -> Result<Arc<TranscriptionHandle>, TranscriptionError> {
+    validate_locale(&locale)?;
     Ok(Arc::new(TranscriptionHandle::new(locale, callback)))
 }
 
@@ -81,6 +86,9 @@ pub fn start_recording(
     progress_callback: ProgressCallbackRef,
 ) -> Result<Arc<RecordingHandle>, RecordingError> {
     let _ = (format, enable_aec, comfort_noise);
+    validate_capture_source(&source)?;
+    validate_locale(&locale)?;
+    validate_output_path(&output_path)?;
     Ok(Arc::new(RecordingHandle::new(
         source,
         output_path,
