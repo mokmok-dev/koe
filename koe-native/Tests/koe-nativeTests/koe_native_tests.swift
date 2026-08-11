@@ -18,8 +18,15 @@ final class KoeNativeTests: XCTestCase {
   }
 
   func testSpeechAnalyzerInitialization() throws {
-    let analyzer = try SpeechAnalyzerBridge(locale: "en-US")
-    XCTAssertNotNil(analyzer)
+    do {
+      let analyzer = try SpeechAnalyzerBridge(locale: "en-US")
+      XCTAssertNotNil(analyzer)
+      XCTAssertFalse(SpeechAnalyzerBridge.supportedLocales.isEmpty)
+    } catch let error as SpeechAnalyzerBridge.Error {
+      guard case .recognizerUnavailable = error else {
+        return XCTFail("unexpected error \(error)")
+      }
+    }
   }
 
   func testScreenCaptureInitialization() {
