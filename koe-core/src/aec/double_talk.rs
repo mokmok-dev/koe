@@ -46,3 +46,25 @@ impl GeigelDetector {
         false
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn triggers_above_threshold_and_holds_hangover() {
+        let mut d = GeigelDetector::from_db(6.0); // ≈ 2.0×
+        assert!(!d.is_double_talk(0.5, 1.0)); // 0.5 < 2.0
+        assert!(d.is_double_talk(2.1, 1.0)); // 2.1 > 2.0
+        // Hangover keeps freeze even when mic drops.
+        assert!(d.is_double_talk(0.0, 1.0));
+    }
+
+    #[test]
+    fn reset_clears_hangover() {
+        let mut d = GeigelDetector::from_db(6.0);
+        assert!(d.is_double_talk(3.0, 1.0));
+        d.reset();
+        assert!(!d.is_double_talk(0.5, 1.0));
+    }
+}

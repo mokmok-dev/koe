@@ -1,4 +1,20 @@
 //! Acoustic echo cancellation (NLMS + Geigel double-talk + comfort noise).
+//!
+//! # Examples
+//!
+//! ```
+//! use koe_core::{AcousticEchoCanceller, AecConfig};
+//!
+//! let mut aec = AcousticEchoCanceller::new(AecConfig {
+//!     comfort_noise: false,
+//!     ..AecConfig::default()
+//! });
+//! let far = vec![0.1_f32; 256];
+//! let near = vec![0.05_f32; 256];
+//! let clean = aec.process_block(&far, &near);
+//! assert_eq!(clean.len(), 256);
+//! let _ = aec.erle();
+//! ```
 
 mod comfort;
 mod double_talk;
@@ -9,16 +25,22 @@ use double_talk::GeigelDetector;
 use nlms::NlmsFilter;
 
 /// Configuration for the echo canceller.
-#[derive(Debug, Clone)]
+///
+/// Timings quoted in field docs assume the pipeline's canonical 48 kHz rate.
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct AecConfig {
     /// Adaptive filter length in taps (~85 ms at 48 kHz when 4096).
-    pub filter_length: usize,
-    /// Preferred processing block size in samples (~5.3 ms when 256).
     ///
-    /// [`AcousticEchoCanceller::process_block`] accepts any equal-length pair;
-    /// this field documents the latency target for callers.
+    /// Values of `0` are clamped to `1` when constructing the canceller.
+    pub filter_length: usize,
+    /// Recommended capture block size in samples (~5.3 ms at 48 kHz when 256).
+    ///
+    /// Ignored at runtime — [`AcousticEchoCanceller::process_block`] accepts any
+    /// equal-length pair. Kept so callers can share a latency target.
     pub block_size: usize,
     /// NLMS step size (μ), normalized by far-end power.
+    ///
+    /// Non-finite or negative values are clamped to `0.0` (adaptation off).
     pub step_size: f32,
     /// Double-talk detection threshold in dB above far-end peak.
     pub double_talk_threshold_db: f32,
@@ -38,7 +60,33 @@ impl Default for AecConfig {
     }
 }
 
+impl AecConfig {
+    /// Returns a copy with unsafe / empty values clamped to usable defaults.
+    #[must_use]
+    pub fn sanitized(&self) -> Self {
+        Self {
+            filter_length: self.filter_length.max(1),
+            block_size: self.block_size.max(1),
+            step_size: if self.step_size.is_finite() {
+                self.step_size.max(0.0)
+            } else {
+                0.0
+            },
+            double_talk_threshold_db: if self.double_talk_threshold_db.is_finite() {
+                self.double_talk_threshold_db
+            } else {
+                6.0
+            },
+            comfort_noise: self.comfort_noise,
+        }
+    }
+}
+
 /// Acoustic echo canceller: removes far-end leakage from the near-end mic.
+///
+/// Operates on mono (or caller-downmixed) `f32` PCM. Process each channel
+/// separately if you need stereo cancellation.
+#[derive(Debug)]
 pub struct AcousticEchoCanceller {
     config: AecConfig,
     filter: NlmsFilter,
@@ -53,10 +101,19 @@ pub struct AcousticEchoCanceller {
     far_power: f32,
 }
 
+impl Default for AcousticEchoCanceller {
+    fn default() -> Self {
+        Self::new(AecConfig::default())
+    }
+}
+
 impl AcousticEchoCanceller {
     /// Creates a new echo canceller with the given configuration.
+    ///
+    /// The stored config is [`AecConfig::sanitized`].
     #[must_use]
     pub fn new(config: AecConfig) -> Self {
+        let config = config.sanitized();
         let filter = NlmsFilter::new(config.filter_length, config.step_size);
         let detector = GeigelDetector::from_db(config.double_talk_threshold_db);
         let comfort = ComfortNoise::new(config.comfort_noise);
@@ -74,22 +131,31 @@ impl AcousticEchoCanceller {
 
     /// Processes one block of far-end (reference) and near-end (mic) audio.
     ///
-    /// Returns echo-cancelled near-end samples. Length equals
-    /// `far_end.len().min(near_end.len())`. Channels are the caller's
-    /// responsibility — pass one channel (or a downmix) per call.
+    /// Returns echo-cancelled near-end samples with the same length as the
+    /// inputs. Channels are the caller's responsibility — pass one channel
+    /// (or a downmix) per call.
+    ///
+    /// Returns an empty vector (and logs an error) when `far_end` and
+    /// `near_end` have different lengths — mismatched buffers are a caller
+    /// bug and must not silently drift.
     #[must_use]
     pub fn process_block(
         &mut self,
         far_end: &[f32],
         near_end: &[f32],
     ) -> Vec<f32> {
-        let len = far_end.len().min(near_end.len());
-        let mut out = Vec::with_capacity(len);
+        if far_end.len() != near_end.len() {
+            log::error!(
+                "AEC process_block length mismatch: far={}, near={}",
+                far_end.len(),
+                near_end.len()
+            );
+            return Vec::new();
+        }
 
-        for i in 0..len {
-            let far = far_end[i];
-            let near = near_end[i];
+        let mut out = Vec::with_capacity(far_end.len());
 
+        for (&far, &near) in far_end.iter().zip(near_end.iter()) {
             self.comfort.observe_near(near);
             self.far_power = 0.01f32.mul_add(far * far, 0.99 * self.far_power);
 
@@ -102,8 +168,10 @@ impl AcousticEchoCanceller {
                 self.filter.adapt(error);
             }
 
-            // Echo-only: far-end is active and Geigel did not see near-end speech.
-            let echo_only = !double_talk && self.far_power > 1e-6;
+            // Echo-only: far-end active, no double-talk, residual near the floor.
+            let floor = self.comfort.noise_floor().max(1e-4);
+            let echo_only =
+                !double_talk && self.far_power > 1e-6 && error.abs() <= 4.0 * floor;
             let sample = self.comfort.maybe_mix(error, echo_only);
             out.push(sample);
 
@@ -135,13 +203,13 @@ impl AcousticEchoCanceller {
         self.erle_db
     }
 
-    /// Active configuration.
+    /// Active (sanitized) configuration.
     #[must_use]
     pub const fn config(&self) -> &AecConfig {
         &self.config
     }
 
-    /// Current comfort-noise floor estimate.
+    /// Current comfort-noise floor estimate as a linear amplitude (not dB).
     #[must_use]
     pub const fn noise_floor(&self) -> f32 {
         self.comfort.noise_floor()
@@ -211,6 +279,23 @@ mod tests {
         assert!((cfg.step_size - 0.01).abs() < f32::EPSILON);
         assert!((cfg.double_talk_threshold_db - 6.0).abs() < f32::EPSILON);
         assert!(cfg.comfort_noise);
+    }
+
+    #[test]
+    fn sanitized_clamps_empty_filter_and_bad_step() {
+        let cfg = AecConfig {
+            filter_length: 0,
+            step_size: f32::NAN,
+            ..AecConfig::default()
+        }
+        .sanitized();
+        assert_eq!(cfg.filter_length, 1);
+        assert!((cfg.step_size - 0.0).abs() < f32::EPSILON);
+        let aec = AcousticEchoCanceller::new(AecConfig {
+            filter_length: 0,
+            ..AecConfig::default()
+        });
+        assert_eq!(aec.config().filter_length, 1);
     }
 
     #[test]
@@ -363,18 +448,18 @@ mod tests {
         let base = AecConfig {
             filter_length: 32,
             block_size: 16,
-            step_size: 0.01,
+            step_size: 0.5,
             double_talk_threshold_db: 6.0,
             comfort_noise: false,
         };
-        let mut silent = AcousticEchoCanceller::new(base.clone());
+        let mut silent = AcousticEchoCanceller::new(base);
         let mut noisy = AcousticEchoCanceller::new(AecConfig {
             comfort_noise: true,
             ..base
         });
 
-        // Converge both, then compare echo-only residual with/without noise.
-        let far = sine(2_048, 400.0, 16_000.0, 0.4);
+        // Converge both so residual sits near the noise floor (echo-only gate).
+        let far = sine(4_096, 400.0, 16_000.0, 0.4);
         let near = apply_echo(&far, 4, 0.5);
         for (f, n) in far.chunks(16).zip(near.chunks(16)) {
             let _ = silent.process_block(f, n);
@@ -394,7 +479,7 @@ mod tests {
     }
 
     #[test]
-    fn mismatched_lengths_process_common_prefix() {
+    fn mismatched_lengths_return_empty() {
         let mut aec = AcousticEchoCanceller::new(AecConfig {
             filter_length: 16,
             block_size: 8,
@@ -402,6 +487,6 @@ mod tests {
             ..AecConfig::default()
         });
         let out = aec.process_block(&[0.1, 0.2, 0.3], &[0.1, 0.2]);
-        assert_eq!(out.len(), 2);
+        assert!(out.is_empty());
     }
 }
