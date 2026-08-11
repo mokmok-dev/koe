@@ -13,6 +13,7 @@ screen-audio = []
 system-audio = []
 
 [dependencies]
+flacenc = { workspace = true }
 fs2 = { workspace = true }
 koe-ffi = { path = "../koe-ffi" }
 log = { workspace = true }

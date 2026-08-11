@@ -5,6 +5,7 @@ resolver = "3"
 [workspace.dependencies]
 block2 = "0.6"
 clap = "4.6.6"
+flacenc = { version = "0.5.1", default-features = false }
 fs2 = "0.4"
 log = "0.4"
 objc2 = "0.6"
