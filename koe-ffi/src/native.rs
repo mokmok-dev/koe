@@ -1,6 +1,6 @@
 //! Swift-side native provider registration and delegation.
 
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, RwLock};
 
 use crate::types::{AppInfo, Permission, PermissionStatus};
 
@@ -18,17 +18,19 @@ pub trait NativeProvider: Send + Sync {
     fn enumerate_apps(&self) -> Vec<AppInfo>;
 }
 
-static NATIVE_PROVIDER: OnceLock<Arc<dyn NativeProvider>> = OnceLock::new();
+static NATIVE_PROVIDER: RwLock<Option<Arc<dyn NativeProvider>>> = RwLock::new(None);
 
 /// Registers the Swift implementation of macOS framework calls.
 ///
 /// Must be called once before any other FFI entry point that touches native
-/// APIs. Safe to call multiple times; only the first registration is kept.
+/// APIs. Later registrations replace the previous provider (used in tests).
 #[uniffi::export]
 pub fn register_native_provider(provider: Box<dyn NativeProvider>) {
-    let _ = NATIVE_PROVIDER.set(Arc::from(provider));
+    if let Ok(mut guard) = NATIVE_PROVIDER.write() {
+        *guard = Some(Arc::from(provider));
+    }
 }
 
-pub fn provider() -> Option<&'static Arc<dyn NativeProvider>> {
-    NATIVE_PROVIDER.get()
+pub fn provider() -> Option<Arc<dyn NativeProvider>> {
+    NATIVE_PROVIDER.read().ok().and_then(|guard| guard.clone())
 }

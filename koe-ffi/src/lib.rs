@@ -16,7 +16,10 @@ pub use callbacks::{
     AudioCallback, AudioCallbackRef, ProgressCallback, ProgressCallbackRef, TranscriptionCallback,
     TranscriptionCallbackRef,
 };
-pub use error::{CaptureError, RecordingError, RecordingSummary, TranscriptionError};
+pub use error::{
+    CaptureError, RecordingError, RecordingSummary, TranscriptionError, validate_capture_source,
+    validate_locale, validate_output_path,
+};
 pub use handles::{CaptureHandle, RecordingHandle, TranscriptionHandle};
 pub use native::{NativeProvider, register_native_provider};
 pub use types::{

@@ -13,10 +13,18 @@ screen-audio = []
 system-audio = []
 
 [dependencies]
+fs2 = { workspace = true }
 koe-ffi = { path = "../koe-ffi" }
 log = { workspace = true }
 thiserror = { workspace = true }
-tokio = { workspace = true, features = ["macros", "rt-multi-thread", "sync"] }
+tokio = { workspace = true, features = [
+  "fs",
+  "io-util",
+  "macros",
+  "rt-multi-thread",
+  "sync",
+  "time",
+] }
 
 [lints]
 workspace = true
