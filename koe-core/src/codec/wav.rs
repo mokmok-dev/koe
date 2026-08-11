@@ -89,7 +89,8 @@ impl AudioEncoder for WavEncoder {
         pcm: &[f32],
     ) -> Result<Vec<u8>, CodecError> {
         for sample in pcm {
-            self.pcm_bytes.extend_from_slice(&self.quantize_sample(*sample));
+            self.pcm_bytes
+                .extend_from_slice(&self.quantize_sample(*sample));
         }
         Ok(Vec::new())
     }
@@ -99,9 +100,8 @@ impl AudioEncoder for WavEncoder {
             return Ok(Vec::new());
         }
         self.header_written = true;
-        let data_size = u32::try_from(self.pcm_bytes.len()).map_err(|_| {
-            CodecError::Encoder("WAV payload exceeds u32::MAX".to_owned())
-        })?;
+        let data_size = u32::try_from(self.pcm_bytes.len())
+            .map_err(|_| CodecError::Encoder("WAV payload exceeds u32::MAX".to_owned()))?;
         let mut out = self.build_header(data_size);
         out.append(&mut self.pcm_bytes);
         Ok(out)

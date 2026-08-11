@@ -49,9 +49,7 @@ pub fn check_disk_space(
     }
 
     if available < needed.saturating_mul(2) {
-        log::warn!(
-            "Low disk space: {available} bytes available, {needed} bytes estimated needed"
-        );
+        log::warn!("Low disk space: {available} bytes available, {needed} bytes estimated needed");
     }
 
     Ok(())
@@ -66,13 +64,12 @@ mod tests {
         let tmp = std::env::temp_dir().join("koe-disk-check-test.ogg");
         let err = check_disk_space(
             &tmp,
-            &OutputFormat::Wav { bits_per_sample: 32 },
+            &OutputFormat::Wav {
+                bits_per_sample: 32,
+            },
             Some(1_000_000.0),
         )
         .expect_err("should fail on insufficient space");
-        assert!(matches!(
-            err,
-            RecordingError::InsufficientDiskSpace { .. }
-        ));
+        assert!(matches!(err, RecordingError::InsufficientDiskSpace { .. }));
     }
 }

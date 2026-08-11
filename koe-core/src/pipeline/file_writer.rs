@@ -37,9 +37,9 @@ impl FileWriter {
         data: &[u8],
     ) -> Result<(), std::io::Error> {
         self.file.write_all(data).await?;
-        self.bytes_written = self.bytes_written.saturating_add(
-            u64::try_from(data.len()).unwrap_or(u64::MAX),
-        );
+        self.bytes_written = self
+            .bytes_written
+            .saturating_add(u64::try_from(data.len()).unwrap_or(u64::MAX));
         Ok(())
     }
 

@@ -13,20 +13,20 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use koe_ffi::{
-    check_permission, finalize_transcription, start_capture, start_transcription, stop_capture,
-    validate_capture_source, validate_locale, validate_output_path, AudioCallback,
-    AudioSourceConfig, OutputFormat, Permission, PermissionStatus, RecordingError,
+    AudioCallback, AudioSourceConfig, OutputFormat, Permission, PermissionStatus, RecordingError,
     RecordingSummary, TranscriptFormat, TranscriptionCallback, TranscriptionSegment,
+    check_permission, finalize_transcription, start_capture, start_transcription, stop_capture,
+    validate_capture_source, validate_locale, validate_output_path,
 };
-use tokio::sync::{broadcast, Mutex as AsyncMutex};
+use tokio::sync::{Mutex as AsyncMutex, broadcast};
 use tokio::task::JoinHandle;
 
 use crate::aec::{AcousticEchoCanceller, AecConfig};
-use crate::codec::{create_encoder, AudioEncoder};
-use crate::transcript::{create_formatter, TranscriptFormatter};
+use crate::codec::{AudioEncoder, create_encoder};
+use crate::transcript::{TranscriptFormatter, create_formatter};
 
 pub use chunk::AudioChunk;
-pub use consumer::{spawn_consumer, ConsumerContext};
+pub use consumer::{ConsumerContext, spawn_consumer};
 pub use disk_check::check_disk_space;
 pub use error::PipelineError;
 pub use file_writer::FileWriter;
@@ -192,10 +192,8 @@ impl RecordingPipeline {
             transcript: Arc::clone(&transcript),
             metrics: Arc::clone(&metrics),
         };
-        let transcription_handle = start_transcription(
-            config.locale.clone(),
-            Box::new(transcription_callback),
-        )?;
+        let transcription_handle =
+            start_transcription(config.locale.clone(), Box::new(transcription_callback))?;
 
         let (audio_tx, _audio_rx) = broadcast::channel(64);
         let audio_callback = PipelineAudioCallback {
@@ -205,8 +203,7 @@ impl RecordingPipeline {
         };
         let capture_handle = start_capture(config.source.clone(), Box::new(audio_callback))?;
 
-        let aec = if matches!(config.source, AudioSourceConfig::Both { .. }) && config.enable_aec
-        {
+        let aec = if matches!(config.source, AudioSourceConfig::Both { .. }) && config.enable_aec {
             Some(AcousticEchoCanceller::new(AecConfig {
                 comfort_noise: config.comfort_noise,
                 ..AecConfig::default()
@@ -270,9 +267,10 @@ impl RecordingPipeline {
         }
 
         let trailer = {
-            let mut encoder = self.encoder.lock().map_err(|_| {
-                PipelineError::InvalidState("encoder lock poisoned".to_owned())
-            })?;
+            let mut encoder = self
+                .encoder
+                .lock()
+                .map_err(|_| PipelineError::InvalidState("encoder lock poisoned".to_owned()))?;
             encoder.finalize()?
         };
 
@@ -437,7 +435,7 @@ mod tests {
     use std::path::Path;
 
     use koe_ffi::{
-        register_native_provider, AppInfo, NativeProvider, Permission, PermissionStatus,
+        AppInfo, NativeProvider, Permission, PermissionStatus, register_native_provider,
     };
 
     use super::*;

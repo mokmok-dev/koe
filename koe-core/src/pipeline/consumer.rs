@@ -4,15 +4,15 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use koe_ffi::TranscriptionHandle;
-use tokio::sync::{broadcast, Mutex as AsyncMutex};
+use tokio::sync::{Mutex as AsyncMutex, broadcast};
 use tokio::task::JoinHandle;
 
 use crate::codec::AudioEncoder;
 
+use super::PipelineError;
 use super::chunk::AudioChunk;
 use super::file_writer::FileWriter;
 use super::metrics::PipelineMetrics;
-use super::PipelineError;
 
 /// Shared state passed into the consumer task.
 pub struct ConsumerContext {
@@ -63,9 +63,10 @@ async fn process_chunk(
         .record_frames(u64::try_from(chunk.frame_count).unwrap_or(0));
 
     let encoded = {
-        let mut encoder = ctx.encoder.lock().map_err(|_| {
-            PipelineError::InvalidState("encoder lock poisoned".to_owned())
-        })?;
+        let mut encoder = ctx
+            .encoder
+            .lock()
+            .map_err(|_| PipelineError::InvalidState("encoder lock poisoned".to_owned()))?;
         encoder.encode(&chunk.samples)?
     };
 

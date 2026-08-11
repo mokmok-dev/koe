@@ -1,7 +1,7 @@
 //! Pipeline runtime metrics.
 
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 /// Internal metrics collected during a recording session.
 #[derive(Debug, Default)]
@@ -37,8 +37,7 @@ impl PipelineMetrics {
 
     /// Increments the transcript segment counter.
     pub fn record_segment(&self) {
-        self.speech_segment_count
-            .fetch_add(1, Ordering::Relaxed);
+        self.speech_segment_count.fetch_add(1, Ordering::Relaxed);
     }
 
     /// Snapshot of current counter values.

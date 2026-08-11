@@ -52,9 +52,7 @@ pub trait AudioEncoder: Send {
 /// Returns [`CodecError`] when the format is unsupported.
 pub fn create_encoder(format: &OutputFormat) -> Result<Box<dyn AudioEncoder>, CodecError> {
     match format {
-        OutputFormat::Wav { bits_per_sample } => {
-            Ok(Box::new(WavEncoder::new(*bits_per_sample)?))
-        },
+        OutputFormat::Wav { bits_per_sample } => Ok(Box::new(WavEncoder::new(*bits_per_sample)?)),
         OutputFormat::Ogg { quality } => Ok(Box::new(PlaceholderEncoder::ogg(*quality))),
         OutputFormat::Flac { compression_level } => {
             Ok(Box::new(PlaceholderEncoder::flac(*compression_level)))
