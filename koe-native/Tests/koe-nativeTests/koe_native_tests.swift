@@ -20,15 +20,18 @@ final class KoeNativeTests: XCTestCase {
 
   func testFfiEnumerateApps() {
     let apps = enumerateApps()
-    XCTAssertEqual(apps, ProcessEnumerator.enumerateApps().map { app in
-      AppInfo(
-        pid: app.pid,
-        name: app.name,
-        bundleId: app.bundleID,
-        hasAudio: app.hasAudio
-      )
-    })
+    XCTAssertEqual(
+      apps,
+      ProcessEnumerator.enumerateApps().map { app in
+        AppInfo(
+          pid: app.pid,
+          name: app.name,
+          bundleId: app.bundleID,
+          hasAudio: app.hasAudio
+        )
+      })
   }
+
   func testAudioTapRejectsUnknownProcess() {
     // PID 0 has no audio object; tap creation must fail cleanly.
     XCTAssertThrowsError(try AudioTap(pid: 0)) { error in
