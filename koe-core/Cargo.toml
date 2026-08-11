@@ -13,6 +13,7 @@ screen-audio = []
 system-audio = []
 
 [dependencies]
+flacenc = { workspace = true }
 fs2 = { workspace = true }
 koe-ffi = { path = "../koe-ffi" }
 log = { workspace = true }
@@ -25,7 +26,6 @@ tokio = { workspace = true, features = [
   "sync",
   "time",
 ] }
-flacenc = { workspace = true }
 vorbis_rs = { workspace = true, optional = true }
 
 [lints]
