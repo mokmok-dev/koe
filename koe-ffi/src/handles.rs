@@ -3,7 +3,7 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::callbacks::{AudioCallbackRef, ProgressCallbackRef, TranscriptionCallbackRef};
-use crate::types::AudioSourceConfig;
+use crate::types::{AudioSourceConfig, RecordingStatus, TranscriptionSegment};
 
 static NEXT_HANDLE_ID: AtomicU64 = AtomicU64::new(1);
 
@@ -32,6 +32,21 @@ impl CaptureHandle {
     }
 }
 
+#[uniffi::export]
+impl CaptureHandle {
+    /// Forwards a PCM chunk to the registered [`crate::AudioCallback`].
+    ///
+    /// Called by the native capture bridge. Must stay non-blocking: the
+    /// callback implementation should only enqueue work.
+    pub fn deliver_audio(
+        &self,
+        pcm: Vec<f32>,
+        timestamp_ms: u64,
+    ) {
+        self.callback.on_audio(pcm, timestamp_ms);
+    }
+}
+
 /// Active speech transcription session.
 #[derive(uniffi::Object)]
 pub struct TranscriptionHandle {
@@ -50,6 +65,25 @@ impl TranscriptionHandle {
             locale,
             callback,
         }
+    }
+}
+
+#[uniffi::export]
+impl TranscriptionHandle {
+    /// Forwards a transcript segment to the registered callback.
+    pub fn deliver_segment(
+        &self,
+        segment: TranscriptionSegment,
+    ) {
+        self.callback.on_segment(segment);
+    }
+
+    /// Forwards a transcription failure to the registered callback.
+    pub fn deliver_error(
+        &self,
+        error: String,
+    ) {
+        self.callback.on_error(error);
     }
 }
 
@@ -78,5 +112,182 @@ impl RecordingHandle {
             locale,
             progress_callback,
         }
+    }
+}
+
+#[uniffi::export]
+impl RecordingHandle {
+    /// Forwards a progress status update to the registered callback.
+    pub fn deliver_status(
+        &self,
+        status: RecordingStatus,
+    ) {
+        self.progress_callback.on_status(status);
+    }
+
+    /// Forwards a live transcript segment to the registered callback.
+    pub fn deliver_segment(
+        &self,
+        segment: TranscriptionSegment,
+    ) {
+        self.progress_callback.on_segment(segment);
+    }
+
+    /// Forwards a recording-session error to the registered callback.
+    pub fn deliver_error(
+        &self,
+        error: String,
+    ) {
+        self.progress_callback.on_error(error);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::{Arc, Mutex};
+
+    use super::*;
+    use crate::callbacks::{AudioCallback, ProgressCallback, TranscriptionCallback};
+    use crate::types::RecordingState;
+
+    type AudioCalls = Arc<Mutex<Vec<(Vec<f32>, u64)>>>;
+    type SegmentLog = Arc<Mutex<Vec<TranscriptionSegment>>>;
+    type StatusLog = Arc<Mutex<Vec<RecordingStatus>>>;
+    type ErrorLog = Arc<Mutex<Vec<String>>>;
+
+    struct MockAudio {
+        calls: AudioCalls,
+    }
+
+    impl AudioCallback for MockAudio {
+        fn on_audio(
+            &self,
+            pcm: Vec<f32>,
+            timestamp_ms: u64,
+        ) {
+            self.calls.lock().expect("lock").push((pcm, timestamp_ms));
+        }
+    }
+
+    struct MockTranscription {
+        segments: SegmentLog,
+        errors: ErrorLog,
+    }
+
+    impl TranscriptionCallback for MockTranscription {
+        fn on_segment(
+            &self,
+            segment: TranscriptionSegment,
+        ) {
+            self.segments.lock().expect("lock").push(segment);
+        }
+
+        fn on_error(
+            &self,
+            error: String,
+        ) {
+            self.errors.lock().expect("lock").push(error);
+        }
+    }
+
+    struct MockProgress {
+        statuses: StatusLog,
+        errors: ErrorLog,
+    }
+
+    impl ProgressCallback for MockProgress {
+        fn on_status(
+            &self,
+            status: RecordingStatus,
+        ) {
+            self.statuses.lock().expect("lock").push(status);
+        }
+
+        fn on_segment(
+            &self,
+            _segment: TranscriptionSegment,
+        ) {
+        }
+
+        fn on_error(
+            &self,
+            error: String,
+        ) {
+            self.errors.lock().expect("lock").push(error);
+        }
+    }
+
+    #[test]
+    fn deliver_audio_preserves_pcm_and_monotonic_timestamps() {
+        let calls: AudioCalls = Arc::new(Mutex::new(Vec::new()));
+        let handle = CaptureHandle::new(
+            AudioSourceConfig::Microphone,
+            Box::new(MockAudio {
+                calls: Arc::clone(&calls),
+            }),
+        );
+
+        handle.deliver_audio(vec![0.1, -0.1], 10);
+        handle.deliver_audio(vec![0.2, -0.2], 20);
+
+        let recorded = calls.lock().expect("lock").clone();
+        assert_eq!(recorded.len(), 2);
+        assert_eq!(recorded[0].0, vec![0.1, -0.1]);
+        assert_eq!(recorded[0].1, 10);
+        assert_eq!(recorded[1].0, vec![0.2, -0.2]);
+        assert_eq!(recorded[1].1, 20);
+        assert!(recorded[0].1 < recorded[1].1);
+    }
+
+    #[test]
+    fn deliver_transcription_segment_and_error() {
+        let segments: SegmentLog = Arc::new(Mutex::new(Vec::new()));
+        let errors: ErrorLog = Arc::new(Mutex::new(Vec::new()));
+        let handle = TranscriptionHandle::new(
+            "en-US".into(),
+            Box::new(MockTranscription {
+                segments: Arc::clone(&segments),
+                errors: Arc::clone(&errors),
+            }),
+        );
+
+        handle.deliver_segment(TranscriptionSegment {
+            text: "hello".into(),
+            start_ms: 0,
+            end_ms: 100,
+            is_final: true,
+            confidence: 0.9,
+        });
+        handle.deliver_error("boom".into());
+
+        assert_eq!(segments.lock().expect("lock").len(), 1);
+        assert_eq!(errors.lock().expect("lock").as_slice(), ["boom"]);
+    }
+
+    #[test]
+    fn deliver_progress_status_and_error() {
+        let statuses: StatusLog = Arc::new(Mutex::new(Vec::new()));
+        let errors: ErrorLog = Arc::new(Mutex::new(Vec::new()));
+        let handle = RecordingHandle::new(
+            AudioSourceConfig::Microphone,
+            "/tmp/out.ogg".into(),
+            "en-US".into(),
+            Box::new(MockProgress {
+                statuses: Arc::clone(&statuses),
+                errors: Arc::clone(&errors),
+            }),
+        );
+
+        handle.deliver_status(RecordingStatus {
+            elapsed_ms: 42,
+            bytes_written: 100,
+            level_left: 0.1,
+            level_right: 0.2,
+            state: RecordingState::Recording,
+        });
+        handle.deliver_error("disk".into());
+
+        assert_eq!(statuses.lock().expect("lock").len(), 1);
+        assert_eq!(errors.lock().expect("lock").as_slice(), ["disk"]);
     }
 }

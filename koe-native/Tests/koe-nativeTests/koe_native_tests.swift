@@ -178,10 +178,79 @@ final class KoeNativeTests: XCTestCase {
       }
     }
   }
+
+  func testAudioCallbackReceivesPcmAndMonotonicTimestamps() throws {
+    let callback = RecordingAudioCallback()
+    let handle = try startCapture(source: .microphone, callback: callback)
+
+    handle.deliverAudio(pcm: [0.1, -0.1], timestampMs: 10)
+    handle.deliverAudio(pcm: [0.2, -0.2], timestampMs: 20)
+    stopCapture(handle: handle)
+
+    XCTAssertEqual(callback.calls.count, 2)
+    XCTAssertEqual(callback.calls[0].pcm, [0.1, -0.1])
+    XCTAssertEqual(callback.calls[0].timestampMs, 10)
+    XCTAssertEqual(callback.calls[1].pcm, [0.2, -0.2])
+    XCTAssertEqual(callback.calls[1].timestampMs, 20)
+    XCTAssertLessThan(callback.calls[0].timestampMs, callback.calls[1].timestampMs)
+  }
+
+  func testAudioCallbackRetainedForHandleLifetime() throws {
+    let callback = RecordingAudioCallback()
+    let handle = try startCapture(source: .microphone, callback: callback)
+
+    // Handle must retain the callback across the FFI boundary for the session.
+    handle.deliverAudio(pcm: [0.5, -0.5], timestampMs: 5)
+    XCTAssertEqual(callback.calls.count, 1)
+    XCTAssertEqual(callback.calls[0].pcm, [0.5, -0.5])
+
+    stopCapture(handle: handle)
+  }
+
+  func testProgressCallbackReceivesStatus() throws {
+    let callback = RecordingProgressCallback()
+    let handle = try startRecording(
+      source: .microphone,
+      outputPath: "/tmp/koe-test.ogg",
+      locale: "en-US",
+      format: .ogg(quality: 0.5),
+      enableAec: false,
+      comfortNoise: false,
+      progressCallback: callback
+    )
+
+    handle.deliverStatus(
+      status: RecordingStatus(
+        elapsedMs: 42,
+        bytesWritten: 100,
+        levelLeft: 0.1,
+        levelRight: 0.2,
+        state: .recording
+      )
+    )
+    _ = try stopRecording(handle: handle)
+
+    XCTAssertEqual(callback.statuses.count, 1)
+    XCTAssertEqual(callback.statuses[0].elapsedMs, 42)
+    XCTAssertEqual(callback.statuses[0].state, .recording)
+  }
 }
 
 private final class NoopAudioCallback: AudioCallback {
   func onAudio(pcm: [Float], timestampMs: UInt64) {}
+}
+
+private final class RecordingAudioCallback: AudioCallback {
+  struct Call {
+    let pcm: [Float]
+    let timestampMs: UInt64
+  }
+
+  private(set) var calls: [Call] = []
+
+  func onAudio(pcm: [Float], timestampMs: UInt64) {
+    calls.append(Call(pcm: pcm, timestampMs: timestampMs))
+  }
 }
 
 private final class NoopTranscriptionCallback: TranscriptionCallback {
@@ -191,6 +260,17 @@ private final class NoopTranscriptionCallback: TranscriptionCallback {
 
 private final class NoopProgressCallback: ProgressCallback {
   func onStatus(status: RecordingStatus) {}
+  func onSegment(segment: TranscriptionSegment) {}
+  func onError(error: String) {}
+}
+
+private final class RecordingProgressCallback: ProgressCallback {
+  private(set) var statuses: [RecordingStatus] = []
+
+  func onStatus(status: RecordingStatus) {
+    statuses.append(status)
+  }
+
   func onSegment(segment: TranscriptionSegment) {}
   func onError(error: String) {}
 }
