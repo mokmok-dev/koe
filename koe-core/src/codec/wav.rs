@@ -17,8 +17,20 @@ const WAVE_FORMAT_IEEE_FLOAT: u16 = 3;
 
 /// Writes interleaved `f32` PCM into a RIFF/WAVE container.
 ///
-/// Canonical input is 48 kHz stereo; use [`WavEncoder::with_channels`] for mono.
-/// Bit depth `32` means IEEE float; `16` / `24` mean little-endian integer PCM.
+/// Canonical pipeline input is 48 kHz stereo. Use [`WavEncoder::with_channels`] for
+/// mono test fixtures; [`crate::codec::create_encoder`] always builds stereo because
+/// [`OutputFormat::Wav`] carries bit depth only — call [`AudioEncoder::channel_count`]
+/// for the active layout.
+///
+/// Bit depth `32` means IEEE float (`WAVE_FORMAT_IEEE_FLOAT`); `16` / `24` mean
+/// little-endian integer PCM. Integer paths clamp samples to `[-1.0, 1.0]` (NaN/Inf →
+/// silence). Float samples are stored as-is except NaN/Inf → `0.0`.
+///
+/// # Memory
+///
+/// All PCM is buffered until [`AudioEncoder::finalize`]; `encode` always returns an
+/// empty `Vec` for WAV. Prefer OGG/FLAC for long sessions (also avoids the 4 GiB
+/// RIFF limit).
 pub struct WavEncoder {
     bits_per_sample: u16,
     channel_count: u16,
@@ -39,6 +51,10 @@ impl WavEncoder {
     }
 
     /// Creates a WAV encoder with an explicit channel count (`1` or `2`).
+    ///
+    /// Prefer [`Self::new`] for production paths; mono is mainly for fixtures.
+    /// [`OutputFormat::Wav`] does not encode channel count, so
+    /// [`crate::codec::create_encoder`] cannot reconstruct a mono instance.
     ///
     /// # Errors
     ///
@@ -83,20 +99,25 @@ impl WavEncoder {
         sample: f32,
         out: &mut Vec<u8>,
     ) {
-        let clamped = sample.clamp(-1.0, 1.0);
         match bits_per_sample {
             16 => {
+                let finite = sanitize_for_pcm(sample);
                 #[allow(clippy::cast_possible_truncation)]
-                let value = (clamped * f32::from(i16::MAX)) as i16;
+                let value = (finite * f32::from(i16::MAX)) as i16;
                 out.extend_from_slice(&value.to_le_bytes());
             },
             24 => {
+                let finite = sanitize_for_pcm(sample);
                 #[allow(clippy::cast_possible_truncation)]
-                let value = (clamped * 8_388_607.0) as i32;
+                let value = (finite * 8_388_607.0) as i32;
                 let bytes = value.to_le_bytes();
                 out.extend_from_slice(&bytes[..3]);
             },
-            32 => out.extend_from_slice(&clamped.to_le_bytes()),
+            32 => {
+                // IEEE float WAV allows peaks outside [-1, 1]; only scrub non-finite.
+                let value = if sample.is_finite() { sample } else { 0.0 };
+                out.extend_from_slice(&value.to_le_bytes());
+            },
             _ => unreachable!("bit depth validated in constructor"),
         }
     }
@@ -104,15 +125,18 @@ impl WavEncoder {
     fn build_header(
         &self,
         data_size: u32,
-    ) -> Vec<u8> {
+    ) -> Result<Vec<u8>, CodecError> {
         let bytes_per_sample = u32::from(self.bits_per_sample / 8);
         let channels = u32::from(self.channel_count);
         let byte_rate = SAMPLE_RATE * channels * bytes_per_sample;
         let block_align = self.channel_count * (self.bits_per_sample / 8);
+        let riff_size = RIFF_SIZE_OVERHEAD.checked_add(data_size).ok_or_else(|| {
+            CodecError::Encoder("WAV RIFF size exceeds u32::MAX".to_owned())
+        })?;
 
         let mut header = Vec::with_capacity(HEADER_LEN);
         header.extend_from_slice(b"RIFF");
-        header.extend_from_slice(&(RIFF_SIZE_OVERHEAD + data_size).to_le_bytes());
+        header.extend_from_slice(&riff_size.to_le_bytes());
         header.extend_from_slice(b"WAVE");
 
         header.extend_from_slice(b"fmt ");
@@ -132,7 +156,7 @@ impl WavEncoder {
         header.extend_from_slice(b"data");
         header.extend_from_slice(&data_size.to_le_bytes());
         debug_assert_eq!(header.len(), HEADER_LEN);
-        header
+        Ok(header)
     }
 
     fn ensure_riff_capacity(
@@ -154,6 +178,15 @@ impl WavEncoder {
             ));
         }
         Ok(())
+    }
+}
+
+/// Clamp finite samples to `[-1, 1]` for integer PCM; non-finite → silence.
+fn sanitize_for_pcm(sample: f32) -> f32 {
+    if sample.is_finite() {
+        sample.clamp(-1.0, 1.0)
+    } else {
+        0.0
     }
 }
 
@@ -203,20 +236,22 @@ impl AudioEncoder for WavEncoder {
 
     fn finalize(&mut self) -> Result<Vec<u8>, CodecError> {
         if self.finished {
+            // Idempotent flush (matches OGG): second call yields an empty trailer.
             return Ok(Vec::new());
         }
-        self.finished = true;
 
         let data_size = u32::try_from(self.pcm_bytes.len())
             .map_err(|_| CodecError::Encoder("WAV payload exceeds u32::MAX".to_owned()))?;
         self.ensure_riff_capacity(0)?;
 
-        let mut out = self.build_header(data_size);
+        let mut out = self.build_header(data_size)?;
         out.append(&mut self.pcm_bytes);
+        self.finished = true;
         Ok(out)
     }
 
     fn format(&self) -> OutputFormat {
+        // Channel count is not part of `OutputFormat::Wav`; see `channel_count()`.
         OutputFormat::Wav {
             bits_per_sample: self.bits_per_sample,
         }
@@ -308,6 +343,8 @@ mod tests {
         assert_eq!(read_u16(fmt, 0), WAVE_FORMAT_IEEE_FLOAT);
         assert_eq!(read_u16(fmt, 2), 2);
         assert_eq!(read_u32(fmt, 4), SAMPLE_RATE);
+        assert_eq!(read_u32(fmt, 8), SAMPLE_RATE * 2 * 4); // byte rate
+        assert_eq!(read_u16(fmt, 12), 8); // block align: 2 ch * 4 bytes
         assert_eq!(read_u16(fmt, 14), 32);
 
         let fact = find_chunk(&wav, b"fact");
@@ -338,6 +375,14 @@ mod tests {
     }
 
     #[test]
+    fn float_preserves_peaks_outside_unit_range() {
+        let wav = encode_all(32, 1, &[1.5]);
+        let data = find_chunk(&wav, b"data");
+        let value = f32::from_le_bytes(data[0..4].try_into().unwrap());
+        assert!((value - 1.5).abs() < f32::EPSILON);
+    }
+
+    #[test]
     fn mono_input_writes_one_channel_fmt() {
         let wav = encode_all(32, 1, &sine(100, 1, 220.0));
         let fmt = find_chunk(&wav, b"fmt ");
@@ -363,6 +408,17 @@ mod tests {
         let out = encoder.finalize().unwrap();
         assert!(out.len() > HEADER_LEN);
         assert!(encoder.finalize().unwrap().is_empty());
+        let err = encoder.encode(&[0.0, 0.0]).expect_err("after finalize");
+        assert!(err.to_string().contains("finalized"));
+    }
+
+    #[test]
+    fn empty_recording_still_writes_valid_header() {
+        let mut encoder = WavEncoder::new(16).expect("encoder");
+        let wav = encoder.finalize().expect("finalize");
+        assert_eq!(wav.len(), HEADER_LEN);
+        assert_eq!(read_u32(find_chunk(&wav, b"fact"), 0), 0);
+        assert!(find_chunk(&wav, b"data").is_empty());
     }
 
     #[test]
