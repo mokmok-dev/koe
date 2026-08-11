@@ -4,8 +4,30 @@ import XCTest
 @testable import koe_native
 
 final class KoeNativeTests: XCTestCase {
+  override func setUp() {
+    super.setUp()
+    KoeFfiBootstrap.install()
+  }
+
   func testKoeFfiAdd() {
     XCTAssertEqual(add(left: 2, right: 2), 4)
+  }
+
+  func testFfiCheckPermission() {
+    let status = checkPermission(permission: .microphone)
+    XCTAssertEqual(status, .notDetermined)
+  }
+
+  func testFfiEnumerateApps() {
+    let apps = enumerateApps()
+    XCTAssertEqual(apps, ProcessEnumerator.enumerateApps().map { app in
+      AppInfo(
+        pid: app.pid,
+        name: app.name,
+        bundleId: app.bundleID,
+        hasAudio: app.hasAudio
+      )
+    })
   }
   func testAudioTapRejectsUnknownProcess() {
     // PID 0 has no audio object; tap creation must fail cleanly.

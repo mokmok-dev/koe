@@ -11,6 +11,7 @@ name = "uniffi-bindgen"
 path = "src/bin/uniffi-bindgen.rs"
 
 [dependencies]
+thiserror = { workspace = true }
 uniffi = { workspace = true, features = ["cli"] }
 
 [lints]
