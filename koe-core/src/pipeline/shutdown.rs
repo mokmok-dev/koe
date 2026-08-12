@@ -289,7 +289,7 @@ mod tests {
 
     use super::*;
     use crate::codec::{AudioEncoder, CodecError};
-    use crate::pipeline::{PipelineConfig, PipelineState};
+    use crate::pipeline::{NullMonitor, PipelineConfig, PipelineState};
 
     struct TestProvider {
         permissions: Vec<(Permission, PermissionStatus)>,
@@ -615,6 +615,7 @@ mod tests {
             progress_tx,
             started_at: Arc::new(Mutex::new(StdInstant::now())),
             bytes_written: Arc::new(AtomicU64::new(0)),
+            monitor: Arc::new(NullMonitor),
         };
         let task = spawn_consumer(rx, ctx);
 
