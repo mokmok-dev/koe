@@ -21,11 +21,12 @@ pub use koe_ffi::RecordingSummary;
 
 /// Discovery, permission, and transcription entry points used by `koe-cli` (and GUI).
 pub use koe_ffi::{
-    AppInfo, AudioSourceConfig, OutputFormat, Permission, PermissionStatus, TranscriptFormat,
-    TranscriptionCallback, TranscriptionError, TranscriptionHandle, TranscriptionSegment,
-    check_permission, enumerate_apps, feed_transcription_audio, finalize_transcription,
+    AppInfo, AudioDeviceInfo, AudioSourceConfig, OutputFormat, Permission, PermissionStatus,
+    TranscriptFormat, TranscriptionCallback, TranscriptionError, TranscriptionHandle,
+    TranscriptionSegment, check_permission, default_input_device, default_output_device,
+    enumerate_apps, feed_transcription_audio, finalize_transcription,
     install_default_native_provider, native_provider_registered, start_transcription,
-    validate_locale,
+    supported_speech_locales, validate_locale,
 };
 
 /// Transcript formatters and path helpers for CLI/GUI output.

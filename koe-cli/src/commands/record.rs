@@ -372,18 +372,16 @@ fn list_sources() -> Result<(), MainError> {
 }
 
 fn list_locales() {
-    // OS-backed locale enumeration is not exported on NativeProvider yet.
-    // Print the common on-device set documented for Speech framework hosts.
-    println!("Supported locales (common on-device set; OS list not bridged yet):");
-    for locale in COMMON_SPEECH_LOCALES {
+    let locales = koe_core::supported_speech_locales();
+    if locales.is_empty() {
+        println!("Supported locales: (none reported on this host)");
+        return;
+    }
+    println!("Supported locales:");
+    for locale in locales {
         println!("  {locale}");
     }
 }
-
-const COMMON_SPEECH_LOCALES: &[&str] = &[
-    "en-US", "en-GB", "en-AU", "en-CA", "en-IN", "ja-JP", "zh-CN", "zh-TW", "zh-HK", "ko-KR",
-    "fr-FR", "fr-CA", "de-DE", "es-ES", "es-MX", "it-IT", "pt-BR", "pt-PT", "ru-RU", "ar-SA",
-];
 
 async fn run_recording(prepared: PreparedSession) -> Result<(), MainError> {
     let output_path = prepared.config.output_path.clone();

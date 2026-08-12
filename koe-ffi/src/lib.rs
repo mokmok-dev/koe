@@ -9,6 +9,8 @@ mod types;
 
 #[cfg(target_os = "macos")]
 mod macos_discovery;
+#[cfg(target_os = "macos")]
+mod macos_system;
 
 pub use api::{
     check_permission, enumerate_apps, feed_monitor, feed_transcription_audio,
@@ -27,18 +29,43 @@ pub use error::{
 pub use handles::{CaptureHandle, MonitorHandle, RecordingHandle, TranscriptionHandle};
 pub use native::{NativeProvider, native_provider_registered, register_native_provider};
 pub use types::{
-    AppInfo, AudioSourceConfig, OutputFormat, Permission, PermissionStatus, RecordingState,
-    RecordingStatus, TranscriptFormat, TranscriptionSegment,
+    AppInfo, AudioDeviceInfo, AudioSourceConfig, OutputFormat, Permission, PermissionStatus,
+    RecordingState, RecordingStatus, TranscriptFormat, TranscriptionSegment,
 };
 
 #[cfg(target_os = "macos")]
 pub use macos_discovery::install_default_native_provider;
+#[cfg(target_os = "macos")]
+pub use macos_system::{
+    default_input_device, default_output_device, supported_speech_locales,
+};
 
 /// No-op on non-macOS targets.
 #[cfg(not(target_os = "macos"))]
 #[must_use]
 pub const fn install_default_native_provider() -> bool {
     false
+}
+
+/// No default input device outside macOS.
+#[cfg(not(target_os = "macos"))]
+#[must_use]
+pub const fn default_input_device() -> Option<AudioDeviceInfo> {
+    None
+}
+
+/// No default output device outside macOS.
+#[cfg(not(target_os = "macos"))]
+#[must_use]
+pub const fn default_output_device() -> Option<AudioDeviceInfo> {
+    None
+}
+
+/// Speech locale enumeration requires the Speech framework (macOS only).
+#[cfg(not(target_os = "macos"))]
+#[must_use]
+pub const fn supported_speech_locales() -> Vec<String> {
+    Vec::new()
 }
 
 uniffi::setup_scaffolding!();
@@ -88,5 +115,12 @@ mod tests {
         let handle = start_monitor().expect("start");
         feed_monitor(Arc::clone(&handle), vec![0.1, -0.1, 0.2, -0.2]).expect("feed");
         stop_monitor(handle);
+    }
+
+    #[test]
+    fn system_queries_degrade_without_macos() {
+        assert!(default_input_device().is_none());
+        assert!(default_output_device().is_none());
+        assert!(supported_speech_locales().is_empty());
     }
 }

@@ -1,8 +1,4 @@
 //! `koe info` — system / build diagnostics.
-//!
-//! Works without a registered `NativeProvider`. Device and speech-locale
-//! fields stay deferred until those queries are exported on the native bridge
-//! and the CLI links/registers it.
 
 use std::env::consts::{ARCH, OS};
 use std::fmt::Write as _;
@@ -10,7 +6,10 @@ use std::path::PathBuf;
 use std::process::Command;
 
 use clap::Parser;
-use koe_core::{available_disk_space, enabled_features};
+use koe_core::{
+    AudioDeviceInfo, available_disk_space, default_input_device, default_output_device,
+    enabled_features, supported_speech_locales,
+};
 use serde_json::json;
 
 use super::Run;
@@ -43,6 +42,9 @@ struct SystemInfo {
     macos_version: Option<String>,
     disk_check_path: String,
     disk_space_bytes: Option<u64>,
+    default_input_device: Option<AudioDeviceInfo>,
+    default_output_device: Option<AudioDeviceInfo>,
+    supported_locales: Vec<String>,
 }
 
 impl Run for InfoArgs {
@@ -75,6 +77,9 @@ fn collect_system_info() -> SystemInfo {
         macos_version: macos_version(),
         disk_check_path,
         disk_space_bytes,
+        default_input_device: default_input_device(),
+        default_output_device: default_output_device(),
+        supported_locales: supported_speech_locales(),
     }
 }
 
@@ -115,6 +120,12 @@ fn format_info_text(info: &SystemInfo) -> String {
     if let Some(version) = &info.macos_version {
         let _ = writeln!(out, "  macOS version:   {version}");
     }
+    format_device_line(&mut out, "Default input:", info.default_input_device.as_ref());
+    format_device_line(
+        &mut out,
+        "Default output:",
+        info.default_output_device.as_ref(),
+    );
     match info.disk_space_bytes {
         Some(bytes) => {
             let _ = writeln!(
@@ -132,10 +143,31 @@ fn format_info_text(info: &SystemInfo) -> String {
             );
         },
     }
-    out.push_str(
-        "\n  Note: default audio devices and supported speech locales are not on\n  NativeProvider yet (list/permissions use the in-process macOS provider).\n",
-    );
+    if info.supported_locales.is_empty() {
+        out.push_str("  Locales:         (none reported)\n");
+    } else {
+        let _ = writeln!(
+            out,
+            "  Locales:         {}",
+            info.supported_locales.join(", ")
+        );
+    }
     out
+}
+
+fn format_device_line(
+    out: &mut String,
+    label: &str,
+    device: Option<&AudioDeviceInfo>,
+) {
+    match device {
+        Some(device) => {
+            let _ = writeln!(out, "  {label:<16} {} ({})", device.name, device.uid);
+        },
+        None => {
+            let _ = writeln!(out, "  {label:<16} unavailable");
+        },
+    }
 }
 
 fn format_info_json(info: &SystemInfo) -> Result<String, MainError> {
@@ -146,11 +178,18 @@ fn format_info_json(info: &SystemInfo) -> Result<String, MainError> {
         "macos_version": info.macos_version,
         "disk_check_path": info.disk_check_path,
         "disk_space_bytes": info.disk_space_bytes,
-        "default_input_device": null,
-        "default_output_device": null,
-        "supported_locales": null,
+        "default_input_device": info.default_input_device.as_ref().map(device_json),
+        "default_output_device": info.default_output_device.as_ref().map(device_json),
+        "supported_locales": info.supported_locales,
     });
     Ok(serde_json::to_string_pretty(&payload)?)
+}
+
+fn device_json(device: &AudioDeviceInfo) -> serde_json::Value {
+    json!({
+        "name": device.name,
+        "uid": device.uid,
+    })
 }
 
 fn format_bytes(bytes: u64) -> String {
@@ -183,17 +222,29 @@ mod tests {
             macos_version: Some("15.5.0".into()),
             disk_check_path: "/Users/test/Movies".into(),
             disk_space_bytes: Some(5 * 1024 * 1024 * 1024),
+            default_input_device: Some(AudioDeviceInfo {
+                name: "MacBook Pro Microphone".into(),
+                uid: "BuiltInMicrophoneDevice".into(),
+            }),
+            default_output_device: Some(AudioDeviceInfo {
+                name: "MacBook Pro Speakers".into(),
+                uid: "BuiltInSpeakerDevice".into(),
+            }),
+            supported_locales: vec!["en-US".into(), "ja-JP".into()],
         }
     }
 
     fn sparse_info() -> SystemInfo {
         SystemInfo {
             version: "0.0.0".into(),
-            host: "aarch64-macos".into(),
+            host: "aarch64-linux".into(),
             features: vec!["cli"],
             macos_version: None,
             disk_check_path: "/tmp".into(),
             disk_space_bytes: None,
+            default_input_device: None,
+            default_output_device: None,
+            supported_locales: vec![],
         }
     }
 
@@ -206,7 +257,12 @@ mod tests {
         assert!(text.contains("15.5.0"));
         assert!(text.contains("5.0 GiB"));
         assert!(text.contains("/Users/test/Movies"));
-        assert!(text.contains("NativeProvider"));
+        assert!(text.contains("MacBook Pro Microphone"));
+        assert!(text.contains("BuiltInMicrophoneDevice"));
+        assert!(text.contains("MacBook Pro Speakers"));
+        assert!(text.contains("BuiltInSpeakerDevice"));
+        assert!(text.contains("en-US, ja-JP"));
+        assert!(!text.contains("NativeProvider"));
         assert!(!text.contains("tasks beyond"));
     }
 
@@ -215,10 +271,13 @@ mod tests {
         let text = format_info_text(&sparse_info());
         assert!(!text.contains("macOS version:"));
         assert!(text.contains("Disk space:      unavailable (/tmp)"));
+        assert!(text.contains("Default input:   unavailable"));
+        assert!(text.contains("Default output:  unavailable"));
+        assert!(text.contains("Locales:         (none reported)"));
     }
 
     #[test]
-    fn json_includes_stable_deferred_keys() {
+    fn json_includes_devices_and_locales() {
         let json = format_info_json(&sample_info()).expect("json");
         let value: serde_json::Value = serde_json::from_str(&json).expect("parse");
         assert_eq!(value["version"], "0.0.0");
@@ -226,9 +285,15 @@ mod tests {
         assert_eq!(value["macos_version"], "15.5.0");
         assert_eq!(value["disk_check_path"], "/Users/test/Movies");
         assert_eq!(value["disk_space_bytes"], 5_368_709_120_u64);
-        assert!(value["default_input_device"].is_null());
-        assert!(value["default_output_device"].is_null());
-        assert_eq!(value["supported_locales"], json!(null));
+        assert_eq!(
+            value["default_input_device"],
+            json!({"name": "MacBook Pro Microphone", "uid": "BuiltInMicrophoneDevice"})
+        );
+        assert_eq!(
+            value["default_output_device"],
+            json!({"name": "MacBook Pro Speakers", "uid": "BuiltInSpeakerDevice"})
+        );
+        assert_eq!(value["supported_locales"], json!(["en-US", "ja-JP"]));
         assert!(
             value["features"]
                 .as_array()
@@ -244,6 +309,9 @@ mod tests {
         assert!(value["macos_version"].is_null());
         assert!(value["disk_space_bytes"].is_null());
         assert_eq!(value["disk_check_path"], "/tmp");
+        assert!(value["default_input_device"].is_null());
+        assert!(value["default_output_device"].is_null());
+        assert_eq!(value["supported_locales"], json!([]));
     }
 
     #[test]
