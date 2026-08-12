@@ -31,13 +31,13 @@ use std::sync::{Arc, OnceLock, Weak};
 use std::time::{Duration, Instant};
 
 use block2::RcBlock;
-use objc2::rc::Retained;
 use objc2::AnyThread;
+use objc2::rc::Retained;
 use objc2_avf_audio::{AVAudioCommonFormat, AVAudioFormat, AVAudioPCMBuffer};
-use objc2_foundation::{NSLocale, NSOperationQueue, NSString, NSError};
+use objc2_foundation::{NSError, NSLocale, NSOperationQueue, NSString};
 use objc2_speech::{
-    SFSpeechAudioBufferRecognitionRequest, SFSpeechRecognitionResult,
-    SFSpeechRecognizer, SFSpeechRecognizerAuthorizationStatus, SFSpeechRecognitionTask,
+    SFSpeechAudioBufferRecognitionRequest, SFSpeechRecognitionResult, SFSpeechRecognitionTask,
+    SFSpeechRecognizer, SFSpeechRecognizerAuthorizationStatus,
 };
 
 use crate::error::TranscriptionError;
@@ -225,11 +225,10 @@ impl SpeechSession {
 
         // Locale validation happens before engine probing so an unknown locale
         // reports `UnsupportedLocale`, not a confusing engine error.
-        let recognizer = make_recognizer(locale).ok_or_else(|| {
-            TranscriptionError::UnsupportedLocale {
+        let recognizer =
+            make_recognizer(locale).ok_or_else(|| TranscriptionError::UnsupportedLocale {
                 locale: locale.to_owned(),
-            }
-        })?;
+            })?;
         let engine = probe_engine(&recognizer);
         if engine == Engine::Unavailable {
             return Err(TranscriptionError::NotAvailable);
@@ -287,9 +286,7 @@ impl SpeechSession {
     /// concurrent [`SpeechSession::feed`] (e.g. a live recorder feeding on a
     /// worker thread while the owner finalizes) never blocks on this thread's
     /// 20 s wait.
-    pub fn start_finalize(
-        &mut self,
-    ) -> Option<Receiver<SessionOutcome>> {
+    pub fn start_finalize(&mut self) -> Option<Receiver<SessionOutcome>> {
         let receiver = self.completion.take()?;
         // SAFETY: both calls are documented for use when audio input ends.
         unsafe {
@@ -537,8 +534,12 @@ mod tests {
 
     #[test]
     fn dictation_disabled_is_recoverable() {
-        assert!(is_recoverable_engine_error("Siri and Dictation are disabled"));
-        assert!(is_recoverable_engine_error("Dictation is not available for this language"));
+        assert!(is_recoverable_engine_error(
+            "Siri and Dictation are disabled"
+        ));
+        assert!(is_recoverable_engine_error(
+            "Dictation is not available for this language"
+        ));
         assert!(is_recoverable_engine_error(
             "on-device speech recognition is unavailable"
         ));
