@@ -184,7 +184,12 @@ impl ProgressRenderer for TtyRenderer {
         &mut self,
         segment: &TranscriptionSegment,
     ) {
-        let text = truncate_display(&segment.text, SEGMENT_TEXT_DISPLAY_CHARS);
+        let max_chars = if segment.is_final {
+            usize::MAX
+        } else {
+            SEGMENT_TEXT_DISPLAY_CHARS
+        };
+        let text = truncate_display(&segment.text, max_chars);
         let line = format_segment_line(self.meta.source_tag, segment.start_ms, &text);
         if segment.is_final {
             // Commit the segment as a permanent line above the live block.
