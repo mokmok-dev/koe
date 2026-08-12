@@ -43,13 +43,10 @@ pub trait CaptureSession: Send {
 /// Stubbed capture (`set_capture_stub` / `KOE_STUB_CAPTURE`) never reaches
 /// here: [`crate::start_capture`] returns a handle without a native session.
 pub fn start_session(handle: Arc<CaptureHandle>) -> Result<Box<dyn CaptureSession>, CaptureError> {
-    match &handle.source {
+    match handle.source.clone() {
         AudioSourceConfig::Microphone => microphone::start(handle),
-        AudioSourceConfig::PidAudio { pid } => process_tap::start(*pid, handle),
-        AudioSourceConfig::AppAudio { bundle_id } => {
-            let bundle_id = bundle_id.clone();
-            screen_audio::start(&bundle_id, handle)
-        },
+        AudioSourceConfig::PidAudio { pid } => process_tap::start(pid, handle),
+        AudioSourceConfig::AppAudio { bundle_id } => screen_audio::start(&bundle_id, handle),
         AudioSourceConfig::Both { .. } => Err(CaptureError::Internal {
             msg: "Both must be split by RecordingPipeline into AppAudio + Microphone".to_owned(),
         }),
