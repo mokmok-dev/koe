@@ -222,9 +222,7 @@ mod tests {
     #[test]
     fn create_monitor_enabled_uses_ffi_stub() {
         let monitor = create_monitor(true).expect("create");
-        monitor
-            .write(&[0.1, -0.1, 0.2, -0.2])
-            .expect("write");
+        monitor.write(&[0.1, -0.1, 0.2, -0.2]).expect("write");
         monitor.stop();
         // Second stop is a no-op for FfiMonitor.
         monitor.stop();

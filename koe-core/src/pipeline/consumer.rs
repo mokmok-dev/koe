@@ -553,8 +553,7 @@ mod tests {
         );
         let task = spawn_consumer(rx, ctx);
 
-        tx.send(AudioChunk::new(vec![0.1, -0.1], 20))
-            .expect("send");
+        tx.send(AudioChunk::new(vec![0.1, -0.1], 20)).expect("send");
         tokio::time::sleep(Duration::from_millis(30)).await;
         shutdown.store(true, Ordering::Relaxed);
         drop(tx);
