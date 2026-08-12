@@ -133,7 +133,10 @@ impl Run for RecordArgs {
         }
 
         let prepared = prepare_session(&self)?;
-        let runtime = tokio::runtime::Builder::new_multi_thread()
+        // Keep async work on the CLI main thread so ScreenCaptureKit start/stop
+        // can pump the AppKit main runloop (multi-thread runtimes call stop on
+        // worker threads, leaving SCStream active after the session ends).
+        let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
             .map_err(|err| MainError::Internal(format!("tokio runtime: {err}")))?;

@@ -131,6 +131,9 @@ impl RecordingPipeline {
 
         // Dropping capture handles drops producers so the consumer / mixer
         // unblock even if no more audio arrives.
+        //
+        // ScreenCaptureKit teardown must run on the main thread with the main
+        // runloop pumped (see `screen_audio::ScreenAudioSession::stop`).
         for handle in self.capture_handles.drain(..) {
             stop_capture(handle);
         }
