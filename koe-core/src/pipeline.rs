@@ -6,6 +6,7 @@ mod disk_check;
 mod error;
 mod file_writer;
 mod metrics;
+mod shutdown;
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -14,9 +15,8 @@ use std::time::{Duration, Instant};
 
 use koe_ffi::{
     AudioCallback, AudioSourceConfig, OutputFormat, Permission, PermissionStatus, RecordingError,
-    RecordingSummary, TranscriptFormat, TranscriptionCallback, TranscriptionSegment,
-    check_permission, finalize_transcription, start_capture, start_transcription, stop_capture,
-    validate_capture_source, validate_locale, validate_output_path,
+    TranscriptFormat, TranscriptionCallback, TranscriptionSegment, check_permission, start_capture,
+    start_transcription, validate_capture_source, validate_locale, validate_output_path,
 };
 use tokio::sync::{Mutex as AsyncMutex, broadcast};
 use tokio::task::JoinHandle;
@@ -33,6 +33,7 @@ pub use file_writer::FileWriter;
 /// Progress payload types for [`RecordingPipeline::subscribe_progress`].
 pub use koe_ffi::{RecordingState, RecordingStatus};
 pub use metrics::{PipelineMetrics, PipelineMetricsSnapshot};
+pub use shutdown::{FORCE_JOIN_BUDGET, SHUTDOWN_BUDGET, ShutdownMode, StopResult};
 
 /// Configuration for a recording session.
 #[derive(Debug, Clone)]
@@ -275,92 +276,6 @@ impl RecordingPipeline {
         })
     }
 
-    /// Stops capture, drains remaining audio, finalizes outputs, and returns a summary.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`PipelineError`] when shutdown or finalization fails.
-    pub async fn stop(&mut self) -> Result<RecordingSummary, PipelineError> {
-        self.shutdown.store(true, Ordering::Relaxed);
-        self.publish_status(RecordingState::Stopping, 0.0, 0.0);
-
-        if let Some(handle) = self.capture_handle.take() {
-            stop_capture(handle);
-        }
-
-        if let Some(task) = self.consumer_task.take() {
-            match task.await {
-                Ok(Ok(())) => {},
-                Ok(Err(err)) => return Err(err),
-                Err(err) => {
-                    return Err(PipelineError::InvalidState(format!(
-                        "consumer task join failed: {err}"
-                    )));
-                },
-            }
-        }
-
-        if let Some(handle) = self.transcription_handle.take() {
-            finalize_transcription(handle);
-        }
-
-        let trailer = {
-            let mut encoder = self
-                .encoder
-                .lock()
-                .map_err(|_| PipelineError::InvalidState("encoder lock poisoned".to_owned()))?;
-            encoder.finalize()?
-        };
-
-        let bytes_written = {
-            let mut writer = self.file_writer.lock().await;
-            if !trailer.is_empty() {
-                let written = u64::try_from(trailer.len()).unwrap_or(u64::MAX);
-                writer.write(&trailer).await?;
-                self.bytes_written.fetch_add(written, Ordering::Relaxed);
-            }
-            writer.flush().await?;
-            writer.bytes_written()
-        };
-        self.bytes_written.store(bytes_written, Ordering::Relaxed);
-
-        if let Some(transcript_path) = &self.config.transcript_output_path {
-            let body = {
-                let transcript = self.transcript_fmt.lock().map_err(|_| {
-                    PipelineError::InvalidState("transcript lock poisoned".to_owned())
-                })?;
-                transcript.committed_output()
-            };
-            tokio::fs::write(transcript_path, body).await?;
-        }
-
-        let duration_sec = match &self.state {
-            PipelineState::Recording { start_time, .. } => start_time.elapsed().as_secs_f64(),
-            PipelineState::Paused {
-                elapsed_before_pause,
-                ..
-            } => elapsed_before_pause.as_secs_f64(),
-            _ => 0.0,
-        };
-
-        let segment_count = self
-            .segments
-            .lock()
-            .map_err(|_| PipelineError::InvalidState("segments lock poisoned".to_owned()))?
-            .len();
-
-        self.state = PipelineState::Stopped;
-        self.publish_status(RecordingState::Stopped, 0.0, 0.0);
-
-        Ok(RecordingSummary {
-            duration_sec,
-            bytes_written,
-            transcript_segment_count: u64::try_from(segment_count).unwrap_or(u64::MAX),
-            dropped_audio_frames: self.drop_counter.load(Ordering::Relaxed),
-            format: self.config.audio_format.clone(),
-        })
-    }
-
     /// Pauses audio production while keeping the native tap alive.
     pub fn pause(&mut self) {
         if let PipelineState::Recording {
@@ -431,6 +346,12 @@ impl RecordingPipeline {
     #[must_use]
     pub const fn capture_handle(&self) -> Option<&Arc<koe_ffi::CaptureHandle>> {
         self.capture_handle.as_ref()
+    }
+
+    /// Transcription handle for test injection of segments.
+    #[must_use]
+    pub const fn transcription_handle(&self) -> Option<&Arc<koe_ffi::TranscriptionHandle>> {
+        self.transcription_handle.as_ref()
     }
 
     /// Subscribes to recording progress for CLI/GUI surfaces.
