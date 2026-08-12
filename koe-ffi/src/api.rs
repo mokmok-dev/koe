@@ -33,20 +33,33 @@ pub fn enumerate_apps() -> Vec<AppInfo> {
     native::provider().map_or_else(Vec::new, |provider| provider.enumerate_apps())
 }
 
-#[allow(clippy::missing_errors_doc)]
+#[allow(clippy::missing_errors_doc, clippy::needless_pass_by_value)]
 #[uniffi::export]
 pub fn start_capture(
     source: AudioSourceConfig,
     callback: AudioCallbackRef,
 ) -> Result<Arc<CaptureHandle>, CaptureError> {
     validate_capture_source(&source)?;
-    Ok(Arc::new(CaptureHandle::new(source, callback)))
+    let handle = Arc::new(CaptureHandle::new(source.clone(), callback));
+    #[cfg(target_os = "macos")]
+    {
+        let session = crate::macos_capture::start_session(&source, Arc::clone(&handle))?;
+        handle.attach_session(session);
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = source;
+        return Err(CaptureError::Internal {
+            msg: "audio capture is only available on macOS".to_owned(),
+        });
+    }
+    Ok(handle)
 }
 
 #[allow(clippy::needless_pass_by_value)]
 #[uniffi::export]
 pub fn stop_capture(handle: Arc<CaptureHandle>) {
-    let _ = (&handle.source, &handle.callback, handle.id);
+    handle.stop_session();
 }
 
 /// Starts a monitoring session that plays clean PCM to the default output.

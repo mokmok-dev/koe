@@ -129,10 +129,13 @@ impl RecordingPipeline {
         self.paused.store(false, Ordering::Release);
         self.publish_status(RecordingState::Stopping, 0.0, 0.0);
 
-        // Dropping the capture handle drops the broadcast sender so the
-        // consumer unblocks (Closed / drain) even if no more audio arrives.
-        if let Some(handle) = self.capture_handle.take() {
+        // Dropping capture handles drops producers so the consumer / mixer
+        // unblock even if no more audio arrives.
+        for handle in self.capture_handles.drain(..) {
             stop_capture(handle);
+        }
+        if let Some(mixer) = self.mixer_task.take() {
+            mixer.abort();
         }
 
         let drain = self.join_consumer(mode).await;
@@ -319,6 +322,7 @@ mod tests {
     }
 
     fn install_provider() {
+        koe_ffi::set_capture_stub(true);
         register_native_provider(Box::new(TestProvider {
             permissions: vec![(Permission::Microphone, PermissionStatus::Authorized)],
         }));

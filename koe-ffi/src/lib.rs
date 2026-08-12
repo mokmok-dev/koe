@@ -8,6 +8,8 @@ mod native;
 mod types;
 
 #[cfg(target_os = "macos")]
+mod macos_capture;
+#[cfg(target_os = "macos")]
 mod macos_discovery;
 #[cfg(target_os = "macos")]
 mod macos_system;
@@ -37,6 +39,9 @@ pub use types::{
 pub use macos_discovery::install_default_native_provider;
 #[cfg(target_os = "macos")]
 pub use macos_system::{default_input_device, default_output_device, supported_speech_locales};
+#[cfg(target_os = "macos")]
+#[doc(hidden)]
+pub use macos_capture::set_capture_stub;
 
 /// No-op on non-macOS targets.
 #[cfg(not(target_os = "macos"))]
@@ -44,6 +49,10 @@ pub use macos_system::{default_input_device, default_output_device, supported_sp
 pub const fn install_default_native_provider() -> bool {
     false
 }
+
+/// Capture stub toggle (no-op off macOS).
+#[cfg(not(target_os = "macos"))]
+pub fn set_capture_stub(_enabled: bool) {}
 
 /// No default input device outside macOS.
 #[cfg(not(target_os = "macos"))]

@@ -16,8 +16,11 @@ uniffi = { workspace = true, features = ["cli"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 block2 = { workspace = true }
+dispatch2 = { workspace = true }
 objc2 = { workspace = true }
 objc2-app-kit = { workspace = true, features = [
+  "NSApplication",
+  "NSResponder",
   "NSRunningApplication",
   "NSWorkspace",
   "libc",
@@ -27,12 +30,23 @@ objc2-av-foundation = { workspace = true, features = [
   "AVMediaFormat",
   "block2",
 ] }
+objc2-core-media = { workspace = true, features = ["CMTime"] }
 objc2-foundation = { workspace = true, features = [
   "NSArray",
   "NSEnumerator",
+  "NSError",
   "NSLocale",
   "NSSet",
   "NSString",
+  "NSValue",
+] }
+objc2-screen-capture-kit = { workspace = true, features = [
+  "SCShareableContent",
+  "SCStream",
+  "block2",
+  "dispatch2",
+  "libc",
+  "objc2-core-media",
 ] }
 objc2-speech = { workspace = true, features = ["SFSpeechRecognizer"] }
 
