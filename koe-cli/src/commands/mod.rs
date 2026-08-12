@@ -1,6 +1,6 @@
 //! CLI subcommands.
 //!
-//! `completions` waits on later tasks (28+).
+//! `completions` waits on later tasks.
 
 mod apps_table;
 mod decode;
@@ -18,7 +18,8 @@ pub use record::RecordArgs;
 pub use transcribe::TranscribeArgs;
 
 use crate::MainError;
+use crate::config::KoeConfig;
 
 pub trait Run {
-    fn run(self) -> Result<(), MainError>;
+    fn run(self, config: &KoeConfig) -> Result<(), MainError>;
 }

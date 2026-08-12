@@ -15,6 +15,7 @@ use super::Run;
 use super::decode::{CANONICAL_SAMPLE_RATE_HZ, DecodedAudioInfo, chunk_pcm, decode_to_canonical};
 use super::duration::parse_duration;
 use crate::MainError;
+use crate::config::KoeConfig;
 
 /// Transcribe an existing audio file without recording.
 #[derive(Debug, Parser)]
@@ -23,16 +24,16 @@ pub struct TranscribeArgs {
     pub input: PathBuf,
 
     /// Speech recognition locale (BCP-47).
-    #[arg(long, default_value = "en-US")]
-    pub locale: String,
+    #[arg(long)]
+    pub locale: Option<String>,
 
     /// Transcript output path (default: `<input>.<format>`).
     #[arg(short = 'o', long)]
     pub output: Option<PathBuf>,
 
     /// Transcript format: `txt`, `srt`, `vtt`, or `json`.
-    #[arg(long, default_value = "txt")]
-    pub format: String,
+    #[arg(long)]
+    pub format: Option<String>,
 
     /// Start transcribing from this offset (e.g. `30s`, `1m30s`).
     #[arg(long)]
@@ -44,8 +45,8 @@ pub struct TranscribeArgs {
 }
 
 impl Run for TranscribeArgs {
-    fn run(self) -> Result<(), MainError> {
-        let prepared = prepare(&self)?;
+    fn run(self, config: &KoeConfig) -> Result<(), MainError> {
+        let prepared = prepare(&self, config)?;
         run_transcription(&prepared)
     }
 }
@@ -60,7 +61,10 @@ struct Prepared {
     end_ms: Option<u64>,
 }
 
-fn prepare(args: &TranscribeArgs) -> Result<Prepared, MainError> {
+fn prepare(
+    args: &TranscribeArgs,
+    config: &KoeConfig,
+) -> Result<Prepared, MainError> {
     if !args.input.exists() {
         return Err(MainError::Io(format!(
             "input file not found: {}",
@@ -74,7 +78,9 @@ fn prepare(args: &TranscribeArgs) -> Result<Prepared, MainError> {
         )));
     }
 
-    let format = parse_transcript_format(&args.format)?;
+    let locale = crate::config::transcribe_locale(args.locale.clone(), config);
+    let format_name = crate::config::transcribe_format(args.format.clone(), config);
+    let format = parse_transcript_format(&format_name)?;
     let output = args
         .output
         .clone()
@@ -97,7 +103,7 @@ fn prepare(args: &TranscribeArgs) -> Result<Prepared, MainError> {
         ));
     }
 
-    if args.locale.trim().is_empty() {
+    if locale.trim().is_empty() {
         return Err(MainError::InvalidArgs(
             "--locale must be a non-empty BCP-47 tag".into(),
         ));
@@ -106,7 +112,7 @@ fn prepare(args: &TranscribeArgs) -> Result<Prepared, MainError> {
     Ok(Prepared {
         input: args.input.clone(),
         output,
-        locale: args.locale.clone(),
+        locale,
         format,
         start_ms,
         end_ms,
@@ -360,8 +366,8 @@ mod tests {
     fn parses_required_input() {
         let args = TranscribeArgs::try_parse_from(["transcribe", "meeting.wav"]).expect("parse");
         assert_eq!(args.input, PathBuf::from("meeting.wav"));
-        assert_eq!(args.locale, "en-US");
-        assert_eq!(args.format, "txt");
+        assert!(args.locale.is_none());
+        assert!(args.format.is_none());
         assert!(args.output.is_none());
     }
 
@@ -383,8 +389,8 @@ mod tests {
         ])
         .expect("parse");
         assert_eq!(args.input, PathBuf::from("in.flac"));
-        assert_eq!(args.locale, "ja-JP");
-        assert_eq!(args.format, "srt");
+        assert_eq!(args.locale.as_deref(), Some("ja-JP"));
+        assert_eq!(args.format.as_deref(), Some("srt"));
         assert_eq!(args.output.as_deref(), Some(Path::new("out.srt")));
         assert_eq!(args.start_at.as_deref(), Some("30s"));
         assert_eq!(args.end_at.as_deref(), Some("2m"));
@@ -403,7 +409,7 @@ mod tests {
             "/tmp/koe-definitely-missing-input-xyz.wav",
         ])
         .expect("parse");
-        let err = prepare(&args).expect_err("missing");
+        let err = prepare(&args, &KoeConfig::default()).expect_err("missing");
         assert!(matches!(err, MainError::Io(_)));
     }
 
@@ -421,9 +427,33 @@ mod tests {
             path.to_str().unwrap(),
         ])
         .expect("parse");
-        let err = prepare(&args).expect_err("inverted");
+        let err = prepare(&args, &KoeConfig::default()).expect_err("inverted");
         let _ = std::fs::remove_file(&path);
         assert!(matches!(err, MainError::InvalidArgs(_)));
+    }
+
+    #[test]
+    fn prepare_uses_transcription_section() {
+        let mut path = std::env::temp_dir();
+        path.push(format!(
+            "koe-transcribe-config-{}.wav",
+            std::process::id()
+        ));
+        std::fs::write(&path, b"RIFF").unwrap();
+        let args =
+            TranscribeArgs::try_parse_from(["transcribe", path.to_str().unwrap()]).expect("parse");
+        let config = crate::config::parse_toml(
+            r#"
+[transcription]
+locale = "ja-JP"
+transcript-format = "srt"
+"#,
+        )
+        .expect("config");
+        let prepared = prepare(&args, &config).expect("prepare");
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(prepared.locale, "ja-JP");
+        assert_eq!(prepared.format, TranscriptFormat::Srt);
     }
 
     #[test]
