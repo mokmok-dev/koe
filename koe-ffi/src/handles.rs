@@ -21,7 +21,7 @@ fn next_handle_id() -> u64 {
 pub struct CaptureHandle {
     #[expect(dead_code)]
     pub(crate) id: u64,
-    #[expect(dead_code)]
+    #[cfg_attr(not(target_os = "macos"), expect(dead_code))]
     pub(crate) source: AudioSourceConfig,
     pub(crate) callback: AudioCallbackRef,
     #[cfg(target_os = "macos")]
@@ -98,7 +98,7 @@ impl CaptureHandle {
 pub struct TranscriptionHandle {
     #[expect(dead_code)]
     pub(crate) id: u64,
-    #[expect(dead_code)]
+    #[cfg_attr(not(target_os = "macos"), expect(dead_code))]
     pub(crate) locale: String,
     pub(crate) callback: TranscriptionCallbackRef,
     /// Native recognition session, when one is running (macOS only).
