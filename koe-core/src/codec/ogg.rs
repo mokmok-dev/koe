@@ -6,7 +6,7 @@ use std::num::{NonZeroU8, NonZeroU32};
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use koe_ffi::{AudioSourceConfig, OutputFormat};
+use koe_ffi::AudioSourceConfig;
 use vorbis_rs::{VorbisBitrateManagementStrategy, VorbisEncoder, VorbisEncoderBuilder};
 
 use super::{AudioEncoder, CodecError};
@@ -89,7 +89,6 @@ impl OggComments {
 
 /// Encodes interleaved stereo `f32` PCM into an OGG Vorbis bitstream.
 pub struct OggEncoder {
-    quality: f32,
     /// Held behind `Option` so [`AudioEncoder::finalize`] can consume it.
     encoder: Option<VorbisEncoder<SharedSink>>,
     sink_buf: Arc<Mutex<Vec<u8>>>,
@@ -106,15 +105,6 @@ pub struct OggEncoder {
 unsafe impl Send for OggEncoder {}
 
 impl OggEncoder {
-    /// Creates an OGG encoder with default comments and the given VBR quality.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`CodecError`] when quality is out of range or libvorbis setup fails.
-    pub fn new(quality: f32) -> Result<Self, CodecError> {
-        Self::with_comments(quality, &OggComments::basic())
-    }
-
     /// Creates an OGG encoder with the given VBR quality and Vorbis comments.
     ///
     /// # Errors
@@ -159,7 +149,6 @@ impl OggEncoder {
             .map_err(|err| CodecError::Encoder(err.to_string()))?;
 
         Ok(Self {
-            quality,
             encoder: Some(encoder),
             sink_buf,
             left: Vec::new(),
@@ -242,20 +231,6 @@ impl AudioEncoder for OggEncoder {
                 .map_err(|err| CodecError::Encoder(err.to_string()))?;
         }
         self.take_encoded()
-    }
-
-    fn format(&self) -> OutputFormat {
-        OutputFormat::Ogg {
-            quality: self.quality,
-        }
-    }
-
-    fn sample_rate(&self) -> u32 {
-        SAMPLE_RATE
-    }
-
-    fn channel_count(&self) -> u16 {
-        CHANNELS
     }
 }
 

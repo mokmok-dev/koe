@@ -46,15 +46,6 @@ pub trait AudioEncoder: Send {
     ///
     /// Returns [`CodecError`] when finalization fails.
     fn finalize(&mut self) -> Result<Vec<u8>, CodecError>;
-
-    /// Output format descriptor for this encoder instance.
-    fn format(&self) -> OutputFormat;
-
-    /// Sample rate in Hz.
-    fn sample_rate(&self) -> u32;
-
-    /// Channel count.
-    fn channel_count(&self) -> u16;
 }
 
 /// Creates an encoder for the requested output format.
@@ -160,8 +151,7 @@ mod tests {
             None,
         )
         .expect("wav");
-        assert_eq!(encoder.sample_rate(), 48_000);
-        assert_eq!(encoder.channel_count(), 2);
+        let _ = encoder;
     }
 
     #[test]
@@ -173,8 +163,6 @@ mod tests {
             None,
         )
         .expect("flac");
-        assert_eq!(encoder.sample_rate(), 48_000);
-        assert_eq!(encoder.channel_count(), 2);
         let pcm = vec![0.0_f32; 4096 * 2];
         let _ = encoder.encode(&pcm).expect("encode");
         let out = encoder.finalize().expect("finalize");

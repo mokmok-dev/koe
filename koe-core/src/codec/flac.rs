@@ -1,14 +1,12 @@
 //! FLAC lossless encoder (48 kHz stereo, 24-bit PCM).
 
+use super::{AudioEncoder, CodecError, OggComments};
 use flacenc::bitsink::ByteSink;
 use flacenc::component::{BitRepr, MetadataBlockData, Stream};
 use flacenc::config;
 use flacenc::encode_fixed_size_frame;
 use flacenc::error::{Verified, Verify};
 use flacenc::source::{Context, Fill, FrameBuf};
-use koe_ffi::OutputFormat;
-
-use super::{AudioEncoder, CodecError, OggComments};
 
 const SAMPLE_RATE: u32 = 48_000;
 const CHANNELS: u16 = 2;
@@ -25,7 +23,6 @@ const PADDING_LEN: usize = 8_192;
 /// `STREAMINFO` can record the final sample count and MD5 digest (same buffering
 /// model as [`super::WavEncoder`]).
 pub struct FlacEncoder {
-    compression_level: u8,
     config: Verified<config::Encoder>,
     stream: Stream,
     context: Context,
@@ -37,15 +34,6 @@ pub struct FlacEncoder {
 }
 
 impl FlacEncoder {
-    /// Creates a FLAC encoder with default session comments.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`CodecError`] when compression level or encoder setup fails.
-    pub fn new(compression_level: u8) -> Result<Self, CodecError> {
-        Self::with_comments(compression_level, &OggComments::basic())
-    }
-
     /// Creates a FLAC encoder with Vorbis Comment tags matching the OGG encoder.
     ///
     /// # Errors
@@ -72,7 +60,6 @@ impl FlacEncoder {
         stream.add_metadata_block(vorbis_comment_block(comments)?);
 
         Ok(Self {
-            compression_level,
             config,
             stream,
             context: Context::new(BITS_PER_SAMPLE, CHANNEL_COUNT),
@@ -170,20 +157,6 @@ impl AudioEncoder for FlacEncoder {
             .set_md5_digest(&self.context.md5_digest());
 
         self.write_stream_to_vec()
-    }
-
-    fn format(&self) -> OutputFormat {
-        OutputFormat::Flac {
-            compression_level: self.compression_level,
-        }
-    }
-
-    fn sample_rate(&self) -> u32 {
-        SAMPLE_RATE
-    }
-
-    fn channel_count(&self) -> u16 {
-        CHANNELS
     }
 }
 
@@ -332,7 +305,7 @@ mod tests {
 
     #[test]
     fn encode_returns_empty_until_finalize() {
-        let mut encoder = FlacEncoder::new(5).expect("encoder");
+        let mut encoder = FlacEncoder::with_comments(5, &OggComments::basic()).expect("encoder");
         assert!(
             encoder
                 .encode(&sine_stereo(BLOCK_SIZE, 440.0))
@@ -346,8 +319,8 @@ mod tests {
 
     #[test]
     fn rejects_bad_compression_level_and_odd_pcm() {
-        assert!(FlacEncoder::new(9).is_err());
-        let mut encoder = FlacEncoder::new(5).expect("encoder");
+        assert!(FlacEncoder::with_comments(9, &OggComments::basic()).is_err());
+        let mut encoder = FlacEncoder::with_comments(5, &OggComments::basic()).expect("encoder");
         let err = encoder.encode(&[0.0]).expect_err("odd");
         assert!(err.to_string().contains("multiple"));
     }
@@ -420,7 +393,7 @@ mod tests {
     fn encode_keeps_up_with_realtime_48khz_blocks() {
         use std::time::Instant;
 
-        let mut encoder = FlacEncoder::new(5).expect("encoder");
+        let mut encoder = FlacEncoder::with_comments(5, &OggComments::basic()).expect("encoder");
         let block = sine_stereo(BLOCK_SIZE, 440.0);
         let _ = encoder.encode(&block).expect("warmup");
 

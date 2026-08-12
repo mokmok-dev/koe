@@ -6,9 +6,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 /// Internal metrics collected during a recording session.
 #[derive(Debug, Default)]
 pub struct PipelineMetrics {
-    pub total_frames_processed: AtomicU64,
-    pub dropped_frames: AtomicU64,
-    pub speech_segment_count: AtomicU64,
+    total_frames_processed: AtomicU64,
+    dropped_frames: AtomicU64,
+    speech_segment_count: AtomicU64,
 }
 
 impl PipelineMetrics {
