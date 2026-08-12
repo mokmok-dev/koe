@@ -14,7 +14,6 @@
 use std::ffi::c_void;
 use std::ptr;
 
-use objc2_foundation::NSLocale;
 use objc2_speech::SFSpeechRecognizer;
 
 use crate::types::AudioDeviceInfo;
@@ -95,7 +94,7 @@ pub fn supported_speech_locales() -> Vec<String> {
     let locales = unsafe { SFSpeechRecognizer::supportedLocales() };
     let mut out: Vec<String> = locales
         .iter()
-        .map(|locale: &NSLocale| to_bcp47(&locale.localeIdentifier().to_string()))
+        .map(|locale| to_bcp47(&locale.localeIdentifier().to_string()))
         .collect();
     out.sort_unstable();
     out.dedup();
