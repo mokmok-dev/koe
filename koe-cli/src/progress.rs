@@ -96,7 +96,8 @@ pub struct TtyRenderer {
     status_line: String,
     /// Open partial line (without trailing newline), if any.
     partial_line: Option<String>,
-    /// How many live lines are currently painted (0–2).
+    /// Live content rows painted (0–2). The cursor rests on an anchor row
+    /// directly below this block so the next CUU lands on the first row.
     painted_lines: u8,
 }
 
@@ -114,16 +115,26 @@ impl TtyRenderer {
 
     fn paint(&mut self) {
         let mut err = std::io::stderr().lock();
-        if self.painted_lines > 0 {
-            let _ = write!(err, "\x1b[{}A", self.painted_lines);
+        let prev_painted = self.painted_lines;
+        if prev_painted > 0 {
+            let _ = write!(err, "\x1b[{prev_painted}A");
         }
         let _ = write!(err, "\r\x1b[2K{}", self.status_line);
-        if let Some(ref partial) = self.partial_line {
+        let content_lines = self.partial_line.as_ref().map_or(1, |partial| {
             let _ = write!(err, "\n\x1b[2K{partial}");
-            self.painted_lines = 2;
+            2
+        });
+        if content_lines == 2 {
+            // Anchor row below a two-line block.
+            let _ = writeln!(err);
+        } else if prev_painted > 1 {
+            // Shrunk from two lines to one — clear the old partial row and
+            // reuse it as the anchor so CUU(1) still reaches the status row.
+            let _ = write!(err, "\n\x1b[2K");
         } else {
-            self.painted_lines = 1;
+            let _ = writeln!(err);
         }
+        self.painted_lines = content_lines;
         let _ = err.flush();
     }
 
@@ -132,6 +143,7 @@ impl TtyRenderer {
             return;
         }
         let mut err = std::io::stderr().lock();
+        // Cursor sits on the anchor row directly below the content block.
         let _ = write!(err, "\x1b[{}A", self.painted_lines);
         for i in 0..self.painted_lines {
             if i > 0 {
@@ -139,11 +151,7 @@ impl TtyRenderer {
             }
             let _ = write!(err, "\r\x1b[2K");
         }
-        // Return to the first cleared line so the next print replaces the block.
-        if self.painted_lines > 1 {
-            let _ = write!(err, "\x1b[{}A", self.painted_lines - 1);
-        }
-        let _ = write!(err, "\r");
+        let _ = write!(err, "\r\x1b[2K");
         let _ = err.flush();
         self.painted_lines = 0;
     }
