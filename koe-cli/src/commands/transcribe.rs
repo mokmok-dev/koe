@@ -18,6 +18,10 @@ use super::parse_speech_engine;
 use crate::MainError;
 use crate::config::KoeConfig;
 
+/// Speech framework recognition tasks are bounded; keep each request short
+/// enough that finalization can reliably produce a final result.
+const RECOGNITION_WINDOW_MS: u64 = 50_000;
+
 /// Transcribe an existing audio file without recording.
 #[derive(Debug, Parser)]
 pub struct TranscribeArgs {
@@ -151,46 +155,56 @@ fn run_transcription(prepared: &Prepared) -> Result<(), MainError> {
     let (pcm, info) = decode_to_canonical(&prepared.input, prepared.start_ms, prepared.end_ms)?;
     report_decode(&info);
 
-    let time_offset_ms = i64::try_from(prepared.start_ms.unwrap_or(0)).unwrap_or(0);
-    let collector = SegmentCollector::new(time_offset_ms);
-    let segments = Arc::clone(&collector.segments);
-    let partial = Arc::clone(&collector.partial);
-    let errors = Arc::clone(&collector.errors);
-
-    let handle = start_transcription(
-        prepared.locale.clone(),
-        prepared.speech_engine,
-        Box::new(collector),
-    )
-    .map_err(|err| match err {
-        koe_core::TranscriptionError::PermissionDenied { .. } => {
-            MainError::PermissionDenied(err.to_string())
-        },
-        other => MainError::Internal(format!("start transcription: {other}")),
-    })?;
-
     let started = Instant::now();
     let total_ms = info.window_duration_ms.max(1);
-    let mut fed_ms: u64 = 0;
     let samples_per_ms = 2 * u64::from(CANONICAL_SAMPLE_RATE_HZ) / 1000;
 
-    for chunk in chunk_pcm(&pcm) {
-        feed_transcription_audio(Arc::clone(&handle), chunk.to_vec());
-        fed_ms += u64::try_from(chunk.len()).unwrap_or(0) / samples_per_ms.max(1);
-        report_progress(fed_ms.min(total_ms), total_ms, &partial);
+    let window_samples = usize::try_from(RECOGNITION_WINDOW_MS.saturating_mul(samples_per_ms))
+        .map_err(|_| MainError::Internal("recognition window is too large".into()))?;
+    let mut finals = Vec::new();
+    let mut asr_error = None;
+    let mut fed_ms: u64 = 0;
+    for (window_index, window) in pcm.chunks(window_samples).enumerate() {
+        let window_offset_ms = prepared.start_ms.unwrap_or(0).saturating_add(
+            RECOGNITION_WINDOW_MS.saturating_mul(u64::try_from(window_index).unwrap_or(u64::MAX)),
+        );
+        let time_offset_ms = i64::try_from(window_offset_ms).unwrap_or(i64::MAX);
+        let collector = SegmentCollector::new(time_offset_ms);
+        let partial = Arc::clone(&collector.partial);
+        let segments = Arc::clone(&collector.segments);
+        let errors = Arc::clone(&collector.errors);
+        let handle = start_transcription(
+            prepared.locale.clone(),
+            prepared.speech_engine,
+            Box::new(collector),
+        )
+        .map_err(|err| match err {
+            koe_core::TranscriptionError::PermissionDenied { .. } => {
+                MainError::PermissionDenied(err.to_string())
+            },
+            other => MainError::Internal(format!("start transcription: {other}")),
+        })?;
+
+        for chunk in chunk_pcm(window) {
+            feed_transcription_audio(Arc::clone(&handle), chunk.to_vec());
+            fed_ms = fed_ms
+                .saturating_add(u64::try_from(chunk.len()).unwrap_or(0) / samples_per_ms.max(1));
+            report_progress(fed_ms.min(total_ms), total_ms, &partial);
+        }
+        finalize_transcription(handle);
+
+        if let Some(err) = errors.lock().ok().and_then(|guard| guard.clone()) {
+            eprintln!("warning: transcription error in window {window_index}: {err}");
+            asr_error = Some(err);
+        }
+        finals.extend(
+            segments
+                .lock()
+                .map_err(|_| MainError::Internal("segment lock poisoned".into()))?
+                .iter()
+                .cloned(),
+        );
     }
-
-    finalize_transcription(handle);
-
-    let asr_error = errors.lock().ok().and_then(|guard| guard.clone());
-    if let Some(err) = asr_error.as_ref() {
-        eprintln!("warning: transcription error: {err}");
-    }
-
-    let finals = segments
-        .lock()
-        .map_err(|_| MainError::Internal("segment lock poisoned".into()))?
-        .clone();
 
     if finals.is_empty() {
         if let Some(err) = asr_error {

@@ -50,10 +50,11 @@ let
     name = "populate-koe-ffi-bindings";
     runtimeInputs = [ pkgs.coreutils ];
     text = ''
-      root="$(
-        git rev-parse --show-toplevel 2>/dev/null \
-          || cd "$(dirname "$0")/../.." && pwd
-      )"
+       if root="$(git rev-parse --show-toplevel 2>/dev/null)"; then
+         :
+       else
+         root="$(cd "$(dirname "$0")/../.." && pwd)"
+       fi
       mkdir -p "$root/koe-native/generated" "$root/target/debug"
       cp -r ${koeFfiBindings}/include/* "$root/koe-native/generated/"
       install -m644 ${koeFfiBindings}/lib/libkoe_ffi.a "$root/target/debug/libkoe_ffi.a"
