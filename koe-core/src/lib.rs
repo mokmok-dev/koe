@@ -7,7 +7,7 @@ pub mod transcript;
 
 pub use aec::{AcousticEchoCanceller, AecConfig};
 pub use pipeline::{
-    AudioChunk, FileWriter, FORCE_JOIN_BUDGET, PipelineConfig, PipelineError, PipelineMetrics,
+    AudioChunk, FORCE_JOIN_BUDGET, FileWriter, PipelineConfig, PipelineError, PipelineMetrics,
     PipelineMetricsSnapshot, PipelineState, RecordingPipeline, RecordingState, RecordingStatus,
     SHUTDOWN_BUDGET, ShutdownMode, StopResult, available_disk_space,
 };

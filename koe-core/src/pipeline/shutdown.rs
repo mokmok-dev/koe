@@ -258,7 +258,7 @@ impl RecordingPipeline {
     }
 
     fn map_join_result(
-        result: Result<Result<(), PipelineError>, tokio::task::JoinError>,
+        result: Result<Result<(), PipelineError>, tokio::task::JoinError>
     ) -> DrainOutcome {
         match result {
             Ok(Ok(())) => DrainOutcome::Drained,
@@ -349,11 +349,7 @@ mod tests {
 
     fn assert_valid_wav(path: &Path) {
         let bytes = std::fs::read(path).expect("read wav");
-        assert!(
-            bytes.len() >= 56,
-            "WAV too small: {} bytes",
-            bytes.len()
-        );
+        assert!(bytes.len() >= 56, "WAV too small: {} bytes", bytes.len());
         assert_eq!(&bytes[0..4], b"RIFF");
         assert_eq!(&bytes[8..12], b"WAVE");
     }
@@ -528,7 +524,10 @@ mod tests {
             for sample in pcm {
                 bytes.extend_from_slice(&sample.to_le_bytes());
             }
-            self.pcm_bytes.lock().expect("lock").extend_from_slice(&bytes);
+            self.pcm_bytes
+                .lock()
+                .expect("lock")
+                .extend_from_slice(&bytes);
             Ok(bytes)
         }
 
