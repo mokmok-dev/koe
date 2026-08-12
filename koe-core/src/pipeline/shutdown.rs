@@ -7,11 +7,16 @@
 //! 4. Finalize speech analyzer
 //! 5. Finalize encoder + flush audio
 //! 6. Write transcript
-//! 7. Emit [`RecordingSummary`]
+//! 7. Emit [`StopResult`]
 //!
 //! Force mode skips the drain / ASR finalize wait but still finalizes the
 //! encoder so on-disk audio containers stay valid.
+//!
+//! `force_stop` is choose-up-front (or call instead of `stop`), not an
+//! in-flight escalate while `stop().await` holds `&mut self`. CLI double
+//! SIGINT (task 29) should prefer `force_stop` over `process::exit`.
 
+use std::ops::Deref;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 
@@ -19,31 +24,69 @@ use koe_ffi::{RecordingState, RecordingSummary, finalize_transcription, stop_cap
 
 use super::{PipelineError, PipelineState, RecordingPipeline};
 
-/// Wall-clock budget for a graceful shutdown (spec: ≤ 2 s).
+/// Maximum time spent waiting for the consumer to drain during graceful stop.
+///
+/// Encoder finalize, disk flush, and transcript write are outside this budget
+/// (typically ≪ 100 ms). Spec ceiling for the full sequence is 2 s.
 pub const SHUTDOWN_BUDGET: Duration = Duration::from_secs(2);
 
+/// Brief wait before aborting the consumer on [`ShutdownMode::Force`].
+pub const FORCE_JOIN_BUDGET: Duration = Duration::from_millis(50);
+
 /// How [`RecordingPipeline::stop_with`] finalizes the session.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ShutdownMode {
     /// Drain remaining audio, finalize ASR, then finalize encoder / transcript.
+    #[default]
     Graceful,
     /// Abort the consumer quickly; skip ASR finalize. Encoder is still
     /// finalized so container files are not left corrupt.
     Force,
 }
 
+/// Outcome of [`RecordingPipeline::stop`] / [`RecordingPipeline::force_stop`].
+///
+/// Derefs to [`RecordingSummary`] so existing `result.bytes_written` style
+/// access keeps working.
+#[derive(Debug, Clone)]
+pub struct StopResult {
+    /// Recording summary for CLI/GUI surfaces.
+    pub summary: RecordingSummary,
+    /// `true` when the consumer exited cleanly after draining.
+    ///
+    /// `false` when the consumer was aborted (force / drain timeout) or
+    /// returned an error. Encoder finalize still ran, so audio files should
+    /// remain readable; some trailing audio or partial transcript may be lost.
+    pub consumer_drained: bool,
+}
+
+impl Deref for StopResult {
+    type Target = RecordingSummary;
+
+    fn deref(&self) -> &Self::Target {
+        &self.summary
+    }
+}
+
+#[derive(Debug)]
+enum DrainOutcome {
+    Drained,
+    Aborted,
+    Failed(PipelineError),
+}
+
 impl RecordingPipeline {
     /// Stops capture, drains remaining audio, finalizes outputs, and returns a summary.
     ///
-    /// Completes within [`SHUTDOWN_BUDGET`] when possible; on timeout the consumer
-    /// is aborted and finalization still runs (same integrity guarantees as a
-    /// normal stop for encoder / transcript files).
+    /// Waits up to [`SHUTDOWN_BUDGET`] for the consumer to drain. On timeout the
+    /// consumer is aborted and **joined** before encoder finalize so no writer
+    /// races the trailer. [`StopResult::consumer_drained`] is `false` in that case.
     ///
     /// # Errors
     ///
-    /// Returns [`PipelineError`] when the pipeline is not running, shutdown
-    /// steps fail, or finalization fails.
-    pub async fn stop(&mut self) -> Result<RecordingSummary, PipelineError> {
+    /// Returns [`PipelineError`] when the pipeline is not running or
+    /// finalization (encoder / disk / transcript) fails.
+    pub async fn stop(&mut self) -> Result<StopResult, PipelineError> {
         self.stop_with(ShutdownMode::Graceful).await
     }
 
@@ -52,15 +95,20 @@ impl RecordingPipeline {
     /// Partial transcript segments may be lost. Encoded audio is still
     /// finalized and flushed so files remain readable.
     ///
+    /// This is not an in-flight escalate for a concurrent `stop().await`
+    /// (both need `&mut self`). Call this instead of `stop` when the user
+    /// requests an immediate exit.
+    ///
     /// # Errors
     ///
     /// Returns [`PipelineError`] when the pipeline is not running or
     /// finalization fails.
-    pub async fn force_stop(&mut self) -> Result<RecordingSummary, PipelineError> {
+    pub async fn force_stop(&mut self) -> Result<StopResult, PipelineError> {
         self.stop_with(ShutdownMode::Force).await
     }
 
-    /// Shared shutdown entry point for graceful and force modes.
+    /// Stops with an explicit [`ShutdownMode`]. Prefer [`Self::stop`] /
+    /// [`Self::force_stop`] at call sites.
     ///
     /// # Errors
     ///
@@ -69,15 +117,15 @@ impl RecordingPipeline {
     pub async fn stop_with(
         &mut self,
         mode: ShutdownMode,
-    ) -> Result<RecordingSummary, PipelineError> {
+    ) -> Result<StopResult, PipelineError> {
         if matches!(self.state, PipelineState::Stopped | PipelineState::Idle) {
             return Err(PipelineError::InvalidState(
-                "pipeline is not recording".to_owned(),
+                "pipeline already stopped".to_owned(),
             ));
         }
 
-        self.shutdown.store(true, Ordering::Relaxed);
-        self.paused.store(false, Ordering::Relaxed);
+        self.shutdown.store(true, Ordering::Release);
+        self.paused.store(false, Ordering::Release);
         self.publish_status(RecordingState::Stopping, 0.0, 0.0);
 
         // Dropping the capture handle drops the broadcast sender so the
@@ -86,8 +134,51 @@ impl RecordingPipeline {
             stop_capture(handle);
         }
 
-        self.join_consumer(mode).await?;
+        let drain = self.join_consumer(mode).await;
+        let consumer_drained = matches!(drain, DrainOutcome::Drained);
+        if let DrainOutcome::Failed(err) = &drain {
+            log::error!("consumer failed during shutdown: {err}");
+        }
 
+        let duration_sec = match &self.state {
+            PipelineState::Recording { start_time, .. } => start_time.elapsed().as_secs_f64(),
+            PipelineState::Paused {
+                elapsed_before_pause,
+                ..
+            } => elapsed_before_pause.as_secs_f64(),
+            _ => 0.0,
+        };
+
+        // Capture/consumer are gone; mark Stopped even if finalize fails so
+        // the state machine does not claim we are still recording.
+        let finalize = self.finalize_outputs(mode).await;
+        self.state = PipelineState::Stopped;
+        self.publish_status(RecordingState::Stopped, 0.0, 0.0);
+
+        let bytes_written = finalize?;
+        let segment_count = self
+            .segments
+            .lock()
+            .map_err(|_| PipelineError::InvalidState("segments lock poisoned".to_owned()))?
+            .len();
+
+        Ok(StopResult {
+            summary: RecordingSummary {
+                duration_sec,
+                bytes_written,
+                transcript_segment_count: u64::try_from(segment_count).unwrap_or(u64::MAX),
+                dropped_audio_frames: self.drop_counter.load(Ordering::Relaxed),
+                format: self.config.audio_format.clone(),
+            },
+            consumer_drained,
+        })
+    }
+
+    /// ASR finalize (graceful only) + encoder trailer + transcript write.
+    async fn finalize_outputs(
+        &mut self,
+        mode: ShutdownMode,
+    ) -> Result<u64, PipelineError> {
         if mode == ShutdownMode::Graceful {
             if let Some(handle) = self.transcription_handle.take() {
                 finalize_transcription(handle);
@@ -97,6 +188,8 @@ impl RecordingPipeline {
             self.transcription_handle.take();
         }
 
+        // Always finalize the encoder after the consumer has fully stopped
+        // (drained, failed, or aborted+joined) so trailers cannot race writes.
         let trailer = {
             let mut encoder = self
                 .encoder
@@ -129,70 +222,51 @@ impl RecordingPipeline {
             tokio::fs::write(transcript_path, body).await?;
         }
 
-        let duration_sec = match &self.state {
-            PipelineState::Recording { start_time, .. } => start_time.elapsed().as_secs_f64(),
-            PipelineState::Paused {
-                elapsed_before_pause,
-                ..
-            } => elapsed_before_pause.as_secs_f64(),
-            _ => 0.0,
-        };
-
-        let segment_count = self
-            .segments
-            .lock()
-            .map_err(|_| PipelineError::InvalidState("segments lock poisoned".to_owned()))?
-            .len();
-
-        self.state = PipelineState::Stopped;
-        self.publish_status(RecordingState::Stopped, 0.0, 0.0);
-
-        Ok(RecordingSummary {
-            duration_sec,
-            bytes_written,
-            transcript_segment_count: u64::try_from(segment_count).unwrap_or(u64::MAX),
-            dropped_audio_frames: self.drop_counter.load(Ordering::Relaxed),
-            format: self.config.audio_format.clone(),
-        })
+        Ok(bytes_written)
     }
 
+    /// Waits for the consumer within the mode budget, then aborts and **joins**
+    /// on timeout so finalize cannot race in-flight encode/write.
     async fn join_consumer(
         &mut self,
         mode: ShutdownMode,
-    ) -> Result<(), PipelineError> {
-        let Some(task) = self.consumer_task.take() else {
-            return Ok(());
+    ) -> DrainOutcome {
+        let Some(mut task) = self.consumer_task.take() else {
+            return DrainOutcome::Drained;
         };
 
         let budget = match mode {
             ShutdownMode::Graceful => SHUTDOWN_BUDGET,
-            // Brief window so an already-idle consumer can exit cleanly;
-            // then abort so force stop cannot hang on a stuck encode.
-            ShutdownMode::Force => Duration::from_millis(50),
+            ShutdownMode::Force => FORCE_JOIN_BUDGET,
         };
 
-        let abort = task.abort_handle();
-        match tokio::time::timeout(budget, task).await {
-            Ok(Ok(Ok(()))) => Ok(()),
-            Ok(Ok(Err(err))) => Err(err),
-            Ok(Err(err)) => {
-                if err.is_cancelled() {
-                    Ok(())
-                } else {
-                    Err(PipelineError::InvalidState(format!(
-                        "consumer task join failed: {err}"
-                    )))
-                }
-            },
-            Err(_elapsed) => {
-                abort.abort();
+        tokio::select! {
+            biased;
+            result = &mut task => Self::map_join_result(result),
+            () = tokio::time::sleep(budget) => {
+                task.abort();
                 if mode == ShutdownMode::Graceful {
                     log::warn!(
                         "consumer drain exceeded {budget:?}; aborting and continuing finalize"
                     );
                 }
-                Ok(())
+                // Join after abort so spawn_blocking encode/write cannot
+                // append past the container trailer.
+                Self::map_join_result(task.await)
             },
+        }
+    }
+
+    fn map_join_result(
+        result: Result<Result<(), PipelineError>, tokio::task::JoinError>,
+    ) -> DrainOutcome {
+        match result {
+            Ok(Ok(())) => DrainOutcome::Drained,
+            Ok(Err(err)) => DrainOutcome::Failed(err),
+            Err(err) if err.is_cancelled() => DrainOutcome::Aborted,
+            Err(err) => DrainOutcome::Failed(PipelineError::InvalidState(format!(
+                "consumer task join failed: {err}"
+            ))),
         }
     }
 }
@@ -200,6 +274,7 @@ impl RecordingPipeline {
 #[cfg(test)]
 mod tests {
     use std::path::Path;
+    use std::sync::{Arc, Mutex};
     use std::time::Instant;
 
     use koe_ffi::{
@@ -208,6 +283,7 @@ mod tests {
     };
 
     use super::*;
+    use crate::codec::{AudioEncoder, CodecError};
     use crate::pipeline::{PipelineConfig, PipelineState};
 
     struct TestProvider {
@@ -291,11 +367,12 @@ mod tests {
             .expect("start");
 
         let started = Instant::now();
-        let summary = pipeline.stop().await.expect("stop");
+        let result = pipeline.stop().await.expect("stop");
         assert!(started.elapsed() < SHUTDOWN_BUDGET);
+        assert!(result.consumer_drained);
         assert!(matches!(pipeline.state(), PipelineState::Stopped));
         assert!(matches!(
-            summary.format,
+            result.format,
             OutputFormat::Wav {
                 bits_per_sample: 16
             }
@@ -312,7 +389,7 @@ mod tests {
             .await
             .expect("start");
 
-        // 3 chunks × 2 frames (stereo pairs) = 6 frames.
+        // 3 chunks × stereo pairs → frame counts 2 + 1 + 2 = 5.
         let chunks = [
             vec![0.1, -0.1, 0.2, -0.2],
             vec![0.3, -0.3],
@@ -326,12 +403,11 @@ mod tests {
             }
         }
 
-        // Let the consumer pull from the broadcast channel before stop.
-        tokio::time::sleep(Duration::from_millis(30)).await;
-
-        let summary = pipeline.stop().await.expect("stop");
-        assert!(summary.bytes_written > 0);
-        assert_eq!(summary.dropped_audio_frames, 0);
+        // Stop drains the broadcast channel; no wall-clock race required.
+        let result = pipeline.stop().await.expect("stop");
+        assert!(result.consumer_drained);
+        assert!(result.bytes_written > 0);
+        assert_eq!(result.dropped_audio_frames, 0);
         assert_eq!(
             pipeline.metrics().total_frames_processed,
             expected_frames,
@@ -356,9 +432,9 @@ mod tests {
         }
 
         let started = Instant::now();
-        let summary = pipeline.force_stop().await.expect("force_stop");
+        let result = pipeline.force_stop().await.expect("force_stop");
         assert!(started.elapsed() < SHUTDOWN_BUDGET);
-        assert!(summary.bytes_written > 0);
+        assert!(result.bytes_written > 0);
         assert_valid_wav(&output);
         let _ = std::fs::remove_file(output);
     }
@@ -391,8 +467,8 @@ mod tests {
             handle.deliver_audio(vec![1.0, -1.0], 30);
         }
 
-        let summary = pipeline.stop().await.expect("stop");
-        assert_eq!(summary.transcript_segment_count, 1);
+        let result = pipeline.stop().await.expect("stop");
+        assert_eq!(result.transcript_segment_count, 1);
 
         let body = std::fs::read_to_string(&transcript).expect("transcript");
         assert!(body.contains("before pause"));
@@ -434,5 +510,133 @@ mod tests {
         assert!(saw_stopping);
         assert!(saw_stopped);
         let _ = std::fs::remove_file(output);
+    }
+
+    /// Slow encoder that holds the mutex across a sleep inside `spawn_blocking`.
+    struct SlowFinalizeEncoder {
+        encode_delay: Duration,
+        pcm_bytes: Arc<Mutex<Vec<u8>>>,
+    }
+
+    impl AudioEncoder for SlowFinalizeEncoder {
+        fn encode(
+            &mut self,
+            pcm: &[f32],
+        ) -> Result<Vec<u8>, CodecError> {
+            std::thread::sleep(self.encode_delay);
+            let mut bytes = Vec::with_capacity(pcm.len() * 4);
+            for sample in pcm {
+                bytes.extend_from_slice(&sample.to_le_bytes());
+            }
+            self.pcm_bytes.lock().expect("lock").extend_from_slice(&bytes);
+            Ok(bytes)
+        }
+
+        fn finalize(&mut self) -> Result<Vec<u8>, CodecError> {
+            Ok(b"TRAILER".to_vec())
+        }
+
+        fn format(&self) -> OutputFormat {
+            OutputFormat::Ogg { quality: 0.5 }
+        }
+
+        fn sample_rate(&self) -> u32 {
+            48_000
+        }
+
+        fn channel_count(&self) -> u16 {
+            2
+        }
+    }
+
+    #[tokio::test]
+    async fn force_stop_joins_before_finalize_no_post_trailer_writes() {
+        use std::sync::atomic::{AtomicBool, AtomicU64, Ordering as AtomicOrdering};
+        use std::time::Instant as StdInstant;
+
+        use tokio::sync::{Mutex as AsyncMutex, broadcast};
+
+        use crate::pipeline::consumer::{ConsumerContext, SpeechFeeder, spawn_consumer};
+        use crate::pipeline::file_writer::FileWriter;
+        use crate::pipeline::metrics::PipelineMetrics;
+        use crate::pipeline::{AudioChunk, RecordingStatus};
+
+        struct NoopSpeech;
+        impl SpeechFeeder for NoopSpeech {
+            fn feed_audio(
+                &self,
+                _pcm: Vec<f32>,
+            ) {
+            }
+        }
+
+        let path = unique_path("race");
+        let writer = Arc::new(AsyncMutex::new(
+            FileWriter::create(&path).await.expect("writer"),
+        ));
+        let pcm_bytes = Arc::new(Mutex::new(Vec::new()));
+        let encoder: Arc<Mutex<Box<dyn AudioEncoder>>> =
+            Arc::new(Mutex::new(Box::new(SlowFinalizeEncoder {
+                encode_delay: Duration::from_millis(80),
+                pcm_bytes: Arc::clone(&pcm_bytes),
+            })));
+
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let (progress_tx, _) = broadcast::channel::<RecordingStatus>(8);
+        let (tx, rx) = broadcast::channel(64);
+        let ctx = ConsumerContext {
+            encoder: Arc::clone(&encoder),
+            speech: Arc::new(NoopSpeech),
+            writer: Arc::clone(&writer),
+            metrics: PipelineMetrics::new(),
+            shutdown: Arc::clone(&shutdown),
+            paused: Arc::new(AtomicBool::new(false)),
+            progress_tx,
+            started_at: Arc::new(Mutex::new(StdInstant::now())),
+            bytes_written: Arc::new(AtomicU64::new(0)),
+        };
+        let task = spawn_consumer(rx, ctx);
+
+        // Queue work that will still be encoding when we abort.
+        for i in 0..4 {
+            tx.send(AudioChunk::new(vec![0.1, -0.1], i)).expect("send");
+        }
+        drop(tx);
+        shutdown.store(true, AtomicOrdering::Release);
+
+        // Mirror join_consumer Force path: brief wait, abort, join, then finalize.
+        let mut task = task;
+        tokio::select! {
+            biased;
+            _ = &mut task => {},
+            () = tokio::time::sleep(FORCE_JOIN_BUDGET) => {
+                task.abort();
+                let _ = task.await;
+            },
+        }
+
+        let trailer = {
+            let mut enc = encoder.lock().expect("encoder");
+            enc.finalize().expect("finalize")
+        };
+        {
+            let mut w = writer.lock().await;
+            w.write(&trailer).await.expect("write trailer");
+            w.flush().await.expect("flush");
+            drop(w);
+        }
+
+        let bytes = std::fs::read(&path).expect("read");
+        let trailer_pos = bytes
+            .windows(7)
+            .rposition(|w| w == b"TRAILER")
+            .expect("trailer present");
+        assert_eq!(
+            trailer_pos + 7,
+            bytes.len(),
+            "no encode writes may follow the trailer"
+        );
+
+        let _ = std::fs::remove_file(path);
     }
 }

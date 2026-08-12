@@ -33,7 +33,7 @@ pub use file_writer::FileWriter;
 /// Progress payload types for [`RecordingPipeline::subscribe_progress`].
 pub use koe_ffi::{RecordingState, RecordingStatus};
 pub use metrics::{PipelineMetrics, PipelineMetricsSnapshot};
-pub use shutdown::{SHUTDOWN_BUDGET, ShutdownMode};
+pub use shutdown::{FORCE_JOIN_BUDGET, SHUTDOWN_BUDGET, ShutdownMode, StopResult};
 
 /// Configuration for a recording session.
 #[derive(Debug, Clone)]

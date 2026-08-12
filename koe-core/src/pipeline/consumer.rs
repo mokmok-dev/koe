@@ -84,7 +84,7 @@ pub fn spawn_consumer(
                 Err(broadcast::error::RecvError::Closed) => break,
             }
 
-            if ctx.shutdown.load(Ordering::Relaxed) {
+            if ctx.shutdown.load(Ordering::Acquire) {
                 drain_remaining(&mut rx, &ctx).await?;
                 break;
             }
@@ -165,7 +165,7 @@ fn emit_progress(
     state_override: Option<RecordingState>,
 ) -> Result<(), PipelineError> {
     let state = state_override.unwrap_or_else(|| {
-        if ctx.shutdown.load(Ordering::Relaxed) {
+        if ctx.shutdown.load(Ordering::Acquire) {
             RecordingState::Stopping
         } else if ctx.paused.load(Ordering::Relaxed) {
             RecordingState::Paused

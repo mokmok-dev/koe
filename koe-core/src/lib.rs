@@ -7,13 +7,15 @@ pub mod transcript;
 
 pub use aec::{AcousticEchoCanceller, AecConfig};
 pub use pipeline::{
-    AudioChunk, FileWriter, PipelineConfig, PipelineError, PipelineMetrics,
+    AudioChunk, FileWriter, FORCE_JOIN_BUDGET, PipelineConfig, PipelineError, PipelineMetrics,
     PipelineMetricsSnapshot, PipelineState, RecordingPipeline, RecordingState, RecordingStatus,
-    SHUTDOWN_BUDGET, ShutdownMode, available_disk_space,
+    SHUTDOWN_BUDGET, ShutdownMode, StopResult, available_disk_space,
 };
 
 /// Error returned by [`available_disk_space`] and recording setup.
 pub use koe_ffi::RecordingError;
+/// Summary payload returned from [`RecordingPipeline::stop`].
+pub use koe_ffi::RecordingSummary;
 
 /// Discovery and permission entry points used by `koe-cli` (and GUI).
 pub use koe_ffi::{
