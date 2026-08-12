@@ -36,9 +36,7 @@ pub use types::{
 #[cfg(target_os = "macos")]
 pub use macos_discovery::install_default_native_provider;
 #[cfg(target_os = "macos")]
-pub use macos_system::{
-    default_input_device, default_output_device, supported_speech_locales,
-};
+pub use macos_system::{default_input_device, default_output_device, supported_speech_locales};
 
 /// No-op on non-macOS targets.
 #[cfg(not(target_os = "macos"))]

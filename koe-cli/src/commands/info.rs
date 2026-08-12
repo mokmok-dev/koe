@@ -120,7 +120,11 @@ fn format_info_text(info: &SystemInfo) -> String {
     if let Some(version) = &info.macos_version {
         let _ = writeln!(out, "  macOS version:   {version}");
     }
-    format_device_line(&mut out, "Default input:", info.default_input_device.as_ref());
+    format_device_line(
+        &mut out,
+        "Default input:",
+        info.default_input_device.as_ref(),
+    );
     format_device_line(
         &mut out,
         "Default output:",
