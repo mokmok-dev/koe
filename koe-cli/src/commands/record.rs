@@ -148,7 +148,13 @@ impl Run for RecordArgs {
             .build()
             .map_err(|err| MainError::Internal(format!("tokio runtime: {err}")))?;
 
-        runtime.block_on(run_recording(prepared))
+        let mut pending = runtime.block_on(run_until_shutdown_trigger(prepared))?;
+
+        // `block_on` returns on the CLI main thread — stop ScreenCaptureKit here
+        // so `stopCapture` completion handlers run on the AppKit main runloop.
+        pending.pipeline.stop_native_captures();
+
+        runtime.block_on(finalize_recording(pending))
     }
 }
 
@@ -452,7 +458,9 @@ fn list_locales() {
     }
 }
 
-async fn run_recording(prepared: PreparedSession) -> Result<(), MainError> {
+async fn run_until_shutdown_trigger(
+    prepared: PreparedSession
+) -> Result<PendingShutdown, MainError> {
     let meta = ProgressMeta::new(
         &prepared.config.audio_format,
         &prepared.config.source,
@@ -484,20 +492,36 @@ async fn run_recording(prepared: PreparedSession) -> Result<(), MainError> {
     )
     .await?;
 
+    Ok(PendingShutdown {
+        pipeline,
+        stop_reason,
+        renderer,
+        signals,
+    })
+}
+
+struct PendingShutdown {
+    pipeline: RecordingPipeline,
+    stop_reason: StopReason,
+    renderer: Box<dyn ProgressRenderer>,
+    signals: SignalListener,
+}
+
+async fn finalize_recording(mut pending: PendingShutdown) -> Result<(), MainError> {
     // Always clear the live TTY block before finalize (interrupt path also
     // clears earlier for the human-readable notice).
-    renderer.prepare_message();
+    pending.renderer.prepare_message();
 
-    let summary = match stop_reason {
+    let summary = match pending.stop_reason {
         StopReason::Interrupted { force } => {
-            stop_after_interrupt(&mut pipeline, &mut signals, force).await?
+            stop_after_interrupt(&mut pending.pipeline, &mut pending.signals, force).await?
         },
-        _ => pipeline.stop().await.map_err(map_pipeline_error)?,
+        _ => pending.pipeline.stop().await.map_err(map_pipeline_error)?,
     };
 
-    renderer.finish(&summary);
+    pending.renderer.finish(&summary);
 
-    if matches!(stop_reason, StopReason::Interrupted { .. }) {
+    if matches!(pending.stop_reason, StopReason::Interrupted { .. }) {
         return Err(MainError::Interrupted);
     }
     Ok(())

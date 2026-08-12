@@ -77,6 +77,37 @@ enum DrainOutcome {
 }
 
 impl RecordingPipeline {
+    /// Stops native capture (`ScreenCaptureKit` / Process Tap / mic) and the
+    /// both-source mixer.
+    ///
+    /// Call from the process main thread when `ScreenCaptureKit` is active so the
+    /// `AppKit` main runloop can pump `stopCapture` completion handlers. Safe to
+    /// call multiple times; [`Self::stop`] skips capture teardown when handles
+    /// are already gone.
+    pub fn stop_native_captures(&mut self) {
+        if matches!(self.state, PipelineState::Stopped | PipelineState::Idle) {
+            return;
+        }
+
+        if !self.shutdown.load(Ordering::Acquire) {
+            self.shutdown.store(true, Ordering::Release);
+            self.paused.store(false, Ordering::Release);
+            self.publish_status(RecordingState::Stopping, 0.0, 0.0);
+        }
+
+        // Dropping capture handles drops producers so the consumer / mixer
+        // unblock even if no more audio arrives.
+        //
+        // ScreenCaptureKit teardown must run on the main thread with the main
+        // runloop pumped (see `screen_audio::ScreenAudioSession::stop`).
+        for handle in self.capture_handles.drain(..) {
+            stop_capture(handle);
+        }
+        if let Some(mixer) = self.mixer_task.take() {
+            mixer.abort();
+        }
+    }
+
     /// Stops capture, drains remaining audio, finalizes outputs, and returns a summary.
     ///
     /// Waits up to [`SHUTDOWN_BUDGET`] for the consumer to drain. On timeout the
@@ -125,18 +156,7 @@ impl RecordingPipeline {
             ));
         }
 
-        self.shutdown.store(true, Ordering::Release);
-        self.paused.store(false, Ordering::Release);
-        self.publish_status(RecordingState::Stopping, 0.0, 0.0);
-
-        // Dropping capture handles drops producers so the consumer / mixer
-        // unblock even if no more audio arrives.
-        for handle in self.capture_handles.drain(..) {
-            stop_capture(handle);
-        }
-        if let Some(mixer) = self.mixer_task.take() {
-            mixer.abort();
-        }
+        self.stop_native_captures();
 
         let drain = self.join_consumer(mode).await;
         let consumer_drained = matches!(drain, DrainOutcome::Drained);

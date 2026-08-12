@@ -20,7 +20,8 @@ use block2::RcBlock;
 use dispatch2::{DispatchQueue, DispatchQueueAttr, DispatchRetained};
 use objc2::rc::Retained;
 use objc2::runtime::{NSObject, NSObjectProtocol, ProtocolObject};
-use objc2::{AnyThread, DefinedClass, Message, define_class, msg_send};
+use objc2::{AnyThread, DefinedClass, MainThreadMarker, Message, define_class, msg_send};
+use objc2_app_kit::{NSApplication, NSApplicationActivationPolicy};
 use objc2_core_media::{CMSampleBuffer, CMTime};
 use objc2_foundation::{NSArray, NSError};
 use objc2_screen_capture_kit::{
@@ -37,6 +38,7 @@ use super::{CaptureSession, monotonic_ms};
 const PIXEL_FORMAT_BGRA: u32 = u32::from_be_bytes(*b"BGRA");
 const ASSURE_16_BYTE_ALIGNMENT: u32 = 1 << 0;
 const SCK_WAIT_TIMEOUT: Duration = Duration::from_secs(15);
+const SCK_STOP_TIMEOUT: Duration = Duration::from_secs(5);
 
 type AudioSink = Arc<dyn Fn(Vec<f32>) + Send + Sync>;
 type CFRunLoopRef = *mut c_void;
@@ -127,7 +129,7 @@ impl AudioOutput {
 
 pub(super) struct ScreenAudioSession {
     stream: Retained<SCStream>,
-    _output: Retained<AudioOutput>,
+    output: Retained<AudioOutput>,
     _queue: DispatchRetained<DispatchQueue>,
     stopped: Mutex<bool>,
 }
@@ -183,8 +185,6 @@ fn start_sck(
     handle: Arc<CaptureHandle>,
 ) -> Result<Box<dyn CaptureSession>, CaptureError> {
     // ScreenCaptureKit / CoreGraphics require AppKit initialization in CLI hosts.
-    use objc2::MainThreadMarker;
-    use objc2_app_kit::{NSApplication, NSApplicationActivationPolicy};
     let Some(mtm) = MainThreadMarker::new() else {
         return Err(CaptureError::Internal {
             msg: "ScreenCaptureKit must start on the main thread".to_owned(),
@@ -231,7 +231,7 @@ fn start_sck(
 
     Ok(Box::new(ScreenAudioSession {
         stream,
-        _output: output,
+        output,
         _queue: queue,
         stopped: Mutex::new(false),
     }))
@@ -281,15 +281,35 @@ fn start_capture(stream: &SCStream) -> Result<(), CaptureError> {
     }
 }
 
+fn teardown_stream(
+    stream: &SCStream,
+    output: &AudioOutput,
+) {
+    let proto: &ProtocolObject<dyn SCStreamOutput> = ProtocolObject::from_ref(output);
+    // Best-effort detach so SCStream releases the output before stop completes.
+    unsafe {
+        let _ = stream.removeStreamOutput_type_error(proto, SCStreamOutputType::Audio);
+    }
+    stop_capture(stream);
+}
+
 fn stop_capture(stream: &SCStream) {
-    let (tx, rx) = mpsc::channel::<()>();
-    let block = RcBlock::new(move |_err: *mut NSError| {
-        let _ = tx.send(());
+    let (tx, rx) = mpsc::channel::<Result<(), String>>();
+    let block = RcBlock::new(move |err: *mut NSError| {
+        let result = if err.is_null() {
+            Ok(())
+        } else {
+            Err(unsafe { Retained::retain(err) }
+                .map(|e| e.localizedDescription().to_string())
+                .unwrap_or_else(|| "stopCapture failed".into()))
+        };
+        let _ = tx.send(result);
     });
     unsafe {
         stream.stopCaptureWithCompletionHandler(Some(&block));
     }
-    let _ = recv_pumping_runloop(&rx, Duration::from_secs(2));
+    // Best-effort: completion may not fire if TCC revoked mid-session.
+    let _ = recv_pumping_runloop(&rx, SCK_STOP_TIMEOUT);
 }
 
 fn find_app(
@@ -375,7 +395,26 @@ impl CaptureSession for ScreenAudioSession {
             return;
         }
         *stopped = true;
-        stop_capture(&self.stream);
+
+        // ScreenCaptureKit completion handlers run on the main runloop. Stop
+        // must run on the main thread and pump that runloop while waiting.
+        if MainThreadMarker::new().is_some() {
+            teardown_stream(&self.stream, &self.output);
+        } else {
+            // Best-effort when a multi-thread runtime calls stop from a worker.
+            // CLI hosts should call `RecordingPipeline::stop_native_captures` on
+            // the main thread before async `stop` (see `koe record`).
+            let proto: &ProtocolObject<dyn SCStreamOutput> =
+                ProtocolObject::from_ref(&*self.output);
+            unsafe {
+                let _ = self
+                    .stream
+                    .removeStreamOutput_type_error(proto, SCStreamOutputType::Audio);
+                // SAFETY: Fire-and-forget stop; completion cannot be awaited off
+                // the main thread without deadlocking `block_on` on the main thread.
+                self.stream.stopCaptureWithCompletionHandler(None);
+            }
+        }
     }
 }
 
