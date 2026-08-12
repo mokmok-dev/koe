@@ -460,8 +460,7 @@ async fn run_recording(prepared: PreparedSession) -> Result<(), MainError> {
 
     eprintln!("Recording → {}", output_path.display());
 
-    let mut signals =
-        SignalListener::install().map_err(MainError::Internal)?;
+    let mut signals = SignalListener::install().map_err(MainError::Internal)?;
 
     let stop_reason = wait_until_done(
         &mut pipeline,

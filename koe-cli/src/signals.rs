@@ -105,10 +105,10 @@ impl SignalListener {
         {
             use tokio::signal::unix::{SignalKind, signal};
 
-            let sigint = signal(SignalKind::interrupt())
-                .map_err(|err| format!("SIGINT handler: {err}"))?;
-            let sigterm = signal(SignalKind::terminate())
-                .map_err(|err| format!("SIGTERM handler: {err}"))?;
+            let sigint =
+                signal(SignalKind::interrupt()).map_err(|err| format!("SIGINT handler: {err}"))?;
+            let sigterm =
+                signal(SignalKind::terminate()).map_err(|err| format!("SIGTERM handler: {err}"))?;
             let sigusr1 = signal(SignalKind::from_raw(sigusr1_raw()))
                 .map_err(|err| format!("SIGUSR1 handler: {err}"))?;
             Ok(Self {
