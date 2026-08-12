@@ -54,6 +54,7 @@ impl SpeechFeeder for TranscriptionFeeder {
 }
 
 /// No-op feeder used when [`super::PipelineConfig::transcribe`] is false.
+#[derive(Debug, Default)]
 pub struct NullSpeechFeeder;
 
 impl SpeechFeeder for NullSpeechFeeder {

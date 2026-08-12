@@ -192,6 +192,15 @@ fn prepare_session(args: &RecordArgs) -> Result<PreparedSession, MainError> {
         .map_err(MainError::InvalidArgs)?;
 
     let transcribe = !args.no_transcribe;
+    if !transcribe
+        && (args.transcript_output.is_some()
+            || args.transcript_format != "txt"
+            || args.locale != "en-US")
+    {
+        eprintln!(
+            "warning: --no-transcribe ignores --locale / --transcript-format / --transcript-output"
+        );
+    }
     let transcript_output_path = if transcribe {
         Some(
             args.transcript_output
@@ -320,6 +329,9 @@ fn default_transcript_path(
 }
 
 /// Parses durations like `30s`, `5m`, `1h`, `2h30m`, `1h30m10s`.
+///
+/// Rejects empty, zero, and values that cannot safely form an [`Instant`]
+/// deadline (~292 years).
 fn parse_duration(input: &str) -> Result<Duration, String> {
     let raw = input.trim();
     if raw.is_empty() {
@@ -330,7 +342,7 @@ fn parse_duration(input: &str) -> Result<Duration, String> {
         let secs: u64 = raw
             .parse()
             .map_err(|_| format!("invalid duration '{raw}'"))?;
-        return Ok(Duration::from_secs(secs));
+        return checked_positive_duration(secs, raw);
     }
 
     let mut total_secs: u64 = 0;
@@ -348,13 +360,16 @@ fn parse_duration(input: &str) -> Result<Duration, String> {
             .map_err(|_| format!("invalid duration '{raw}'"))?;
         number.clear();
         let factor = match ch {
-            'h' | 'H' => 3600,
+            'h' | 'H' => 3600_u64,
             'm' | 'M' => 60,
             's' | 'S' => 1,
             _ => return Err(format!("invalid duration unit '{ch}' in '{raw}'")),
         };
+        let part = value
+            .checked_mul(factor)
+            .ok_or_else(|| format!("duration '{raw}' is too large"))?;
         total_secs = total_secs
-            .checked_add(value.saturating_mul(factor))
+            .checked_add(part)
             .ok_or_else(|| format!("duration '{raw}' is too large"))?;
     }
     if !number.is_empty() {
@@ -362,10 +377,23 @@ fn parse_duration(input: &str) -> Result<Duration, String> {
             "duration '{raw}' is missing a unit on trailing digits"
         ));
     }
-    if total_secs == 0 {
+    checked_positive_duration(total_secs, raw)
+}
+
+/// Caps at ~100 years so `Instant::now() + duration` cannot panic.
+const MAX_DURATION_SECS: u64 = 100 * 365 * 24 * 60 * 60;
+
+fn checked_positive_duration(
+    secs: u64,
+    raw: &str,
+) -> Result<Duration, String> {
+    if secs == 0 {
         return Err(format!("duration '{raw}' must be greater than zero"));
     }
-    Ok(Duration::from_secs(total_secs))
+    if secs > MAX_DURATION_SECS {
+        return Err(format!("duration '{raw}' is too large"));
+    }
+    Ok(Duration::from_secs(secs))
 }
 
 /// Parses sizes like `500M`, `2G`, `100K`, `1024` (bytes).
@@ -504,11 +532,22 @@ async fn wait_until_done(
     let mut progress = pipeline.subscribe_progress();
     let deadline = max_duration.map(|d| Instant::now() + d);
     let mut last_sound = Instant::now();
+    // Poll silence even when no meter updates arrive.
+    let silence_tick = Duration::from_millis(200);
+    let mut sigterm = install_terminate_signal()?;
 
     loop {
-        let sleep_for = deadline.map_or(Duration::ZERO, |at| {
-            at.saturating_duration_since(Instant::now())
+        let until_deadline = deadline.map(|at| at.saturating_duration_since(Instant::now()));
+        let until_silence = silence_timeout.map(|timeout| {
+            timeout.saturating_sub(last_sound.elapsed()).max(silence_tick)
         });
+        let sleep_for = match (until_deadline, until_silence) {
+            (Some(d), Some(s)) => d.min(s),
+            (Some(d), None) => d,
+            (None, Some(s)) => s,
+            (None, None) => Duration::from_mins(1),
+        };
+        let sleep_armed = deadline.is_some() || silence_timeout.is_some();
 
         tokio::select! {
             ctrl = tokio::signal::ctrl_c() => {
@@ -516,8 +555,21 @@ async fn wait_until_done(
                 eprintln!("Interrupted — finishing recording…");
                 return Ok(StopReason::Interrupted);
             }
-            () = tokio::time::sleep(sleep_for), if deadline.is_some() => {
-                return Ok(StopReason::DurationLimit);
+            () = recv_terminate(&mut sigterm) => {
+                eprintln!("Interrupted — finishing recording…");
+                return Ok(StopReason::Interrupted);
+            }
+            () = tokio::time::sleep(sleep_for), if sleep_armed => {
+                if let Some(at) = deadline
+                    && Instant::now() >= at
+                {
+                    return Ok(StopReason::DurationLimit);
+                }
+                if let Some(timeout) = silence_timeout
+                    && last_sound.elapsed() >= timeout
+                {
+                    return Ok(StopReason::SilenceTimeout);
+                }
             }
             status = progress.recv() => {
                 match status {
@@ -527,11 +579,13 @@ async fn wait_until_done(
                         {
                             return Ok(StopReason::MaxSize);
                         }
-                        if let Some(timeout) = silence_timeout {
+                        if silence_timeout.is_some() {
                             let peak = status.level_left.max(status.level_right);
                             if peak >= SILENCE_PEAK_THRESHOLD {
                                 last_sound = Instant::now();
-                            } else if last_sound.elapsed() >= timeout {
+                            } else if let Some(timeout) = silence_timeout
+                                && last_sound.elapsed() >= timeout
+                            {
                                 return Ok(StopReason::SilenceTimeout);
                             }
                         }
@@ -540,12 +594,43 @@ async fn wait_until_done(
                         // Best-effort progress; keep waiting.
                     }
                     Err(tokio::sync::broadcast::error::RecvError::Closed) => {
-                        // Pipeline stopped underneath us.
+                        // Progress publisher gone; finish gracefully.
                         return Ok(StopReason::DurationLimit);
                     }
                 }
             }
         }
+    }
+}
+
+#[cfg(unix)]
+struct TerminateSignal(tokio::signal::unix::Signal);
+
+#[cfg(not(unix))]
+struct TerminateSignal;
+
+fn install_terminate_signal() -> Result<TerminateSignal, MainError> {
+    #[cfg(unix)]
+    {
+        let signal = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+            .map_err(|err| MainError::Internal(format!("SIGTERM handler: {err}")))?;
+        Ok(TerminateSignal(signal))
+    }
+    #[cfg(not(unix))]
+    {
+        Ok(TerminateSignal)
+    }
+}
+
+async fn recv_terminate(signal: &mut TerminateSignal) {
+    #[cfg(unix)]
+    {
+        let _ = signal.0.recv().await;
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = signal;
+        std::future::pending::<()>().await;
     }
 }
 
@@ -589,9 +674,9 @@ fn map_pipeline_error(err: PipelineError) -> MainError {
         PipelineError::Io(err) => MainError::Io(err.to_string()),
         PipelineError::Capture(err) => MainError::Capture(err.to_string()),
         PipelineError::Monitor(err) => MainError::Capture(err.to_string()),
-        PipelineError::Transcription(err) => MainError::InvalidArgs(err.to_string()),
+        PipelineError::Transcription(err) => MainError::Internal(err.to_string()),
         PipelineError::Recording(RecordingError::Transcription(err)) => {
-            MainError::InvalidArgs(err.to_string())
+            MainError::Internal(err.to_string())
         },
         PipelineError::Codec(err) => MainError::Internal(err.to_string()),
         PipelineError::InvalidState(msg)
@@ -681,6 +766,8 @@ mod tests {
         assert_eq!(parse_duration("90").unwrap(), Duration::from_secs(90));
         assert!(parse_duration("").is_err());
         assert!(parse_duration("0s").is_err());
+        assert!(parse_duration("0").is_err());
+        assert!(parse_duration("999999999h").is_err());
     }
 
     #[test]

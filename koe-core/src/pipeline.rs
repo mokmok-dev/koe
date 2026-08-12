@@ -55,11 +55,11 @@ pub struct PipelineConfig {
     pub output_path: PathBuf,
     /// Optional path for transcript output.
     pub transcript_output_path: Option<PathBuf>,
-    /// BCP-47 locale for speech recognition.
+    /// BCP-47 locale for speech recognition (ignored when [`Self::transcribe`] is false).
     pub locale: String,
     /// Encoded audio format.
     pub audio_format: OutputFormat,
-    /// Transcript file format.
+    /// Transcript file format (ignored when [`Self::transcribe`] is false).
     pub transcript_format: TranscriptFormat,
     /// Enable acoustic echo cancellation (for `Both` sources).
     pub enable_aec: bool,
@@ -71,7 +71,10 @@ pub struct PipelineConfig {
     /// Create failures are logged and monitoring is disabled so recording still
     /// proceeds. Write failures after start are also non-fatal.
     pub monitor: bool,
-    /// Run on-device speech recognition and (optionally) write a transcript.
+    /// Run on-device speech recognition.
+    ///
+    /// When `false`, ASR is skipped and [`Self::transcript_output_path`] must be
+    /// `None` (validated in [`RecordingPipeline::start`]).
     pub transcribe: bool,
     /// Optional estimated recording duration for disk-space checks.
     pub estimated_duration_hours: Option<f64>,
@@ -405,6 +408,11 @@ fn validate_config(config: &PipelineConfig) -> Result<(), PipelineError> {
     validate_capture_source(&config.source)?;
     if config.transcribe {
         validate_locale(&config.locale)?;
+    } else if config.transcript_output_path.is_some() {
+        return Err(RecordingError::ConfigError {
+            msg: "transcript_output_path requires transcribe=true".to_owned(),
+        }
+        .into());
     }
     let output = config
         .output_path
@@ -413,6 +421,14 @@ fn validate_config(config: &PipelineConfig) -> Result<(), PipelineError> {
             msg: "output path is not valid UTF-8".to_owned(),
         })?;
     validate_output_path(output)?;
+    if let Some(path) = &config.transcript_output_path
+        && path.exists()
+    {
+        return Err(RecordingError::OutputExists {
+            path: path.to_str().unwrap_or("<invalid utf-8>").to_owned(),
+        }
+        .into());
+    }
     Ok(())
 }
 
