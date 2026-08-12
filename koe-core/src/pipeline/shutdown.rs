@@ -366,6 +366,7 @@ mod tests {
             output_path: output.to_path_buf(),
             transcript_output_path: None,
             locale: "en-US".into(),
+            speech_engine: koe_ffi::SpeechEngine::Auto,
             audio_format: OutputFormat::Wav {
                 bits_per_sample: 16,
             },

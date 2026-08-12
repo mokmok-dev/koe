@@ -42,7 +42,7 @@ use objc2_speech::{
 
 use crate::error::TranscriptionError;
 use crate::handles::TranscriptionHandle;
-use crate::types::TranscriptionSegment;
+use crate::types::{SpeechEngine, TranscriptionSegment};
 
 /// PCM frame rate fed to the recognizer (matches the pipeline's canonical rate).
 const SAMPLE_RATE_HZ: f64 = 48_000.0;
@@ -65,6 +65,10 @@ pub enum Engine {
 
 /// `None` = not yet probed; see [`probe_engine`].
 static ENGINE_CACHE: OnceLock<Engine> = OnceLock::new();
+
+fn on_device_help() -> String {
+    "enable Dictation / on-device speech models in System Settings → Apple Intelligence & Siri → Dictation, or use engine=network to explicitly allow Apple server-side recognition".to_owned()
+}
 
 /// Whether the recognizer reported a system-level engine failure ("Siri and
 /// Dictation are disabled" et al.) which a retry with network recognition
@@ -201,17 +205,27 @@ unsafe impl Send for SpeechSession {}
 unsafe impl Sync for SpeechSession {}
 
 impl SpeechSession {
-    /// Starts recognition on `handle`, preferring the probed engine.
+    /// Starts recognition on `handle` using the requested [`SpeechEngine`].
+    ///
+    /// - [`SpeechEngine::Auto`] prefers on-device and falls back to network
+    ///   recognition when the host cannot run on-device models.
+    /// - [`SpeechEngine::OnDevice`] never sends audio off-device: it errors
+    ///   with [`TranscriptionError::OnDeviceUnavailable`] instead of falling
+    ///   back.
+    /// - [`SpeechEngine::Network`] always uses server-side recognition.
     ///
     /// # Errors
     ///
     /// [`TranscriptionError::UnsupportedLocale`] when the locale is unknown,
-    /// [`TranscriptionError::NotAvailable`] when speech services are
-    /// unavailable, and [`TranscriptionError::PermissionDenied`] when speech
-    /// authorization has not been granted.
+    /// [`TranscriptionError::PermissionDenied`] when speech authorization has
+    /// not been granted, [`TranscriptionError::OnDeviceUnavailable`] when
+    /// [`SpeechEngine::OnDevice`] is requested but unavailable, and
+    /// [`TranscriptionError::NotAvailable`] when speech services are otherwise
+    /// unavailable.
     pub fn start(
         handle: &Arc<TranscriptionHandle>,
         locale: &str,
+        requested: SpeechEngine,
     ) -> Result<Self, TranscriptionError> {
         let status = unsafe { SFSpeechRecognizer::authorizationStatus() };
         if status != SFSpeechRecognizerAuthorizationStatus::Authorized {
@@ -229,11 +243,32 @@ impl SpeechSession {
             make_recognizer(locale).ok_or_else(|| TranscriptionError::UnsupportedLocale {
                 locale: locale.to_owned(),
             })?;
-        let engine = probe_engine(&recognizer);
-        if engine == Engine::Unavailable {
-            return Err(TranscriptionError::NotAvailable);
-        }
-        let use_on_device = engine == Engine::OnDevice;
+
+        // Resolve the requested engine to a concrete on-device / network mode.
+        // `Network` skips the probe entirely (no throwaway task, no audio
+        // off-device until the user asked for it).
+        let use_on_device = match requested {
+            SpeechEngine::Network => false,
+            SpeechEngine::OnDevice => match probe_engine(&recognizer) {
+                Engine::OnDevice => true,
+                Engine::Network | Engine::Unavailable => {
+                    return Err(TranscriptionError::OnDeviceUnavailable {
+                        msg: on_device_help(),
+                    });
+                },
+            },
+            SpeechEngine::Auto => match probe_engine(&recognizer) {
+                Engine::OnDevice => true,
+                Engine::Network => false,
+                Engine::Unavailable => return Err(TranscriptionError::NotAvailable),
+            },
+        };
+        let engine = if use_on_device {
+            Engine::OnDevice
+        } else {
+            Engine::Network
+        };
+
         let request = make_request(use_on_device);
         let queue = make_result_queue();
         // SAFETY: assigning our own serial result queue.

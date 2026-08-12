@@ -13,6 +13,7 @@ pub mod builtin {
     pub const FORMAT: &str = "ogg";
     pub const LOCALE: &str = "en-US";
     pub const TRANSCRIPT_FORMAT: &str = "txt";
+    pub const SPEECH_ENGINE: &str = "auto";
     pub const SAMPLE_RATE_HZ: u32 = 48_000;
     pub const CHANNELS: u8 = 2;
     pub const AEC_ENABLED: bool = true;
@@ -37,6 +38,7 @@ pub struct DefaultsSection {
     pub format: Option<String>,
     pub locale: Option<String>,
     pub transcript_format: Option<String>,
+    pub engine: Option<String>,
     pub sample_rate: Option<u32>,
     pub channels: Option<u8>,
 }
@@ -62,6 +64,7 @@ pub struct OutputSection {
 pub struct TranscriptionSection {
     pub locale: Option<String>,
     pub transcript_format: Option<String>,
+    pub engine: Option<String>,
 }
 
 /// Loads config from `--config` or the default path.
@@ -196,6 +199,23 @@ pub fn transcribe_format(
     )
 }
 
+/// Speech engine for `koe transcribe`: CLI > `[transcription]` > `[defaults]` > built-in.
+#[must_use]
+pub fn transcribe_engine(
+    cli: Option<String>,
+    config: &KoeConfig,
+) -> String {
+    coalesce_owned(
+        cli,
+        config
+            .transcription
+            .engine
+            .as_deref()
+            .or(config.defaults.engine.as_deref()),
+        builtin::SPEECH_ENGINE,
+    )
+}
+
 fn home_dir() -> Option<PathBuf> {
     std::env::var_os("HOME").map(PathBuf::from)
 }
@@ -213,6 +233,7 @@ source = "system"
 format = "ogg"
 locale = "en-US"
 transcript-format = "txt"
+engine = "auto"
 sample-rate = 48000
 channels = 2
 
@@ -226,12 +247,14 @@ directory = "~/Recordings/Koe"
 [transcription]
 locale = "en-US"
 transcript-format = "srt"
+engine = "on-device"
 "#,
         )
         .expect("parse");
 
         assert_eq!(config.defaults.source.as_deref(), Some("system"));
         assert_eq!(config.defaults.transcript_format.as_deref(), Some("txt"));
+        assert_eq!(config.defaults.engine.as_deref(), Some("auto"));
         assert_eq!(config.aec.enabled, Some(true));
         assert_eq!(config.aec.comfort_noise, Some(true));
         assert_eq!(config.output.directory.as_deref(), Some("~/Recordings/Koe"));
@@ -239,6 +262,7 @@ transcript-format = "srt"
             config.transcription.transcript_format.as_deref(),
             Some("srt")
         );
+        assert_eq!(config.transcription.engine.as_deref(), Some("on-device"));
     }
 
     #[test]
@@ -281,13 +305,17 @@ enabled = false
         let mut config = KoeConfig::default();
         config.defaults.locale = Some("ja-JP".into());
         config.defaults.transcript_format = Some("txt".into());
+        config.defaults.engine = Some("network".into());
         assert_eq!(transcribe_locale(None, &config), "ja-JP");
         assert_eq!(transcribe_format(None, &config), "txt");
+        assert_eq!(transcribe_engine(None, &config), "network");
 
         config.transcription.locale = Some("fr-FR".into());
         config.transcription.transcript_format = Some("srt".into());
+        config.transcription.engine = Some("on-device".into());
         assert_eq!(transcribe_locale(None, &config), "fr-FR");
         assert_eq!(transcribe_format(Some("vtt".into()), &config), "vtt");
+        assert_eq!(transcribe_engine(Some("auto".into()), &config), "auto");
     }
 
     #[test]
