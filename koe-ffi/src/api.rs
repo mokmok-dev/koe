@@ -1,6 +1,7 @@
 //! Exported FFI entry points.
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::callbacks::{AudioCallbackRef, ProgressCallbackRef, TranscriptionCallbackRef};
 use crate::error::{
@@ -96,12 +97,31 @@ pub fn stop_monitor(handle: Arc<MonitorHandle>) {
     let _ = handle.id;
 }
 
+/// When true, [`start_transcription`] returns a handle without a native speech
+/// session (test / CI harness only — mirrors [`crate::set_capture_stub`]).
+static STUB_TRANSCRIPTION: AtomicBool = AtomicBool::new(false);
+
+/// Enables or disables no-op transcription for tests that only need lifecycle.
+///
+/// Not part of the supported public API — test / CI harness only.
+#[doc(hidden)]
+pub fn set_transcription_stub(enabled: bool) {
+    STUB_TRANSCRIPTION.store(enabled, Ordering::SeqCst);
+}
+
+fn transcription_stubbed() -> bool {
+    STUB_TRANSCRIPTION.load(Ordering::SeqCst)
+}
+
 #[cfg(target_os = "macos")]
 #[allow(clippy::needless_pass_by_value)]
 fn start_transcription_native(
     handle: &Arc<TranscriptionHandle>,
     locale: &str,
 ) -> Result<(), TranscriptionError> {
+    if transcription_stubbed() {
+        return Ok(());
+    }
     let session = crate::speech_session::SpeechSession::start(handle, locale)?;
     if session.engine() == crate::speech_session::Engine::Network {
         eprintln!(

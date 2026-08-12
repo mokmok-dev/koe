@@ -623,6 +623,7 @@ mod tests {
 
     fn install_provider(permissions: Vec<(Permission, PermissionStatus)>) {
         koe_ffi::set_capture_stub(true);
+        koe_ffi::set_transcription_stub(true);
         register_native_provider(Box::new(TestProvider { permissions }));
     }
 
