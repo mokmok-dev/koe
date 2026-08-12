@@ -200,11 +200,10 @@ fn prepare_session(
         );
     }
     let transcript_output_path = if transcribe {
-        Some(
-            args.transcript_output
-                .clone()
-                .unwrap_or_else(|| default_transcript_path(&output, transcript_format)),
-        )
+        Some(args.transcript_output.as_ref().map_or_else(
+            || default_transcript_path(&output, transcript_format),
+            |path| config::resolve_under_output_dir(path, file),
+        ))
     } else {
         None
     };
@@ -254,12 +253,12 @@ fn merge_record_options(
     );
     if sample_rate != CANONICAL_SAMPLE_RATE_HZ {
         return Err(MainError::InvalidArgs(format!(
-            "--sample-rate must be {CANONICAL_SAMPLE_RATE_HZ} (canonical pipeline rate)"
+            "sample-rate must be {CANONICAL_SAMPLE_RATE_HZ} (canonical pipeline rate); got {sample_rate}"
         )));
     }
     if channels != CANONICAL_CHANNELS {
         return Err(MainError::InvalidArgs(format!(
-            "--channels must be {CANONICAL_CHANNELS} (canonical stereo pipeline)"
+            "channels must be {CANONICAL_CHANNELS} (canonical stereo pipeline); got {channels}"
         )));
     }
 
@@ -345,7 +344,7 @@ fn resolve_source(
             })
         },
         other => Err(MainError::InvalidArgs(format!(
-            "unknown --source '{other}' (expected system, mic, or both)"
+            "unknown source '{other}' (expected system, mic, or both)"
         ))),
     }
 }
@@ -360,7 +359,7 @@ fn parse_audio_format(value: &str) -> Result<OutputFormat, MainError> {
             compression_level: 5,
         }),
         other => Err(MainError::InvalidArgs(format!(
-            "unknown --format '{other}' (expected ogg, wav, or flac)"
+            "unknown format '{other}' (expected ogg, wav, or flac)"
         ))),
     }
 }
@@ -372,7 +371,7 @@ fn parse_transcript_format(value: &str) -> Result<TranscriptFormat, MainError> {
         "vtt" => Ok(TranscriptFormat::Vtt),
         "json" => Ok(TranscriptFormat::Json),
         other => Err(MainError::InvalidArgs(format!(
-            "unknown --transcript-format '{other}' (expected txt, srt, vtt, or json)"
+            "unknown transcript-format '{other}' (expected txt, srt, vtt, or json)"
         ))),
     }
 }
@@ -825,6 +824,31 @@ enabled = true
         assert_eq!(
             prepared.config.output_path,
             PathBuf::from("/tmp/koe-recs/meet.ogg")
+        );
+        assert_eq!(
+            prepared.config.transcript_output_path.as_deref(),
+            Some(Path::new("/tmp/koe-recs/meet.txt"))
+        );
+    }
+
+    #[test]
+    fn prepare_resolves_relative_transcript_output() {
+        let args = RecordArgs::try_parse_from([
+            "record",
+            "--source",
+            "mic",
+            "-o",
+            "meet.ogg",
+            "--transcript-output",
+            "notes.srt",
+        ])
+        .expect("parse");
+        let mut file = KoeConfig::default();
+        file.output.directory = Some("/tmp/koe-recs".into());
+        let prepared = prepare_session(&args, &file).expect("prepare");
+        assert_eq!(
+            prepared.config.transcript_output_path.as_deref(),
+            Some(Path::new("/tmp/koe-recs/notes.srt"))
         );
     }
 }

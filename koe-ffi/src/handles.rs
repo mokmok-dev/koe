@@ -29,7 +29,8 @@ pub struct CaptureHandle {
 }
 
 impl CaptureHandle {
-    #[cfg_attr(not(target_os = "macos"), expect(dead_code))]
+    // Constructed from `start_capture` on macOS; tests exercise it on all targets.
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     pub(crate) fn new(
         source: AudioSourceConfig,
         callback: AudioCallbackRef,

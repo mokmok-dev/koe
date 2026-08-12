@@ -1,7 +1,7 @@
 //! TOML config loading and path helpers for `koe-cli`.
 //!
 //! Precedence: CLI flags > config file > built-in defaults.
-//! Default path: `~/.config/koe/config.toml` (XDG-style; not macOS Application Support).
+//! Default path: `~/.config/koe/config.toml` (explicit XDG layout under `$HOME`).
 
 use std::path::{Path, PathBuf};
 
@@ -21,7 +21,7 @@ pub mod builtin {
 
 /// Root config file shape (`~/.config/koe/config.toml`).
 #[derive(Debug, Default, Clone, PartialEq, Eq, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct KoeConfig {
     pub defaults: DefaultsSection,
     pub aec: AecSection,
@@ -31,7 +31,7 @@ pub struct KoeConfig {
 
 /// Defaults applied mainly by `koe record`.
 #[derive(Debug, Default, Clone, PartialEq, Eq, Deserialize)]
-#[serde(default, rename_all = "kebab-case")]
+#[serde(default, rename_all = "kebab-case", deny_unknown_fields)]
 pub struct DefaultsSection {
     pub source: Option<String>,
     pub format: Option<String>,
@@ -43,7 +43,7 @@ pub struct DefaultsSection {
 
 /// Acoustic echo cancellation defaults for `koe record --source both`.
 #[derive(Debug, Default, Clone, PartialEq, Eq, Deserialize)]
-#[serde(default, rename_all = "kebab-case")]
+#[serde(default, rename_all = "kebab-case", deny_unknown_fields)]
 pub struct AecSection {
     pub enabled: Option<bool>,
     pub comfort_noise: Option<bool>,
@@ -51,14 +51,14 @@ pub struct AecSection {
 
 /// Default output directory (tilde-expanded when used).
 #[derive(Debug, Default, Clone, PartialEq, Eq, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct OutputSection {
     pub directory: Option<String>,
 }
 
 /// Defaults for `koe transcribe` (falls back to [`DefaultsSection`] when unset).
 #[derive(Debug, Default, Clone, PartialEq, Eq, Deserialize)]
-#[serde(default, rename_all = "kebab-case")]
+#[serde(default, rename_all = "kebab-case", deny_unknown_fields)]
 pub struct TranscriptionSection {
     pub locale: Option<String>,
     pub transcript_format: Option<String>,
@@ -315,8 +315,13 @@ enabled = false
     }
 
     #[test]
-    fn load_missing_default_is_empty() {
-        // Unlikely to exist under a fresh temp HOME — use explicit missing path.
+    fn rejects_unknown_keys() {
+        let err = parse_toml("[defaults]\nunknown-key = 1\n").expect_err("unknown");
+        assert!(err.contains("unknown") || err.contains("unknown-key") || err.contains("did you mean"));
+    }
+
+    #[test]
+    fn load_explicit_missing_errors() {
         let err = load(Some(Path::new("/tmp/koe-definitely-missing-97e3.toml")))
             .expect_err("explicit missing");
         assert!(err.contains("not found"));
