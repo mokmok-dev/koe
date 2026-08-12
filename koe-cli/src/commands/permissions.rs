@@ -28,7 +28,10 @@ struct PermissionRow {
 }
 
 impl Run for PermissionsArgs {
-    fn run(self) -> Result<(), MainError> {
+    fn run(
+        self,
+        _config: &crate::config::KoeConfig,
+    ) -> Result<(), MainError> {
         if !native_provider_registered() {
             return Err(MainError::NativeBridgeUnavailable("permissions"));
         }
@@ -252,7 +255,7 @@ mod tests {
             json: false,
             check: false,
         }
-        .run()
+        .run(&crate::config::KoeConfig::default())
         .expect_err("must fail without provider");
         assert!(matches!(
             err,

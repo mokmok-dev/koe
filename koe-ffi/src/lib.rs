@@ -52,7 +52,7 @@ pub const fn install_default_native_provider() -> bool {
 
 /// Capture stub toggle (no-op off macOS).
 #[cfg(not(target_os = "macos"))]
-pub fn set_capture_stub(_enabled: bool) {}
+pub const fn set_capture_stub(_enabled: bool) {}
 
 /// No default input device outside macOS.
 #[cfg(not(target_os = "macos"))]
