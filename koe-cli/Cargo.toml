@@ -12,6 +12,13 @@ clap = { workspace = true, features = ["derive"] }
 koe-core = { path = "../koe-core" }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
+tokio = { workspace = true, features = [
+  "macros",
+  "rt-multi-thread",
+  "signal",
+  "sync",
+  "time",
+] }
 
 [lints]
 workspace = true

@@ -53,6 +53,17 @@ impl SpeechFeeder for TranscriptionFeeder {
     }
 }
 
+/// No-op feeder used when [`super::PipelineConfig::transcribe`] is false.
+pub struct NullSpeechFeeder;
+
+impl SpeechFeeder for NullSpeechFeeder {
+    fn feed_audio(
+        &self,
+        _pcm: Vec<f32>,
+    ) {
+    }
+}
+
 /// Shared state passed into the consumer task.
 pub struct ConsumerContext {
     pub encoder: Arc<Mutex<Box<dyn AudioEncoder>>>,

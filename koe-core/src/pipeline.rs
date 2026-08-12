@@ -27,7 +27,9 @@ use crate::codec::{AudioEncoder, OggComments, create_encoder};
 use crate::transcript::{TranscriptFormatter, TranscriptMeta, create_formatter};
 
 pub use chunk::AudioChunk;
-pub use consumer::{ConsumerContext, SpeechFeeder, TranscriptionFeeder, spawn_consumer};
+pub use consumer::{
+    ConsumerContext, NullSpeechFeeder, SpeechFeeder, TranscriptionFeeder, spawn_consumer,
+};
 pub use disk_check::{available_disk_space, check_disk_space};
 pub use error::PipelineError;
 pub use file_writer::FileWriter;
@@ -41,7 +43,11 @@ pub use monitor::{
 pub use shutdown::{FORCE_JOIN_BUDGET, SHUTDOWN_BUDGET, ShutdownMode, StopResult};
 
 /// Configuration for a recording session.
+///
+/// Feature toggles (`enable_aec`, `comfort_noise`, `monitor`, `transcribe`) are
+/// independent session flags; collapsing them into an enum would obscure that.
 #[derive(Debug, Clone)]
+#[allow(clippy::struct_excessive_bools)]
 pub struct PipelineConfig {
     /// Audio capture source.
     pub source: AudioSourceConfig,
@@ -65,6 +71,8 @@ pub struct PipelineConfig {
     /// Create failures are logged and monitoring is disabled so recording still
     /// proceeds. Write failures after start are also non-fatal.
     pub monitor: bool,
+    /// Run on-device speech recognition and (optionally) write a transcript.
+    pub transcribe: bool,
     /// Optional estimated recording duration for disk-space checks.
     pub estimated_duration_hours: Option<f64>,
 }
@@ -214,13 +222,8 @@ impl RecordingPipeline {
         let segments = Arc::new(Mutex::new(Vec::new()));
         let transcript = Arc::new(Mutex::new(transcript_fmt));
 
-        let transcription_callback = PipelineTranscriptionCallback {
-            segments: Arc::clone(&segments),
-            transcript: Arc::clone(&transcript),
-            metrics: Arc::clone(&metrics),
-        };
-        let transcription_handle =
-            start_transcription(config.locale.clone(), Box::new(transcription_callback))?;
+        let (transcription_handle, speech) =
+            open_transcription(&config, &segments, &transcript, &metrics)?;
 
         let (audio_tx, _audio_rx) = broadcast::channel(64);
         let audio_callback = PipelineAudioCallback {
@@ -249,7 +252,7 @@ impl RecordingPipeline {
 
         let consumer_ctx = ConsumerContext {
             encoder: Arc::clone(&encoder),
-            speech: Arc::new(TranscriptionFeeder::new(Arc::clone(&transcription_handle))),
+            speech,
             writer: Arc::clone(&file_writer),
             metrics: Arc::clone(&metrics),
             shutdown: Arc::clone(&shutdown),
@@ -276,7 +279,7 @@ impl RecordingPipeline {
             transcript_fmt: transcript,
             file_writer,
             capture_handle: Some(capture_handle),
-            transcription_handle: Some(transcription_handle),
+            transcription_handle,
             consumer_task: Some(consumer_task),
             shutdown,
             paused,
@@ -400,7 +403,9 @@ impl RecordingPipeline {
 
 fn validate_config(config: &PipelineConfig) -> Result<(), PipelineError> {
     validate_capture_source(&config.source)?;
-    validate_locale(&config.locale)?;
+    if config.transcribe {
+        validate_locale(&config.locale)?;
+    }
     let output = config
         .output_path
         .to_str()
@@ -410,6 +415,30 @@ fn validate_config(config: &PipelineConfig) -> Result<(), PipelineError> {
     validate_output_path(output)?;
     Ok(())
 }
+
+fn open_transcription(
+    config: &PipelineConfig,
+    segments: &Arc<Mutex<Vec<TranscriptionSegment>>>,
+    transcript: &Arc<Mutex<Box<dyn TranscriptFormatter>>>,
+    metrics: &Arc<PipelineMetrics>,
+) -> Result<TranscriptionSetup, PipelineError> {
+    if !config.transcribe {
+        return Ok((None, Arc::new(NullSpeechFeeder)));
+    }
+    let transcription_callback = PipelineTranscriptionCallback {
+        segments: Arc::clone(segments),
+        transcript: Arc::clone(transcript),
+        metrics: Arc::clone(metrics),
+    };
+    let handle = start_transcription(config.locale.clone(), Box::new(transcription_callback))?;
+    let feeder = Arc::new(TranscriptionFeeder::new(Arc::clone(&handle)));
+    Ok((Some(handle), feeder))
+}
+
+type TranscriptionSetup = (
+    Option<Arc<koe_ffi::TranscriptionHandle>>,
+    Arc<dyn SpeechFeeder>,
+);
 
 fn check_permissions(source: &AudioSourceConfig) -> Result<(), PipelineError> {
     for permission in required_permissions(source) {
@@ -496,6 +525,7 @@ mod tests {
             enable_aec: false,
             comfort_noise: false,
             monitor: false,
+            transcribe: true,
             estimated_duration_hours: None,
         }
     }
@@ -598,6 +628,34 @@ mod tests {
         }
         assert!(saw_stopping);
         assert!(saw_stopped);
+
+        let _ = std::fs::remove_file(output);
+    }
+
+    #[tokio::test]
+    async fn start_without_transcription() {
+        install_provider(vec![(Permission::Microphone, PermissionStatus::Authorized)]);
+        let output = std::env::temp_dir().join(format!(
+            "koe-pipeline-no-asr-{}-{}.wav",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+
+        let mut config = test_config(&output);
+        config.transcribe = false;
+        let mut pipeline = RecordingPipeline::start(config).await.expect("start");
+        assert!(pipeline.transcription_handle().is_none());
+
+        if let Some(handle) = pipeline.capture_handle() {
+            handle.deliver_audio(vec![0.1, -0.1], 10);
+        }
+
+        let summary = pipeline.stop().await.expect("stop");
+        assert!(summary.bytes_written > 0);
+        assert_eq!(summary.transcript_segment_count, 0);
 
         let _ = std::fs::remove_file(output);
     }

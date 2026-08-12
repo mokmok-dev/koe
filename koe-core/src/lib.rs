@@ -19,10 +19,13 @@ pub use koe_ffi::RecordingError;
 /// Summary payload returned from [`RecordingPipeline::stop`].
 pub use koe_ffi::RecordingSummary;
 
+/// Summary payload returned from [`RecordingPipeline::stop`].
+pub use koe_ffi::RecordingSummary;
+
 /// Discovery and permission entry points used by `koe-cli` (and GUI).
 pub use koe_ffi::{
-    AppInfo, Permission, PermissionStatus, check_permission, enumerate_apps,
-    install_default_native_provider, native_provider_registered,
+    AppInfo, AudioSourceConfig, OutputFormat, Permission, PermissionStatus, TranscriptFormat,
+    check_permission, enumerate_apps, install_default_native_provider, native_provider_registered,
 };
 
 /// Compile-time feature flags enabled in this `koe-core` build.
