@@ -21,5 +21,8 @@ use crate::MainError;
 use crate::config::KoeConfig;
 
 pub trait Run {
-    fn run(self, config: &KoeConfig) -> Result<(), MainError>;
+    fn run(
+        self,
+        config: &KoeConfig,
+    ) -> Result<(), MainError>;
 }

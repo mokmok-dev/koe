@@ -128,7 +128,10 @@ enum StopReason {
 }
 
 impl Run for RecordArgs {
-    fn run(self, config: &KoeConfig) -> Result<(), MainError> {
+    fn run(
+        self,
+        config: &KoeConfig,
+    ) -> Result<(), MainError> {
         if self.list_sources {
             return list_sources();
         }
@@ -250,11 +253,7 @@ fn merge_record_options(
         file.defaults.sample_rate,
         builtin::SAMPLE_RATE_HZ,
     );
-    let channels = config::coalesce_copy(
-        args.channels,
-        file.defaults.channels,
-        builtin::CHANNELS,
-    );
+    let channels = config::coalesce_copy(args.channels, file.defaults.channels, builtin::CHANNELS);
     if sample_rate != CANONICAL_SAMPLE_RATE_HZ {
         return Err(MainError::InvalidArgs(format!(
             "sample-rate must be {CANONICAL_SAMPLE_RATE_HZ} (canonical pipeline rate); got {sample_rate}"
@@ -295,9 +294,7 @@ fn merge_record_options(
         comfort_noise: if args.no_comfort_noise {
             false
         } else {
-            file.aec
-                .comfort_noise
-                .unwrap_or(builtin::COMFORT_NOISE)
+            file.aec.comfort_noise.unwrap_or(builtin::COMFORT_NOISE)
         },
     })
 }
@@ -771,14 +768,8 @@ mod tests {
 
     #[test]
     fn prepare_inherits_config_defaults() {
-        let args = RecordArgs::try_parse_from([
-            "record",
-            "--source",
-            "mic",
-            "-o",
-            "clip.flac",
-        ])
-        .expect("parse");
+        let args = RecordArgs::try_parse_from(["record", "--source", "mic", "-o", "clip.flac"])
+            .expect("parse");
         let file = config::parse_toml(
             r#"
 [defaults]
@@ -805,15 +796,7 @@ comfort-noise = false
     #[test]
     fn prepare_cli_overrides_config() {
         let args = RecordArgs::try_parse_from([
-            "record",
-            "--source",
-            "mic",
-            "--format",
-            "wav",
-            "--locale",
-            "en-US",
-            "--no-aec",
-            "-o",
+            "record", "--source", "mic", "--format", "wav", "--locale", "en-US", "--no-aec", "-o",
             "out.wav",
         ])
         .expect("parse");

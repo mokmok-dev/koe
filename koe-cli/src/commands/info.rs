@@ -51,7 +51,10 @@ struct SystemInfo {
 }
 
 impl Run for InfoArgs {
-    fn run(self, config: &KoeConfig) -> Result<(), MainError> {
+    fn run(
+        self,
+        config: &KoeConfig,
+    ) -> Result<(), MainError> {
         let info = collect_system_info(config);
         if self.json {
             println!("{}", format_info_json(&info)?);
