@@ -4,10 +4,10 @@ use std::sync::Arc;
 
 use crate::callbacks::{AudioCallbackRef, ProgressCallbackRef, TranscriptionCallbackRef};
 use crate::error::{
-    CaptureError, RecordingError, RecordingSummary, TranscriptionError, validate_capture_source,
-    validate_locale, validate_output_path,
+    CaptureError, MonitorError, RecordingError, RecordingSummary, TranscriptionError,
+    validate_capture_source, validate_locale, validate_output_path,
 };
-use crate::handles::{CaptureHandle, RecordingHandle, TranscriptionHandle};
+use crate::handles::{CaptureHandle, MonitorHandle, RecordingHandle, TranscriptionHandle};
 use crate::native;
 use crate::types::{AppInfo, AudioSourceConfig, OutputFormat, Permission, PermissionStatus};
 
@@ -47,6 +47,34 @@ pub fn start_capture(
 #[uniffi::export]
 pub fn stop_capture(handle: Arc<CaptureHandle>) {
     let _ = (&handle.source, &handle.callback, handle.id);
+}
+
+/// Starts a monitoring session that plays clean PCM to the default output.
+///
+/// The native bridge (`koe-native` `AudioMonitor`) owns the `AudioQueue`. This
+/// stub allocates a handle so `koe-core` can exercise the full start/feed/stop
+/// path on all platforms.
+#[allow(clippy::missing_errors_doc)]
+#[uniffi::export]
+pub fn start_monitor() -> Result<Arc<MonitorHandle>, MonitorError> {
+    Ok(Arc::new(MonitorHandle::new()))
+}
+
+/// Enqueues interleaved stereo Float32 PCM for monitoring playback.
+#[allow(clippy::needless_pass_by_value)]
+#[uniffi::export]
+pub fn feed_monitor(
+    handle: Arc<MonitorHandle>,
+    pcm: Vec<f32>,
+) {
+    let _ = (handle.id, pcm);
+}
+
+/// Stops monitoring and releases the native `AudioQueue`.
+#[allow(clippy::needless_pass_by_value)]
+#[uniffi::export]
+pub fn stop_monitor(handle: Arc<MonitorHandle>) {
+    let _ = handle.id;
 }
 
 #[allow(clippy::missing_errors_doc)]

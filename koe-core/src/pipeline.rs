@@ -6,6 +6,7 @@ mod disk_check;
 mod error;
 mod file_writer;
 mod metrics;
+mod monitor;
 mod shutdown;
 
 use std::path::PathBuf;
@@ -33,6 +34,10 @@ pub use file_writer::FileWriter;
 /// Progress payload types for [`RecordingPipeline::subscribe_progress`].
 pub use koe_ffi::{RecordingState, RecordingStatus};
 pub use metrics::{PipelineMetrics, PipelineMetricsSnapshot};
+pub use monitor::{
+    AudioMonitor, MONITOR_BUFFER_FRAMES, MONITOR_BYTES_PER_FRAME, MONITOR_CHANNEL_COUNT,
+    MONITOR_SAMPLE_RATE_HZ, MonitorError, NullMonitor, create_monitor,
+};
 pub use shutdown::{FORCE_JOIN_BUDGET, SHUTDOWN_BUDGET, ShutdownMode, StopResult};
 
 /// Configuration for a recording session.
@@ -108,6 +113,8 @@ pub struct RecordingPipeline {
     /// Pause-aware origin shared with the consumer progress clock.
     started_at: Arc<Mutex<Instant>>,
     bytes_written: Arc<AtomicU64>,
+    /// Live pass-through sink (null when [`PipelineConfig::monitor`] is false).
+    monitor: Arc<dyn AudioMonitor>,
 }
 
 struct PipelineAudioCallback {
@@ -234,6 +241,7 @@ impl RecordingPipeline {
         let started_at = Instant::now();
         let started_at = Arc::new(Mutex::new(started_at));
         let bytes_written = Arc::new(AtomicU64::new(0));
+        let monitor = create_monitor(config.monitor)?;
 
         let consumer_ctx = ConsumerContext {
             encoder: Arc::clone(&encoder),
@@ -245,6 +253,7 @@ impl RecordingPipeline {
             progress_tx: progress_tx.clone(),
             started_at: Arc::clone(&started_at),
             bytes_written: Arc::clone(&bytes_written),
+            monitor: Arc::clone(&monitor),
         };
         let consumer_task = spawn_consumer(audio_tx.subscribe(), consumer_ctx);
         let start_time = *started_at
@@ -273,6 +282,7 @@ impl RecordingPipeline {
             progress_tx,
             started_at,
             bytes_written,
+            monitor,
         })
     }
 

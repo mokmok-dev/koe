@@ -87,6 +87,29 @@ impl TranscriptionHandle {
     }
 }
 
+/// Active audio-monitoring (pass-through output) session.
+#[derive(uniffi::Object)]
+pub struct MonitorHandle {
+    pub(crate) id: u64,
+}
+
+impl MonitorHandle {
+    pub(crate) fn new() -> Self {
+        Self {
+            id: next_handle_id(),
+        }
+    }
+}
+
+#[uniffi::export]
+impl MonitorHandle {
+    /// Stable session id for native/debug correlation.
+    #[must_use]
+    pub const fn id(&self) -> u64 {
+        self.id
+    }
+}
+
 /// Active recording session spanning capture, encoding, and transcription.
 #[derive(uniffi::Object)]
 pub struct RecordingHandle {
@@ -289,5 +312,12 @@ mod tests {
 
         assert_eq!(statuses.lock().expect("lock").len(), 1);
         assert_eq!(errors.lock().expect("lock").as_slice(), ["disk"]);
+    }
+
+    #[test]
+    fn monitor_handle_ids_are_unique() {
+        let a = MonitorHandle::new();
+        let b = MonitorHandle::new();
+        assert_ne!(a.id(), b.id());
     }
 }

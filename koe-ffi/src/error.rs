@@ -25,6 +25,16 @@ pub enum TranscriptionError {
 }
 
 #[derive(Debug, thiserror::Error, uniffi::Error)]
+pub enum MonitorError {
+    #[error("Failed to create audio monitor: {msg}")]
+    CreateFailed { msg: String },
+    #[error("Monitor is not running")]
+    NotRunning,
+    #[error("Monitor internal error: {msg}")]
+    Internal { msg: String },
+}
+
+#[derive(Debug, thiserror::Error, uniffi::Error)]
 pub enum RecordingError {
     #[error("{0}")]
     Capture(#[from] CaptureError),
@@ -181,5 +191,24 @@ mod tests {
     fn validate_output_path_rejects_empty() {
         let err = validate_output_path("").unwrap_err();
         assert!(matches!(err, RecordingError::ConfigError { .. }));
+    }
+
+    #[test]
+    fn monitor_error_display_is_distinct() {
+        assert_eq!(
+            MonitorError::CreateFailed {
+                msg: "queue".into()
+            }
+            .to_string(),
+            "Failed to create audio monitor: queue"
+        );
+        assert_eq!(
+            MonitorError::NotRunning.to_string(),
+            "Monitor is not running"
+        );
+        assert_eq!(
+            MonitorError::Internal { msg: "x".into() }.to_string(),
+            "Monitor internal error: x"
+        );
     }
 }

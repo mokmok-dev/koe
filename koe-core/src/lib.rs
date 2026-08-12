@@ -7,9 +7,10 @@ pub mod transcript;
 
 pub use aec::{AcousticEchoCanceller, AecConfig};
 pub use pipeline::{
-    AudioChunk, FORCE_JOIN_BUDGET, FileWriter, PipelineConfig, PipelineError, PipelineMetrics,
-    PipelineMetricsSnapshot, PipelineState, RecordingPipeline, RecordingState, RecordingStatus,
-    SHUTDOWN_BUDGET, ShutdownMode, StopResult, available_disk_space,
+    AudioChunk, AudioMonitor, FORCE_JOIN_BUDGET, FileWriter, MONITOR_BUFFER_FRAMES,
+    MONITOR_CHANNEL_COUNT, MONITOR_SAMPLE_RATE_HZ, MonitorError, PipelineConfig, PipelineError,
+    PipelineMetrics, PipelineMetricsSnapshot, PipelineState, RecordingPipeline, RecordingState,
+    RecordingStatus, SHUTDOWN_BUDGET, ShutdownMode, StopResult, available_disk_space, create_monitor,
 };
 
 /// Error returned by [`available_disk_space`] and recording setup.
