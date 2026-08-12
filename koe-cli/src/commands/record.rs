@@ -1,18 +1,19 @@
 //! `koe record` — capture, encode, and optionally transcribe.
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use clap::Parser;
 use koe_core::{
     AudioSourceConfig, OutputFormat, PipelineConfig, PipelineError, RecordingError,
-    RecordingPipeline, StopResult, TranscriptFormat, enumerate_apps, native_provider_registered,
+    RecordingPipeline, StopResult, default_transcript_path, enumerate_apps,
+    native_provider_registered,
 };
 
 use super::Run;
 use super::apps_table::{format_apps_table, prepare_apps};
 use super::duration::parse_duration;
-use super::parse_speech_engine;
+use super::{parse_speech_engine, parse_transcript_format};
 use crate::MainError;
 use crate::config::{self, KoeConfig, builtin};
 use crate::progress::{ProgressMeta, ProgressRenderer, create_renderer};
@@ -386,38 +387,6 @@ fn parse_audio_format(value: &str) -> Result<OutputFormat, MainError> {
     }
 }
 
-fn parse_transcript_format(value: &str) -> Result<TranscriptFormat, MainError> {
-    match value.trim().to_ascii_lowercase().as_str() {
-        "txt" => Ok(TranscriptFormat::Txt),
-        "srt" => Ok(TranscriptFormat::Srt),
-        "vtt" => Ok(TranscriptFormat::Vtt),
-        "json" => Ok(TranscriptFormat::Json),
-        other => Err(MainError::InvalidArgs(format!(
-            "unknown transcript-format '{other}' (expected txt, srt, vtt, or json)"
-        ))),
-    }
-}
-
-fn default_transcript_path(
-    output: &Path,
-    format: TranscriptFormat,
-) -> PathBuf {
-    let ext = match format {
-        TranscriptFormat::Txt => "txt",
-        TranscriptFormat::Srt => "srt",
-        TranscriptFormat::Vtt => "vtt",
-        TranscriptFormat::Json => "json",
-    };
-    let mut path = output.to_path_buf();
-    // Prefer `<stem>.<fmt>` over appending after the audio extension.
-    if let Some(stem) = output.file_stem().and_then(|s| s.to_str()) {
-        path.set_file_name(format!("{stem}.{ext}"));
-    } else {
-        path.set_extension(ext);
-    }
-    path
-}
-
 /// Parses sizes like `500M`, `2G`, `100K`, `1024` (bytes).
 fn parse_byte_size(input: &str) -> Result<u64, String> {
     let raw = input.trim();
@@ -764,7 +733,10 @@ fn map_pipeline_error(err: PipelineError) -> MainError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::Path;
+
     use clap::Parser;
+    use koe_core::TranscriptFormat;
 
     #[test]
     fn parses_list_sources_without_output() {

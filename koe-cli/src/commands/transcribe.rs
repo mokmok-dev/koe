@@ -7,14 +7,14 @@ use std::time::Instant;
 use clap::Parser;
 use koe_core::{
     AudioSourceConfig, TranscriptFormat, TranscriptMeta, TranscriptionCallback,
-    TranscriptionSegment, create_formatter, feed_transcription_audio, finalize_transcription,
-    start_transcription, transcript_extension,
+    TranscriptionSegment, create_formatter, default_transcript_path, feed_transcription_audio,
+    finalize_transcription, start_transcription,
 };
 
 use super::Run;
 use super::decode::{CANONICAL_SAMPLE_RATE_HZ, DecodedAudioInfo, chunk_pcm, decode_to_canonical};
 use super::duration::parse_duration;
-use super::parse_speech_engine;
+use super::{parse_speech_engine, parse_transcript_format};
 use crate::MainError;
 use crate::config::KoeConfig;
 
@@ -103,7 +103,7 @@ fn prepare(
     let output = args
         .output
         .clone()
-        .unwrap_or_else(|| default_output_path(&args.input, format));
+        .unwrap_or_else(|| default_transcript_path(&args.input, format));
     if output.exists() {
         return Err(MainError::Io(format!(
             "output already exists: {}",
@@ -315,32 +315,6 @@ fn format_secs_display_u64(ms: u64) -> String {
     format_secs_display(u128::from(ms))
 }
 
-fn parse_transcript_format(value: &str) -> Result<TranscriptFormat, MainError> {
-    match value.trim().to_ascii_lowercase().as_str() {
-        "txt" => Ok(TranscriptFormat::Txt),
-        "srt" => Ok(TranscriptFormat::Srt),
-        "vtt" => Ok(TranscriptFormat::Vtt),
-        "json" => Ok(TranscriptFormat::Json),
-        other => Err(MainError::InvalidArgs(format!(
-            "unknown --format '{other}' (expected txt, srt, vtt, or json)"
-        ))),
-    }
-}
-
-fn default_output_path(
-    input: &Path,
-    format: TranscriptFormat,
-) -> PathBuf {
-    let ext = transcript_extension(format);
-    let mut path = input.to_path_buf();
-    if let Some(stem) = input.file_stem().and_then(|s| s.to_str()) {
-        path.set_file_name(format!("{stem}.{ext}"));
-    } else {
-        path.set_extension(ext);
-    }
-    path
-}
-
 /// Collects ASR segments, shifting timestamps by the `--start-at` offset so
 /// they align with the original file timeline.
 struct SegmentCollector {
@@ -440,7 +414,7 @@ mod tests {
 
     #[test]
     fn default_output_replaces_extension() {
-        let path = default_output_path(Path::new("/tmp/rec.ogg"), TranscriptFormat::Vtt);
+        let path = default_transcript_path(Path::new("/tmp/rec.ogg"), TranscriptFormat::Vtt);
         assert_eq!(path, PathBuf::from("/tmp/rec.vtt"));
     }
 
@@ -495,15 +469,6 @@ engine = "network"
         assert_eq!(prepared.locale, "ja-JP");
         assert_eq!(prepared.speech_engine, koe_core::SpeechEngine::Network);
         assert_eq!(prepared.format, TranscriptFormat::Srt);
-    }
-
-    #[test]
-    fn parse_format_variants() {
-        assert!(matches!(
-            parse_transcript_format("JSON").unwrap(),
-            TranscriptFormat::Json
-        ));
-        assert!(parse_transcript_format("docx").is_err());
     }
 
     #[test]
