@@ -82,9 +82,18 @@ unsafe extern "C" {
         in_num_packet_descs: u32,
         in_packet_descs: *const c_void,
     ) -> OSStatus;
-    fn AudioQueueStart(in_aq: AudioQueueRef, in_start_time: *const c_void) -> OSStatus;
-    fn AudioQueueStop(in_aq: AudioQueueRef, in_immediate: u8) -> OSStatus;
-    fn AudioQueueDispose(in_aq: AudioQueueRef, in_immediate: u8) -> OSStatus;
+    fn AudioQueueStart(
+        in_aq: AudioQueueRef,
+        in_start_time: *const c_void,
+    ) -> OSStatus;
+    fn AudioQueueStop(
+        in_aq: AudioQueueRef,
+        in_immediate: u8,
+    ) -> OSStatus;
+    fn AudioQueueDispose(
+        in_aq: AudioQueueRef,
+        in_immediate: u8,
+    ) -> OSStatus;
 }
 
 struct MicState {
@@ -245,9 +254,8 @@ unsafe extern "C-unwind" fn mic_input_callback(
     if byte_count >= 4 && !buffer.audio_data.is_null() {
         let sample_count = byte_count / 4;
         // SAFETY: AudioQueue guarantees `audio_data` holds `byte_count` bytes of PCM.
-        let samples = unsafe {
-            std::slice::from_raw_parts(buffer.audio_data.cast::<f32>(), sample_count)
-        };
+        let samples =
+            unsafe { std::slice::from_raw_parts(buffer.audio_data.cast::<f32>(), sample_count) };
         if let Some(handle) = state.handle.upgrade() {
             handle.deliver_audio(apply_agc(state, samples), monotonic_ms());
         }

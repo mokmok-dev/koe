@@ -9,7 +9,7 @@
     clippy::unwrap_used
 )]
 
-use std::alloc::{alloc, dealloc, Layout};
+use std::alloc::{Layout, alloc, dealloc};
 use std::ffi::c_void;
 use std::ptr;
 use std::sync::mpsc;
@@ -20,7 +20,7 @@ use block2::RcBlock;
 use dispatch2::{DispatchQueue, DispatchQueueAttr, DispatchRetained};
 use objc2::rc::Retained;
 use objc2::runtime::{NSObject, NSObjectProtocol, ProtocolObject};
-use objc2::{define_class, msg_send, AnyThread, DefinedClass, Message};
+use objc2::{AnyThread, DefinedClass, Message, define_class, msg_send};
 use objc2_core_media::{CMSampleBuffer, CMTime};
 use objc2_foundation::{NSArray, NSError};
 use objc2_screen_capture_kit::{
@@ -151,7 +151,9 @@ pub(super) fn start(
             match super::process_tap::start_global(handle) {
                 Ok(session) => Ok(session),
                 Err(tap_err) => Err(CaptureError::StreamError {
-                    msg: format!("ScreenCaptureKit failed ({sck_err}); Process Tap also failed ({tap_err})"),
+                    msg: format!(
+                        "ScreenCaptureKit failed ({sck_err}); Process Tap also failed ({tap_err})"
+                    ),
                 }),
             }
         },
@@ -209,12 +211,7 @@ fn start_sck(
     let queue = DispatchQueue::new("dev.mokmok.koe.sck.audio", DispatchQueueAttr::SERIAL);
 
     let stream = unsafe {
-        SCStream::initWithFilter_configuration_delegate(
-            SCStream::alloc(),
-            &filter,
-            &config,
-            None,
-        )
+        SCStream::initWithFilter_configuration_delegate(SCStream::alloc(), &filter, &config, None)
     };
 
     let proto: &ProtocolObject<dyn SCStreamOutput> = ProtocolObject::from_ref(&*output);
@@ -339,10 +336,7 @@ fn make_filter(
         };
         if unsafe { owner.processID() } == target_pid {
             return Ok(unsafe {
-                SCContentFilter::initWithDesktopIndependentWindow(
-                    SCContentFilter::alloc(),
-                    &window,
-                )
+                SCContentFilter::initWithDesktopIndependentWindow(SCContentFilter::alloc(), &window)
             });
         }
     }

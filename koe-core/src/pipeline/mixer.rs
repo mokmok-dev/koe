@@ -1,9 +1,13 @@
 //! Far/near mixer for `--source both` (optional AEC).
 
-#![allow(clippy::option_if_let_else, clippy::similar_names, clippy::suboptimal_flops)]
+#![allow(
+    clippy::option_if_let_else,
+    clippy::similar_names,
+    clippy::suboptimal_flops
+)]
 
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use tokio::sync::{broadcast, mpsc};
 use tokio::task::JoinHandle;
@@ -77,9 +81,7 @@ pub fn spawn_both_mixer(
             while far_buf.len() >= BLOCK_SAMPLES && near_buf.len() >= BLOCK_SAMPLES {
                 let far: Vec<f32> = far_buf.drain(..BLOCK_SAMPLES).collect();
                 let near: Vec<f32> = near_buf.drain(..BLOCK_SAMPLES).collect();
-                let mixed = tokio::task::block_in_place(|| {
-                    mix_block(&far, &near, aec.as_mut())
-                });
+                let mixed = tokio::task::block_in_place(|| mix_block(&far, &near, aec.as_mut()));
                 if !mixed.is_empty() {
                     let _ = out.send(AudioChunk::new(mixed, last_ts));
                 }

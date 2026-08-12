@@ -22,8 +22,8 @@ mod process_tap;
 mod screen_audio;
 mod timestamp;
 
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::error::CaptureError;
 use crate::handles::CaptureHandle;

@@ -12,9 +12,9 @@ use std::ptr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Weak};
 
+use objc2::msg_send;
 use objc2::rc::Retained;
 use objc2::runtime::{AnyClass, AnyObject};
-use objc2::msg_send;
 use objc2_foundation::{NSArray, NSNumber, NSString};
 
 use crate::error::CaptureError;
@@ -91,8 +91,14 @@ unsafe extern "C" {
         device: AudioObjectID,
         io_proc_id: AudioDeviceIOProcID,
     ) -> OSStatus;
-    fn AudioDeviceStart(device: AudioObjectID, io_proc_id: AudioDeviceIOProcID) -> OSStatus;
-    fn AudioDeviceStop(device: AudioObjectID, io_proc_id: AudioDeviceIOProcID) -> OSStatus;
+    fn AudioDeviceStart(
+        device: AudioObjectID,
+        io_proc_id: AudioDeviceIOProcID,
+    ) -> OSStatus;
+    fn AudioDeviceStop(
+        device: AudioObjectID,
+        io_proc_id: AudioDeviceIOProcID,
+    ) -> OSStatus;
 }
 
 struct TapState {
@@ -130,7 +136,7 @@ pub(super) fn start(
 
 /// Stereo mixdown of every process except this one (AppAudio fallback).
 pub(super) fn start_global(
-    handle: Arc<CaptureHandle>,
+    handle: Arc<CaptureHandle>
 ) -> Result<Box<dyn CaptureSession>, CaptureError> {
     let exclude = process_object_for_pid(std::process::id() as i32)
         .into_iter()
@@ -165,9 +171,8 @@ fn start_with_description(
     drop(handle);
 
     let mut io_proc: AudioDeviceIOProcID = ptr::null_mut();
-    let create = unsafe {
-        AudioDeviceCreateIOProcID(tap_id, tap_io_proc, state.cast(), &raw mut io_proc)
-    };
+    let create =
+        unsafe { AudioDeviceCreateIOProcID(tap_id, tap_io_proc, state.cast(), &raw mut io_proc) };
     if create != 0 || io_proc.is_null() {
         unsafe {
             let _ = AudioHardwareDestroyProcessTap(tap_id);
@@ -199,7 +204,7 @@ fn start_with_description(
 }
 
 fn make_tap_description(
-    process_object_ids: &[AudioObjectID],
+    process_object_ids: &[AudioObjectID]
 ) -> Result<Retained<AnyObject>, CaptureError> {
     let class = AnyClass::get(c"CATapDescription").ok_or_else(|| CaptureError::Internal {
         msg: "CATapDescription class missing (need macOS 14.2+)".to_owned(),
@@ -229,7 +234,7 @@ fn make_tap_description(
 }
 
 fn make_global_tap_description(
-    exclude: &[AudioObjectID],
+    exclude: &[AudioObjectID]
 ) -> Result<Retained<AnyObject>, CaptureError> {
     let class = AnyClass::get(c"CATapDescription").ok_or_else(|| CaptureError::Internal {
         msg: "CATapDescription class missing (need macOS 14.2+)".to_owned(),
@@ -401,7 +406,10 @@ unsafe extern "C-unwind" fn tap_io_proc(
     0
 }
 
-fn copy_buffer_list(input: *const AudioBufferList, output: *mut AudioBufferList) {
+fn copy_buffer_list(
+    input: *const AudioBufferList,
+    output: *mut AudioBufferList,
+) {
     let input = unsafe { &*input };
     let output = unsafe { &mut *output };
     let count = input.m_number_buffers.min(output.m_number_buffers) as usize;
@@ -419,7 +427,10 @@ fn copy_buffer_list(input: *const AudioBufferList, output: *mut AudioBufferList)
     }
 }
 
-fn to_stereo_interleaved(src: &[f32], channels: usize) -> Vec<f32> {
+fn to_stereo_interleaved(
+    src: &[f32],
+    channels: usize,
+) -> Vec<f32> {
     if channels == 0 || src.is_empty() {
         return Vec::new();
     }

@@ -161,7 +161,11 @@ impl AudioCallback for SideAudioCallback {
         if self.paused.load(Ordering::Relaxed) {
             return;
         }
-        if self.tx.try_send(AudioChunk::new(pcm, timestamp_ms)).is_err() {
+        if self
+            .tx
+            .try_send(AudioChunk::new(pcm, timestamp_ms))
+            .is_err()
+        {
             self.drop_counter.fetch_add(1, Ordering::Relaxed);
         }
     }
