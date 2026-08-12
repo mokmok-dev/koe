@@ -383,6 +383,23 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn stop_with_monitor_enabled_is_clean() {
+        install_provider();
+        let output = unique_path("monitor");
+        let mut config = test_config(&output);
+        config.monitor = true;
+        let mut pipeline = RecordingPipeline::start(config).await.expect("start");
+
+        let started = Instant::now();
+        let summary = pipeline.stop().await.expect("stop");
+        assert!(started.elapsed() < SHUTDOWN_BUDGET);
+        assert!(matches!(pipeline.state(), PipelineState::Stopped));
+        assert_valid_wav(&output);
+        assert!(summary.bytes_written > 0);
+        let _ = std::fs::remove_file(output);
+    }
+
+    #[tokio::test]
     async fn stop_after_audio_processes_all_frames() {
         install_provider();
         let output = unique_path("drain");

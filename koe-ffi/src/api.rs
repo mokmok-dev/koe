@@ -61,13 +61,19 @@ pub fn start_monitor() -> Result<Arc<MonitorHandle>, MonitorError> {
 }
 
 /// Enqueues interleaved stereo Float32 PCM for monitoring playback.
+///
+/// # Errors
+///
+/// Returns [`MonitorError::NotRunning`] when the session has already been
+/// stopped. Native bridges may also return [`MonitorError::Internal`].
 #[allow(clippy::needless_pass_by_value)]
 #[uniffi::export]
 pub fn feed_monitor(
     handle: Arc<MonitorHandle>,
     pcm: Vec<f32>,
-) {
+) -> Result<(), MonitorError> {
     let _ = (handle.id, pcm);
+    Ok(())
 }
 
 /// Stops monitoring and releases the native `AudioQueue`.

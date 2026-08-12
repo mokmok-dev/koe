@@ -11,6 +11,7 @@ pub use pipeline::{
     MONITOR_CHANNEL_COUNT, MONITOR_SAMPLE_RATE_HZ, MonitorError, PipelineConfig, PipelineError,
     PipelineMetrics, PipelineMetricsSnapshot, PipelineState, RecordingPipeline, RecordingState,
     RecordingStatus, SHUTDOWN_BUDGET, ShutdownMode, StopResult, available_disk_space, create_monitor,
+    create_monitor_or_null,
 };
 
 /// Error returned by [`available_disk_space`] and recording setup.

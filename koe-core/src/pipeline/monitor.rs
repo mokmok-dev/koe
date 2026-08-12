@@ -10,6 +10,7 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
+pub use koe_ffi::MonitorError;
 use koe_ffi::{MonitorHandle, feed_monitor, start_monitor, stop_monitor};
 
 /// Canonical sample rate for monitored audio (matches capture / AEC).
@@ -21,28 +22,11 @@ pub const MONITOR_BUFFER_FRAMES: usize = 960;
 /// Bytes per interleaved stereo frame (Float32 × 2).
 pub const MONITOR_BYTES_PER_FRAME: usize = 8;
 
-/// Errors from starting or writing to an [`AudioMonitor`].
-#[derive(Debug, thiserror::Error, Clone, PartialEq, Eq)]
-pub enum MonitorError {
-    #[error("failed to create audio monitor: {0}")]
-    CreateFailed(String),
-    #[error("monitor is not running")]
-    NotRunning,
-    #[error("monitor error: {0}")]
-    Internal(String),
-}
-
-impl From<koe_ffi::MonitorError> for MonitorError {
-    fn from(value: koe_ffi::MonitorError) -> Self {
-        match value {
-            koe_ffi::MonitorError::CreateFailed { msg } => Self::CreateFailed(msg),
-            koe_ffi::MonitorError::NotRunning => Self::NotRunning,
-            koe_ffi::MonitorError::Internal { msg } => Self::Internal(msg),
-        }
-    }
-}
-
 /// Sink for clean (post-AEC) PCM destined for the default output device.
+///
+/// PCM must be interleaved stereo [`f32`] at [`MONITOR_SAMPLE_RATE_HZ`]
+/// ([`MONITOR_CHANNEL_COUNT`] channels). Each write is typically one
+/// [`MONITOR_BUFFER_FRAMES`]-frame block (~20 ms).
 pub trait AudioMonitor: Send + Sync {
     /// Enqueues interleaved stereo Float32 samples for playback.
     ///
@@ -77,7 +61,7 @@ impl AudioMonitor for NullMonitor {
 }
 
 /// FFI-backed monitor that forwards PCM to the native `AudioQueue` bridge.
-pub struct FfiMonitor {
+struct FfiMonitor {
     handle: Arc<MonitorHandle>,
     stopped: AtomicBool,
 }
@@ -89,7 +73,7 @@ impl FfiMonitor {
     ///
     /// Returns [`MonitorError::CreateFailed`] when the FFI layer cannot start
     /// the output queue.
-    pub fn start() -> Result<Self, MonitorError> {
+    fn start() -> Result<Self, MonitorError> {
         let handle = start_monitor()?;
         Ok(Self {
             handle,
@@ -103,17 +87,21 @@ impl AudioMonitor for FfiMonitor {
         &self,
         pcm: &[f32],
     ) -> Result<(), MonitorError> {
-        if self.stopped.load(Ordering::Relaxed) {
+        if self.stopped.load(Ordering::Acquire) {
             return Err(MonitorError::NotRunning);
         }
-        feed_monitor(Arc::clone(&self.handle), pcm.to_vec());
+        feed_monitor(Arc::clone(&self.handle), pcm.to_vec())?;
+        // Re-check after feed so a concurrent stop is visible to the caller.
+        if self.stopped.load(Ordering::Acquire) {
+            return Err(MonitorError::NotRunning);
+        }
         Ok(())
     }
 
     fn stop(&self) {
         if self
             .stopped
-            .compare_exchange(false, true, Ordering::Relaxed, Ordering::Relaxed)
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
             .is_ok()
         {
             stop_monitor(Arc::clone(&self.handle));
@@ -135,12 +123,27 @@ impl Drop for FfiMonitor {
 /// # Errors
 ///
 /// Returns [`MonitorError`] when an enabled monitor cannot open the native
-/// output queue.
+/// output queue. Callers that must keep recording running should fall back to
+/// [`NullMonitor`] (see [`super::RecordingPipeline::start`]).
 pub fn create_monitor(enabled: bool) -> Result<Arc<dyn AudioMonitor>, MonitorError> {
     if enabled {
         Ok(Arc::new(FfiMonitor::start()?))
     } else {
         Ok(Arc::new(NullMonitor))
+    }
+}
+
+/// Like [`create_monitor`], but never fails the recording path.
+///
+/// On create failure logs a warning and returns [`NullMonitor`].
+#[must_use]
+pub fn create_monitor_or_null(enabled: bool) -> Arc<dyn AudioMonitor> {
+    match create_monitor(enabled) {
+        Ok(monitor) => monitor,
+        Err(err) => {
+            log::warn!("audio monitor unavailable; continuing without monitoring: {err}");
+            Arc::new(NullMonitor)
+        },
     }
 }
 
@@ -161,12 +164,16 @@ impl AudioMonitor for RecordingMonitor {
         pcm: &[f32],
     ) -> Result<(), MonitorError> {
         if self.fail_writes.load(Ordering::Relaxed) {
-            return Err(MonitorError::Internal("injected failure".to_owned()));
+            return Err(MonitorError::Internal {
+                msg: "injected failure".to_owned(),
+            });
         }
         self.write_count.fetch_add(1, Ordering::Relaxed);
         self.samples
             .lock()
-            .map_err(|_| MonitorError::Internal("lock poisoned".to_owned()))?
+            .map_err(|_| MonitorError::Internal {
+                msg: "lock poisoned".to_owned(),
+            })?
             .push(pcm.to_vec());
         Ok(())
     }
@@ -224,6 +231,13 @@ mod tests {
     }
 
     #[test]
+    fn create_monitor_or_null_never_fails() {
+        let monitor = create_monitor_or_null(true);
+        monitor.write(&[0.0, 0.0]).expect("write");
+        monitor.stop();
+    }
+
+    #[test]
     fn recording_monitor_captures_pcm() {
         let monitor = RecordingMonitor::default();
         monitor.write(&[0.5, -0.5]).expect("write");
@@ -240,6 +254,6 @@ mod tests {
         let monitor = FfiMonitor::start().expect("start");
         monitor.stop();
         let err = monitor.write(&[0.0, 0.0]).expect_err("stopped");
-        assert_eq!(err, MonitorError::NotRunning);
+        assert!(matches!(err, MonitorError::NotRunning));
     }
 }

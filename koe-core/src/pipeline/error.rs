@@ -1,9 +1,7 @@
 //! Pipeline error types.
 
-use koe_ffi::{CaptureError, RecordingError, TranscriptionError};
+use koe_ffi::{CaptureError, MonitorError, RecordingError, TranscriptionError};
 use thiserror::Error;
-
-use super::monitor::MonitorError;
 
 /// Errors raised by [`super::RecordingPipeline`].
 #[derive(Debug, Error)]

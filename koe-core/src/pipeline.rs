@@ -36,7 +36,7 @@ pub use koe_ffi::{RecordingState, RecordingStatus};
 pub use metrics::{PipelineMetrics, PipelineMetricsSnapshot};
 pub use monitor::{
     AudioMonitor, MONITOR_BUFFER_FRAMES, MONITOR_BYTES_PER_FRAME, MONITOR_CHANNEL_COUNT,
-    MONITOR_SAMPLE_RATE_HZ, MonitorError, NullMonitor, create_monitor,
+    MONITOR_SAMPLE_RATE_HZ, MonitorError, NullMonitor, create_monitor, create_monitor_or_null,
 };
 pub use shutdown::{FORCE_JOIN_BUDGET, SHUTDOWN_BUDGET, ShutdownMode, StopResult};
 
@@ -60,6 +60,10 @@ pub struct PipelineConfig {
     /// Inject comfort noise during echo-only periods.
     pub comfort_noise: bool,
     /// Route clean audio to the default output device.
+    ///
+    /// When `true`, the pipeline opens a native `AudioQueue` output at start.
+    /// Create failures are logged and monitoring is disabled so recording still
+    /// proceeds. Write failures after start are also non-fatal.
     pub monitor: bool,
     /// Optional estimated recording duration for disk-space checks.
     pub estimated_duration_hours: Option<f64>,
@@ -241,7 +245,7 @@ impl RecordingPipeline {
         let started_at = Instant::now();
         let started_at = Arc::new(Mutex::new(started_at));
         let bytes_written = Arc::new(AtomicU64::new(0));
-        let monitor = create_monitor(config.monitor)?;
+        let monitor = create_monitor_or_null(config.monitor);
 
         let consumer_ctx = ConsumerContext {
             encoder: Arc::clone(&encoder),

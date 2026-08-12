@@ -86,7 +86,7 @@ mod tests {
     #[test]
     fn monitor_start_feed_stop_round_trip() {
         let handle = start_monitor().expect("start");
-        feed_monitor(Arc::clone(&handle), vec![0.1, -0.1, 0.2, -0.2]);
+        feed_monitor(Arc::clone(&handle), vec![0.1, -0.1, 0.2, -0.2]).expect("feed");
         stop_monitor(handle);
     }
 }
