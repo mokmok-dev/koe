@@ -34,7 +34,7 @@ pub use handles::{CaptureHandle, MonitorHandle, RecordingHandle, TranscriptionHa
 pub use native::{NativeProvider, native_provider_registered, register_native_provider};
 pub use types::{
     AppInfo, AudioDeviceInfo, AudioSourceConfig, OutputFormat, Permission, PermissionStatus,
-    RecordingState, RecordingStatus, TranscriptFormat, TranscriptionSegment,
+    RecordingState, RecordingStatus, SpeechEngine, TranscriptFormat, TranscriptionSegment,
 };
 
 #[cfg(target_os = "macos")]

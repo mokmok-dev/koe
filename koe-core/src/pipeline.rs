@@ -17,8 +17,9 @@ use std::time::{Duration, Instant};
 
 use koe_ffi::{
     AudioCallback, AudioSourceConfig, OutputFormat, Permission, PermissionStatus, RecordingError,
-    TranscriptFormat, TranscriptionCallback, TranscriptionSegment, check_permission, start_capture,
-    start_transcription, validate_capture_source, validate_locale, validate_output_path,
+    SpeechEngine, TranscriptFormat, TranscriptionCallback, TranscriptionSegment, check_permission,
+    start_capture, start_transcription, validate_capture_source, validate_locale,
+    validate_output_path,
 };
 use tokio::sync::{Mutex as AsyncMutex, broadcast, mpsc};
 use tokio::task::JoinHandle;
@@ -58,6 +59,10 @@ pub struct PipelineConfig {
     pub transcript_output_path: Option<PathBuf>,
     /// BCP-47 locale for speech recognition (ignored when [`Self::transcribe`] is false).
     pub locale: String,
+    /// Which speech engine to use (on-device / network / auto).
+    ///
+    /// Ignored when [`Self::transcribe`] is false.
+    pub speech_engine: SpeechEngine,
     /// Encoded audio format.
     pub audio_format: OutputFormat,
     /// Transcript file format (ignored when [`Self::transcribe`] is false).
@@ -543,7 +548,11 @@ fn open_transcription(
         metrics: Arc::clone(metrics),
         segment_tx,
     };
-    let handle = start_transcription(config.locale.clone(), Box::new(transcription_callback))?;
+    let handle = start_transcription(
+        config.locale.clone(),
+        config.speech_engine,
+        Box::new(transcription_callback),
+    )?;
     let feeder = Arc::new(TranscriptionFeeder::new(Arc::clone(&handle)));
     Ok((Some(handle), feeder))
 }
@@ -633,6 +642,7 @@ mod tests {
             output_path: output.to_path_buf(),
             transcript_output_path: None,
             locale: "en-US".into(),
+            speech_engine: koe_ffi::SpeechEngine::Auto,
             audio_format: OutputFormat::Wav {
                 bits_per_sample: 16,
             },

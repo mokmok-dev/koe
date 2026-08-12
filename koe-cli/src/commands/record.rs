@@ -12,6 +12,7 @@ use koe_core::{
 use super::Run;
 use super::apps_table::{format_apps_table, prepare_apps};
 use super::duration::parse_duration;
+use super::parse_speech_engine;
 use crate::MainError;
 use crate::config::{self, KoeConfig, builtin};
 use crate::progress::{ProgressMeta, ProgressRenderer, create_renderer};
@@ -72,6 +73,14 @@ pub struct RecordArgs {
     /// Speech recognition locale (BCP-47).
     #[arg(long)]
     pub locale: Option<String>,
+
+    /// Speech engine: `auto` (default), `on-device`, or `network`.
+    ///
+    /// `on-device` never sends audio to Apple; it errors if unavailable.
+    /// `network` always uses Apple's servers. `auto` prefers on-device and
+    /// falls back to network with a warning.
+    #[arg(long)]
+    pub engine: Option<String>,
 
     /// Record audio only; skip transcription.
     #[arg(long)]
@@ -208,10 +217,11 @@ fn prepare_session(
     if !transcribe
         && (args.transcript_output.is_some()
             || args.transcript_format.is_some()
+            || args.engine.is_some()
             || args.locale.is_some())
     {
         eprintln!(
-            "warning: --no-transcribe ignores --locale / --transcript-format / --transcript-output"
+            "warning: --no-transcribe ignores --locale / --engine / --transcript-format / --transcript-output"
         );
     }
     let transcript_output_path = if transcribe {
@@ -229,6 +239,7 @@ fn prepare_session(
             output_path: output,
             transcript_output_path,
             locale: merged.locale,
+            speech_engine: merged.speech_engine,
             audio_format,
             transcript_format,
             enable_aec: merged.enable_aec,
@@ -248,6 +259,7 @@ struct MergedRecordOptions {
     format: String,
     transcript_format: String,
     locale: String,
+    speech_engine: koe_core::SpeechEngine,
     enable_aec: bool,
     comfort_noise: bool,
 }
@@ -294,6 +306,7 @@ fn merge_record_options(
             file.defaults.locale.as_deref(),
             builtin::LOCALE,
         ),
+        speech_engine: parse_speech_engine(&config::transcribe_engine(args.engine.clone(), file))?,
         enable_aec: if args.no_aec {
             false
         } else {
@@ -839,6 +852,7 @@ mod tests {
 format = "flac"
 locale = "ja-JP"
 transcript-format = "srt"
+engine = "on-device"
 [aec]
 enabled = false
 comfort-noise = false
@@ -851,6 +865,10 @@ comfort-noise = false
             OutputFormat::Flac { .. }
         ));
         assert_eq!(prepared.config.locale, "ja-JP");
+        assert_eq!(
+            prepared.config.speech_engine,
+            koe_core::SpeechEngine::OnDevice
+        );
         assert_eq!(prepared.config.transcript_format, TranscriptFormat::Srt);
         assert!(!prepared.config.enable_aec);
         assert!(!prepared.config.comfort_noise);
@@ -859,8 +877,8 @@ comfort-noise = false
     #[test]
     fn prepare_cli_overrides_config() {
         let args = RecordArgs::try_parse_from([
-            "record", "--source", "mic", "--format", "wav", "--locale", "en-US", "--no-aec", "-o",
-            "out.wav",
+            "record", "--source", "mic", "--format", "wav", "--locale", "en-US", "--engine",
+            "network", "--no-aec", "-o", "out.wav",
         ])
         .expect("parse");
         let file = config::parse_toml(
@@ -879,6 +897,10 @@ enabled = true
             OutputFormat::Wav { .. }
         ));
         assert_eq!(prepared.config.locale, "en-US");
+        assert_eq!(
+            prepared.config.speech_engine,
+            koe_core::SpeechEngine::Network
+        );
         assert!(!prepared.config.enable_aec);
     }
 

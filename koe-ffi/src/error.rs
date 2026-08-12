@@ -20,6 +20,8 @@ pub enum TranscriptionError {
     UnsupportedLocale { locale: String },
     #[error("Analyzer not available on this OS version")]
     NotAvailable,
+    #[error("On-device recognition unavailable: {msg}")]
+    OnDeviceUnavailable { msg: String },
     #[error("Permission denied: {msg}")]
     PermissionDenied { msg: String },
     #[error("Transcription internal error: {msg}")]
@@ -152,6 +154,13 @@ mod tests {
         assert_eq!(
             TranscriptionError::NotAvailable.to_string(),
             "Analyzer not available on this OS version"
+        );
+        assert_eq!(
+            TranscriptionError::OnDeviceUnavailable {
+                msg: "enable dictation".into()
+            }
+            .to_string(),
+            "On-device recognition unavailable: enable dictation"
         );
         assert_eq!(
             TranscriptionError::PermissionDenied {
