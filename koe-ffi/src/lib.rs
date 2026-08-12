@@ -10,6 +10,8 @@ mod types;
 #[cfg(target_os = "macos")]
 mod macos_capture;
 #[cfg(target_os = "macos")]
+mod speech_session;
+#[cfg(target_os = "macos")]
 mod macos_discovery;
 #[cfg(target_os = "macos")]
 mod macos_system;

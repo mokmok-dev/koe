@@ -30,6 +30,7 @@ objc2-av-foundation = { workspace = true, features = [
   "AVMediaFormat",
   "block2",
 ] }
+objc2-avf-audio = { workspace = true, features = ["AVAudioBuffer", "AVAudioFormat", "AVAudioTypes"] }
 objc2-core-media = { workspace = true, features = ["CMTime"] }
 objc2-foundation = { workspace = true, features = [
   "NSArray",
@@ -39,6 +40,7 @@ objc2-foundation = { workspace = true, features = [
   "NSSet",
   "NSString",
   "NSValue",
+  "block2",
 ] }
 objc2-screen-capture-kit = { workspace = true, features = [
   "SCShareableContent",
@@ -48,7 +50,17 @@ objc2-screen-capture-kit = { workspace = true, features = [
   "libc",
   "objc2-core-media",
 ] }
-objc2-speech = { workspace = true, features = ["SFSpeechRecognizer"] }
+objc2-speech = { workspace = true, features = [
+  "SFSpeechRecognizer",
+  "SFSpeechRecognitionRequest",
+  "SFSpeechRecognitionResult",
+  "SFSpeechRecognitionTask",
+  "SFSpeechRecognitionTaskHint",
+  "SFTranscription",
+  "SFTranscriptionSegment",
+  "block2",
+  "objc2-avf-audio",
+] }
 
 [lints]
 workspace = true

@@ -96,9 +96,14 @@ impl CaptureHandle {
 /// Active speech transcription session.
 #[derive(uniffi::Object)]
 pub struct TranscriptionHandle {
+    #[expect(dead_code)]
     pub(crate) id: u64,
+    #[expect(dead_code)]
     pub(crate) locale: String,
     pub(crate) callback: TranscriptionCallbackRef,
+    /// Native recognition session, when one is running (macOS only).
+    #[cfg(target_os = "macos")]
+    session: Mutex<Option<crate::speech_session::SpeechSession>>,
 }
 
 impl TranscriptionHandle {
@@ -110,7 +115,36 @@ impl TranscriptionHandle {
             id: next_handle_id(),
             locale,
             callback,
+            #[cfg(target_os = "macos")]
+            session: Mutex::new(None),
         }
+    }
+
+    /// Attaches the native recognition session started by
+    /// [`crate::start_transcription`].
+    #[cfg(target_os = "macos")]
+    pub(crate) fn attach_session(
+        &self,
+        session: crate::speech_session::SpeechSession,
+    ) {
+        let mut guard = self
+            .session
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *guard = Some(session);
+    }
+
+    /// Takes (or leaves) the native recognition session for feeding/finalize.
+    #[cfg(target_os = "macos")]
+    pub(crate) fn with_session<R>(
+        &self,
+        f: impl FnOnce(Option<&mut crate::speech_session::SpeechSession>) -> R,
+    ) -> R {
+        let mut guard = self
+            .session
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        f(guard.as_mut())
     }
 }
 
