@@ -14,6 +14,7 @@ use koe_core::{
 use super::Run;
 use super::decode::{CANONICAL_SAMPLE_RATE_HZ, DecodedAudioInfo, chunk_pcm, decode_to_canonical};
 use super::duration::parse_duration;
+use super::parse_speech_engine;
 use crate::MainError;
 use crate::config::KoeConfig;
 
@@ -34,6 +35,14 @@ pub struct TranscribeArgs {
     /// Transcript format: `txt`, `srt`, `vtt`, or `json`.
     #[arg(long)]
     pub format: Option<String>,
+
+    /// Speech engine: `auto` (default), `on-device`, or `network`.
+    ///
+    /// `on-device` never sends audio to Apple; it errors if unavailable.
+    /// `network` always uses Apple's servers. `auto` prefers on-device and
+    /// falls back to network with a warning.
+    #[arg(long)]
+    pub engine: Option<String>,
 
     /// Start transcribing from this offset (e.g. `30s`, `1m30s`).
     #[arg(long)]
@@ -59,6 +68,7 @@ struct Prepared {
     input: PathBuf,
     output: PathBuf,
     locale: String,
+    speech_engine: koe_core::SpeechEngine,
     format: TranscriptFormat,
     start_ms: Option<u64>,
     end_ms: Option<u64>,
@@ -82,6 +92,8 @@ fn prepare(
     }
 
     let locale = crate::config::transcribe_locale(args.locale.clone(), config);
+    let engine_name = crate::config::transcribe_engine(args.engine.clone(), config);
+    let speech_engine = parse_speech_engine(&engine_name)?;
     let format_name = crate::config::transcribe_format(args.format.clone(), config);
     let format = parse_transcript_format(&format_name)?;
     let output = args
@@ -116,6 +128,7 @@ fn prepare(
         input: args.input.clone(),
         output,
         locale,
+        speech_engine,
         format,
         start_ms,
         end_ms,
@@ -144,14 +157,17 @@ fn run_transcription(prepared: &Prepared) -> Result<(), MainError> {
     let partial = Arc::clone(&collector.partial);
     let errors = Arc::clone(&collector.errors);
 
-    let handle = start_transcription(prepared.locale.clone(), Box::new(collector)).map_err(
-        |err| match err {
-            koe_core::TranscriptionError::PermissionDenied { .. } => {
-                MainError::PermissionDenied(err.to_string())
-            },
-            other => MainError::Internal(format!("start transcription: {other}")),
+    let handle = start_transcription(
+        prepared.locale.clone(),
+        prepared.speech_engine,
+        Box::new(collector),
+    )
+    .map_err(|err| match err {
+        koe_core::TranscriptionError::PermissionDenied { .. } => {
+            MainError::PermissionDenied(err.to_string())
         },
-    )?;
+        other => MainError::Internal(format!("start transcription: {other}")),
+    })?;
 
     let started = Instant::now();
     let total_ms = info.window_duration_ms.max(1);
@@ -388,6 +404,8 @@ mod tests {
             "ja-JP",
             "--format",
             "srt",
+            "--engine",
+            "on-device",
             "-o",
             "out.srt",
             "--start-at",
@@ -400,6 +418,7 @@ mod tests {
         assert_eq!(args.input, PathBuf::from("in.flac"));
         assert_eq!(args.locale.as_deref(), Some("ja-JP"));
         assert_eq!(args.format.as_deref(), Some("srt"));
+        assert_eq!(args.engine.as_deref(), Some("on-device"));
         assert_eq!(args.output.as_deref(), Some(Path::new("out.srt")));
         assert_eq!(args.start_at.as_deref(), Some("30s"));
         assert_eq!(args.end_at.as_deref(), Some("2m"));
@@ -453,12 +472,14 @@ mod tests {
 [transcription]
 locale = "ja-JP"
 transcript-format = "srt"
+engine = "network"
 "#,
         )
         .expect("config");
         let prepared = prepare(&args, &config).expect("prepare");
         let _ = std::fs::remove_file(&path);
         assert_eq!(prepared.locale, "ja-JP");
+        assert_eq!(prepared.speech_engine, koe_core::SpeechEngine::Network);
         assert_eq!(prepared.format, TranscriptFormat::Srt);
     }
 

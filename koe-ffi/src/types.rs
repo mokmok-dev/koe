@@ -44,6 +44,19 @@ pub struct AppInfo {
     pub has_audio: bool,
 }
 
+/// Which speech-recognition engine a session should use.
+///
+/// `Auto` prefers on-device recognition and only falls back to network
+/// recognition when the host cannot run on-device models (e.g. Dictation is
+/// disabled). `OnDevice` refuses to send audio off-device and errors instead
+/// of falling back. `Network` always uses server-side recognition.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
+pub enum SpeechEngine {
+    Auto,
+    OnDevice,
+    Network,
+}
+
 /// Default Core Audio device identity (name + persistent UID).
 ///
 /// Rust hosts only (not a `UniFFI` record). Consumed by `koe info` and any

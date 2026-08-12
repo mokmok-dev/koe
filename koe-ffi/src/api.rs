@@ -10,7 +10,9 @@ use crate::error::{
 };
 use crate::handles::{CaptureHandle, MonitorHandle, RecordingHandle, TranscriptionHandle};
 use crate::native;
-use crate::types::{AppInfo, AudioSourceConfig, OutputFormat, Permission, PermissionStatus};
+use crate::types::{
+    AppInfo, AudioSourceConfig, OutputFormat, Permission, PermissionStatus, SpeechEngine,
+};
 
 #[must_use]
 #[uniffi::export]
@@ -118,12 +120,13 @@ fn transcription_stubbed() -> bool {
 fn start_transcription_native(
     handle: &Arc<TranscriptionHandle>,
     locale: &str,
+    engine: SpeechEngine,
 ) -> Result<(), TranscriptionError> {
     if transcription_stubbed() {
         return Ok(());
     }
-    let session = crate::speech_session::SpeechSession::start(handle, locale)?;
-    if session.engine() == crate::speech_session::Engine::Network {
+    let session = crate::speech_session::SpeechSession::start(handle, locale, engine)?;
+    if engine == SpeechEngine::Auto && session.engine() == crate::speech_session::Engine::Network {
         eprintln!(
             "warning: on-device speech recognition is unavailable (Siri & Dictation \
              disabled); falling back to network recognition — audio is sent to Apple's servers"
@@ -137,14 +140,17 @@ fn start_transcription_native(
 #[uniffi::export]
 pub fn start_transcription(
     locale: String,
+    engine: SpeechEngine,
     callback: TranscriptionCallbackRef,
 ) -> Result<Arc<TranscriptionHandle>, TranscriptionError> {
     validate_locale(&locale)?;
     let handle = Arc::new(TranscriptionHandle::new(locale.clone(), callback));
     #[cfg(target_os = "macos")]
     {
-        start_transcription_native(&handle, &locale)?;
+        start_transcription_native(&handle, &locale, engine)?;
     }
+    #[cfg(not(target_os = "macos"))]
+    let _ = engine;
     Ok(handle)
 }
 
