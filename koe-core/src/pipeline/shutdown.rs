@@ -4,10 +4,11 @@
 //! 1. Set shutdown flag
 //! 2. Stop native capture
 //! 3. Drain consumer (budget: [`SHUTDOWN_BUDGET`])
-//! 4. Finalize speech analyzer
-//! 5. Finalize encoder + flush audio
-//! 6. Write transcript
-//! 7. Emit [`StopResult`]
+//! 4. Stop audio monitor (`AudioQueue` teardown)
+//! 5. Finalize speech analyzer
+//! 6. Finalize encoder + flush audio
+//! 7. Write transcript
+//! 8. Emit [`StopResult`]
 //!
 //! Force mode skips the drain / ASR finalize wait but still finalizes the
 //! encoder so on-disk audio containers stay valid.
@@ -139,6 +140,10 @@ impl RecordingPipeline {
         if let DrainOutcome::Failed(err) = &drain {
             log::error!("consumer failed during shutdown: {err}");
         }
+
+        // Tear down AudioQueue after the consumer has drained so late writes
+        // during drain still reach the device, then release the output.
+        self.monitor.stop();
 
         let duration_sec = match &self.state {
             PipelineState::Recording { start_time, .. } => start_time.elapsed().as_secs_f64(),
@@ -284,7 +289,7 @@ mod tests {
 
     use super::*;
     use crate::codec::{AudioEncoder, CodecError};
-    use crate::pipeline::{PipelineConfig, PipelineState};
+    use crate::pipeline::{NullMonitor, PipelineConfig, PipelineState};
 
     struct TestProvider {
         permissions: Vec<(Permission, PermissionStatus)>,
@@ -374,6 +379,23 @@ mod tests {
             }
         ));
         assert_valid_wav(&output);
+        let _ = std::fs::remove_file(output);
+    }
+
+    #[tokio::test]
+    async fn stop_with_monitor_enabled_is_clean() {
+        install_provider();
+        let output = unique_path("monitor");
+        let mut config = test_config(&output);
+        config.monitor = true;
+        let mut pipeline = RecordingPipeline::start(config).await.expect("start");
+
+        let started = Instant::now();
+        let summary = pipeline.stop().await.expect("stop");
+        assert!(started.elapsed() < SHUTDOWN_BUDGET);
+        assert!(matches!(pipeline.state(), PipelineState::Stopped));
+        assert_valid_wav(&output);
+        assert!(summary.bytes_written > 0);
         let _ = std::fs::remove_file(output);
     }
 
@@ -593,6 +615,7 @@ mod tests {
             progress_tx,
             started_at: Arc::new(Mutex::new(StdInstant::now())),
             bytes_written: Arc::new(AtomicU64::new(0)),
+            monitor: Arc::new(NullMonitor),
         };
         let task = spawn_consumer(rx, ctx);
 

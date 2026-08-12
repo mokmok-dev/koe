@@ -1,6 +1,6 @@
 //! Pipeline error types.
 
-use koe_ffi::{CaptureError, RecordingError, TranscriptionError};
+use koe_ffi::{CaptureError, MonitorError, RecordingError, TranscriptionError};
 use thiserror::Error;
 
 /// Errors raised by [`super::RecordingPipeline`].
@@ -12,6 +12,8 @@ pub enum PipelineError {
     Capture(#[from] CaptureError),
     #[error("{0}")]
     Transcription(#[from] TranscriptionError),
+    #[error("{0}")]
+    Monitor(#[from] MonitorError),
     #[error("invalid pipeline state: {0}")]
     InvalidState(String),
     #[error("permission denied: {0}")]

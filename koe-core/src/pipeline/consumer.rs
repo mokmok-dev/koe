@@ -1,6 +1,7 @@
 //! Async consumer loop draining the audio broadcast channel.
 //!
-//! Flow: broadcast → encode (`spawn_blocking`) → async disk write → ASR feed → progress.
+//! Flow: broadcast → monitor (optional) → encode (`spawn_blocking`) → async disk
+//! write → ASR feed → progress.
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -16,6 +17,7 @@ use super::PipelineError;
 use super::chunk::AudioChunk;
 use super::file_writer::FileWriter;
 use super::metrics::PipelineMetrics;
+use super::monitor::AudioMonitor;
 
 /// Feeds canonical PCM into the speech analyzer (non-blocking on the Rust side).
 pub trait SpeechFeeder: Send + Sync {
@@ -64,6 +66,8 @@ pub struct ConsumerContext {
     pub started_at: Arc<Mutex<Instant>>,
     /// Running total of encoded bytes written (avoids re-locking the writer).
     pub bytes_written: Arc<AtomicU64>,
+    /// Clean-audio sink for live monitoring (null sink when disabled).
+    pub monitor: Arc<dyn AudioMonitor>,
 }
 
 /// Spawns the background consumer that encodes audio and feeds transcription.
@@ -125,6 +129,13 @@ async fn process_chunk(
 ) -> Result<(), PipelineError> {
     let frame_count = chunk.frame_count;
     let (level_left, level_right) = peak_levels(&chunk.samples);
+
+    // Feed the monitor before encode so pass-through latency stays ~one block
+    // plus the device buffer (spec: ~15–35 ms), independent of codec cost.
+    // Failures are non-fatal: monitoring must not abort the recording path.
+    if let Err(err) = ctx.monitor.write(&chunk.samples) {
+        log::warn!("audio monitor write failed: {err}");
+    }
 
     let encoder_slot = Arc::clone(&ctx.encoder);
     let pcm = chunk.samples;
@@ -214,6 +225,7 @@ mod tests {
 
     use super::*;
     use crate::codec::{AudioEncoder, CodecError};
+    use crate::pipeline::monitor::{NullMonitor, RecordingMonitor};
 
     struct CountingEncoder {
         encode_count: Arc<AtomicUsize>,
@@ -287,6 +299,7 @@ mod tests {
         writer: Arc<AsyncMutex<FileWriter>>,
         shutdown: Arc<AtomicBool>,
         progress_tx: broadcast::Sender<RecordingStatus>,
+        monitor: Arc<dyn AudioMonitor>,
     ) -> (ConsumerContext, Arc<PipelineMetrics>) {
         let metrics = PipelineMetrics::new();
         let ctx = ConsumerContext {
@@ -299,6 +312,7 @@ mod tests {
             progress_tx,
             started_at: Arc::new(Mutex::new(Instant::now())),
             bytes_written: Arc::new(AtomicU64::new(0)),
+            monitor,
         };
         (ctx, metrics)
     }
@@ -329,6 +343,7 @@ mod tests {
             Arc::clone(&writer),
             Arc::clone(&shutdown),
             progress_tx,
+            Arc::new(NullMonitor),
         );
         let task = spawn_consumer(rx, ctx);
 
@@ -389,7 +404,14 @@ mod tests {
 
         // Tiny buffer so a slow consumer must lag.
         let (tx, rx) = broadcast::channel(1);
-        let (ctx, metrics) = context(codec, speech, writer, Arc::clone(&shutdown), progress_tx);
+        let (ctx, metrics) = context(
+            codec,
+            speech,
+            writer,
+            Arc::clone(&shutdown),
+            progress_tx,
+            Arc::new(NullMonitor),
+        );
         let task = spawn_consumer(rx, ctx);
 
         for i in 0..20 {
@@ -431,7 +453,14 @@ mod tests {
         });
 
         let (tx, rx) = broadcast::channel(64);
-        let (ctx, _) = context(codec, speech, writer, Arc::clone(&shutdown), progress_tx);
+        let (ctx, _) = context(
+            codec,
+            speech,
+            writer,
+            Arc::clone(&shutdown),
+            progress_tx,
+            Arc::new(NullMonitor),
+        );
         let task = spawn_consumer(rx, ctx);
 
         for i in 0..8 {
@@ -445,6 +474,93 @@ mod tests {
         assert_eq!(encode_count.load(Ordering::Relaxed), 8);
         assert_eq!(feed_count.load(Ordering::Relaxed), 8);
 
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn monitor_receives_clean_pcm_before_shutdown() {
+        let encode_count = Arc::new(AtomicUsize::new(0));
+        let feed_count = Arc::new(AtomicUsize::new(0));
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let (progress_tx, _) = broadcast::channel(8);
+        let (path, writer) = temp_writer("monitor").await;
+        let monitor = Arc::new(RecordingMonitor::default());
+
+        let codec: Arc<Mutex<Box<dyn AudioEncoder>>> =
+            Arc::new(Mutex::new(Box::new(CountingEncoder {
+                encode_count: Arc::clone(&encode_count),
+                delay: Duration::ZERO,
+            })));
+        let speech: Arc<dyn SpeechFeeder> = Arc::new(CountingSpeech {
+            feed_count: Arc::clone(&feed_count),
+            samples: Arc::new(Mutex::new(Vec::new())),
+        });
+
+        let (tx, rx) = broadcast::channel(64);
+        let (ctx, _) = context(
+            codec,
+            speech,
+            writer,
+            Arc::clone(&shutdown),
+            progress_tx,
+            Arc::clone(&monitor) as Arc<dyn AudioMonitor>,
+        );
+        let task = spawn_consumer(rx, ctx);
+
+        let chunk = vec![0.1, -0.1, 0.2, -0.2];
+        tx.send(AudioChunk::new(chunk.clone(), 20)).expect("send");
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        shutdown.store(true, Ordering::Relaxed);
+        drop(tx);
+        task.await.expect("join").expect("consumer ok");
+
+        assert_eq!(monitor.write_count.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            monitor.samples.lock().expect("lock").as_slice(),
+            [chunk.as_slice()]
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn monitor_write_failure_does_not_abort_consumer() {
+        let encode_count = Arc::new(AtomicUsize::new(0));
+        let feed_count = Arc::new(AtomicUsize::new(0));
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let (progress_tx, _) = broadcast::channel(8);
+        let (path, writer) = temp_writer("monitor-fail").await;
+        let monitor = Arc::new(RecordingMonitor::default());
+        monitor.fail_writes.store(true, Ordering::Relaxed);
+
+        let codec: Arc<Mutex<Box<dyn AudioEncoder>>> =
+            Arc::new(Mutex::new(Box::new(CountingEncoder {
+                encode_count: Arc::clone(&encode_count),
+                delay: Duration::ZERO,
+            })));
+        let speech: Arc<dyn SpeechFeeder> = Arc::new(CountingSpeech {
+            feed_count: Arc::clone(&feed_count),
+            samples: Arc::new(Mutex::new(Vec::new())),
+        });
+
+        let (tx, rx) = broadcast::channel(64);
+        let (ctx, _) = context(
+            codec,
+            speech,
+            writer,
+            Arc::clone(&shutdown),
+            progress_tx,
+            Arc::clone(&monitor) as Arc<dyn AudioMonitor>,
+        );
+        let task = spawn_consumer(rx, ctx);
+
+        tx.send(AudioChunk::new(vec![0.1, -0.1], 20)).expect("send");
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        shutdown.store(true, Ordering::Relaxed);
+        drop(tx);
+        task.await.expect("join").expect("consumer ok");
+
+        assert_eq!(encode_count.load(Ordering::Relaxed), 1);
+        assert_eq!(feed_count.load(Ordering::Relaxed), 1);
         let _ = std::fs::remove_file(path);
     }
 }

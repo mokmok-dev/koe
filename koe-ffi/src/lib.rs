@@ -11,19 +11,20 @@ mod types;
 mod macos_discovery;
 
 pub use api::{
-    check_permission, enumerate_apps, feed_transcription_audio, finalize_transcription,
-    pause_recording, request_permission, resume_recording, start_capture, start_recording,
-    start_transcription, stop_capture, stop_recording,
+    check_permission, enumerate_apps, feed_monitor, feed_transcription_audio,
+    finalize_transcription, pause_recording, request_permission, resume_recording, start_capture,
+    start_monitor, start_recording, start_transcription, stop_capture, stop_monitor,
+    stop_recording,
 };
 pub use callbacks::{
     AudioCallback, AudioCallbackRef, ProgressCallback, ProgressCallbackRef, TranscriptionCallback,
     TranscriptionCallbackRef,
 };
 pub use error::{
-    CaptureError, RecordingError, RecordingSummary, TranscriptionError, validate_capture_source,
-    validate_locale, validate_output_path,
+    CaptureError, MonitorError, RecordingError, RecordingSummary, TranscriptionError,
+    validate_capture_source, validate_locale, validate_output_path,
 };
-pub use handles::{CaptureHandle, RecordingHandle, TranscriptionHandle};
+pub use handles::{CaptureHandle, MonitorHandle, RecordingHandle, TranscriptionHandle};
 pub use native::{NativeProvider, native_provider_registered, register_native_provider};
 pub use types::{
     AppInfo, AudioSourceConfig, OutputFormat, Permission, PermissionStatus, RecordingState,
@@ -54,6 +55,8 @@ pub const fn add(
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use super::*;
 
     #[test]
@@ -78,5 +81,12 @@ mod tests {
     fn native_provider_starts_unregistered() {
         // Other tests in this crate do not register a provider.
         assert!(!native_provider_registered());
+    }
+
+    #[test]
+    fn monitor_start_feed_stop_round_trip() {
+        let handle = start_monitor().expect("start");
+        feed_monitor(Arc::clone(&handle), vec![0.1, -0.1, 0.2, -0.2]).expect("feed");
+        stop_monitor(handle);
     }
 }
