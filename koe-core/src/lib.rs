@@ -7,8 +7,8 @@ pub(crate) mod transcript;
 
 pub use aec::{AcousticEchoCanceller, AecConfig};
 pub use pipeline::{
-    PipelineConfig, PipelineError, PipelineMetricsSnapshot, PipelineState, RecordingPipeline,
-    RecordingState, RecordingStatus, StopResult, available_disk_space,
+    PipelineConfig, PipelineError, PipelineMetricsSnapshot, RecordingPipeline, RecordingState,
+    RecordingStatus, StopResult, available_disk_space,
 };
 
 /// Error returned by [`available_disk_space`] and recording setup.

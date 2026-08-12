@@ -146,7 +146,7 @@ impl RecordingPipeline {
     ///
     /// Returns [`PipelineError`] when the pipeline is not running or a
     /// finalization step fails.
-    pub async fn stop_with(
+    pub(crate) async fn stop_with(
         &mut self,
         mode: ShutdownMode,
     ) -> Result<StopResult, PipelineError> {

@@ -30,34 +30,22 @@ use crate::types::AudioSourceConfig;
 
 pub use timestamp::monotonic_ms;
 
-/// When true, [`start_session`] returns a no-op session (`KOE_STUB_CAPTURE`).
-fn capture_stubbed() -> bool {
-    std::env::var_os("KOE_STUB_CAPTURE").is_some()
-}
-
 /// Running native capture; stopped on [`Drop`] or [`CaptureSession::stop`].
 pub trait CaptureSession: Send {
     fn stop(&mut self);
-}
-
-struct NullSession;
-
-impl CaptureSession for NullSession {
-    fn stop(&mut self) {}
 }
 
 /// Starts a single-source capture session that forwards PCM into `handle`.
 ///
 /// [`AudioSourceConfig::Both`] is rejected here — the pipeline opens system +
 /// mic sessions separately and runs AEC / mix itself.
+///
+/// Stubbed capture (`set_capture_stub` / `KOE_STUB_CAPTURE`) never reaches
+/// here: [`crate::start_capture`] returns a handle without a native session.
 pub fn start_session(
     source: &AudioSourceConfig,
     handle: Arc<CaptureHandle>,
 ) -> Result<Box<dyn CaptureSession>, CaptureError> {
-    if capture_stubbed() {
-        let _ = handle;
-        return Ok(Box::new(NullSession));
-    }
     match source {
         AudioSourceConfig::Microphone => microphone::start(handle),
         AudioSourceConfig::PidAudio { pid } => process_tap::start(*pid, handle),

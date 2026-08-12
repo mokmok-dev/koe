@@ -143,18 +143,6 @@ mod tests {
     }
 
     #[test]
-    fn create_encoder_wav_ignores_comments() {
-        let encoder = create_encoder(
-            &OutputFormat::Wav {
-                bits_per_sample: 16,
-            },
-            None,
-        )
-        .expect("wav");
-        let _ = encoder;
-    }
-
-    #[test]
     fn create_encoder_flac_emits_flac_magic() {
         let mut encoder = create_encoder(
             &OutputFormat::Flac {

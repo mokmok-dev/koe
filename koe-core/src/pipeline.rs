@@ -300,10 +300,10 @@ impl RecordingPipeline {
             segment_tx.clone(),
         )?;
 
-        let (audio_tx, _audio_rx) = broadcast::channel(64);
+        let (audio_tx, audio_rx) = broadcast::channel(64);
         let (capture_handles, mixer_task) = start_captures(
             &config,
-            audio_tx.clone(),
+            audio_tx,
             Arc::clone(&paused),
             Arc::clone(&drop_counter),
             Arc::clone(&shutdown),
@@ -331,7 +331,9 @@ impl RecordingPipeline {
             bytes_written: Arc::clone(&bytes_written),
             monitor: monitor.clone(),
         };
-        let consumer_task = spawn_consumer(audio_tx.subscribe(), consumer_ctx);
+        // Use the original receiver so chunks that arrive while the output
+        // file is created are not discarded with a leftover `_audio_rx`.
+        let consumer_task = spawn_consumer(audio_rx, consumer_ctx);
 
         Ok(Self {
             config,
@@ -392,9 +394,10 @@ impl RecordingPipeline {
     }
 
     /// Current lifecycle state.
+    #[cfg(test)]
     #[must_use]
-    pub const fn state(&self) -> &PipelineState {
-        &self.state
+    pub(crate) const fn state(&self) -> PipelineState {
+        self.state
     }
 
     /// Active configuration.
@@ -410,14 +413,16 @@ impl RecordingPipeline {
     }
 
     /// Returns the primary capture handle when a session is active.
+    #[cfg(test)]
     #[must_use]
-    pub fn capture_handle(&self) -> Option<&Arc<CaptureHandle>> {
+    pub(crate) fn capture_handle(&self) -> Option<&Arc<CaptureHandle>> {
         self.capture_handles.first()
     }
 
     /// Transcription handle for test injection of segments.
+    #[cfg(test)]
     #[must_use]
-    pub const fn transcription_handle(&self) -> Option<&Arc<TranscriptionHandle>> {
+    pub(crate) const fn transcription_handle(&self) -> Option<&Arc<TranscriptionHandle>> {
         self.transcription_handle.as_ref()
     }
 
