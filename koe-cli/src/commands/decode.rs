@@ -81,10 +81,7 @@ pub fn decode_to_canonical(
     let mut decoder = symphonia::default::get_codecs()
         .make(&track.codec_params, &DecoderOptions::default())
         .map_err(|err| {
-            MainError::InvalidArgs(format!(
-                "unsupported codec in '{}': {err}",
-                path.display()
-            ))
+            MainError::InvalidArgs(format!("unsupported codec in '{}': {err}", path.display()))
         })?;
 
     let raw = decode_window(
@@ -129,12 +126,9 @@ pub fn decode_to_canonical(
     ))
 }
 
-fn open_format(
-    path: &Path,
-) -> Result<(Box<dyn FormatReader>, Track), MainError> {
-    let file = File::open(path).map_err(|err| {
-        MainError::Io(format!("failed to open '{}': {err}", path.display()))
-    })?;
+fn open_format(path: &Path) -> Result<(Box<dyn FormatReader>, Track), MainError> {
+    let file = File::open(path)
+        .map_err(|err| MainError::Io(format!("failed to open '{}': {err}", path.display())))?;
     let mss = MediaSourceStream::new(Box::new(file), MediaSourceStreamOptions::default());
 
     let mut hint = Hint::new();
@@ -168,9 +162,7 @@ fn open_format(
                 .iter()
                 .find(|t| t.codec_params.codec != CODEC_TYPE_NULL)
         })
-        .ok_or_else(|| {
-            MainError::InvalidArgs(format!("no audio track in '{}'", path.display()))
-        })?
+        .ok_or_else(|| MainError::InvalidArgs(format!("no audio track in '{}'", path.display())))?
         .clone();
     Ok((format, track))
 }
@@ -290,9 +282,10 @@ fn decode_window(
 
 fn track_duration_ms(track: &Track) -> Option<u64> {
     let n_frames = track.codec_params.n_frames?;
-    let tb = track.codec_params.time_base.unwrap_or_else(|| {
-        TimeBase::new(1, track.codec_params.sample_rate.unwrap_or(1))
-    });
+    let tb = track
+        .codec_params
+        .time_base
+        .unwrap_or_else(|| TimeBase::new(1, track.codec_params.sample_rate.unwrap_or(1)));
     let time = tb.calc_time(n_frames);
     #[allow(clippy::cast_precision_loss)]
     let secs = time.seconds as f64 + time.frac;
@@ -321,9 +314,7 @@ fn normalize_window(
     }
     let end_ms = match (end_ms, source_duration_ms) {
         (Some(end), Some(total)) if end > total => {
-            eprintln!(
-                "warning: --end-at ({end}ms) exceeds file duration ({total}ms); clamping"
-            );
+            eprintln!("warning: --end-at ({end}ms) exceeds file duration ({total}ms); clamping");
             Some(total)
         },
         (end, _) => end,
@@ -408,12 +399,9 @@ fn resample_linear(
     if in_frames == 0 {
         return Vec::new();
     }
-    let out_frames = usize::try_from(
-        (in_frames as u64)
-            .saturating_mul(u64::from(to_hz))
-            / u64::from(from_hz),
-    )
-    .unwrap_or(0);
+    let out_frames =
+        usize::try_from((in_frames as u64).saturating_mul(u64::from(to_hz)) / u64::from(from_hz))
+            .unwrap_or(0);
     if out_frames == 0 {
         return Vec::new();
     }
@@ -504,8 +492,7 @@ mod tests {
         let path = temp_wav("window");
         let samples = vec![1000i16; 48_000];
         write_wav_i16(&path, 48_000, 1, &samples);
-        let (pcm, info) =
-            decode_to_canonical(&path, Some(200), Some(500)).expect("decode window");
+        let (pcm, info) = decode_to_canonical(&path, Some(200), Some(500)).expect("decode window");
         let _ = std::fs::remove_file(&path);
         assert!((290..=310).contains(&info.window_duration_ms));
         let frames = pcm.len() / 2;
@@ -560,7 +547,10 @@ mod tests {
     #[test]
     fn unsupported_extension_errors_gracefully() {
         let mut path = std::env::temp_dir();
-        path.push(format!("koe-transcribe-not-audio-{}.txt", std::process::id()));
+        path.push(format!(
+            "koe-transcribe-not-audio-{}.txt",
+            std::process::id()
+        ));
         std::fs::write(&path, b"not audio").unwrap();
         let err = decode_to_canonical(&path, None, None).expect_err("not audio");
         let _ = std::fs::remove_file(&path);

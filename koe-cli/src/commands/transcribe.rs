@@ -12,9 +12,7 @@ use koe_core::{
 };
 
 use super::Run;
-use super::decode::{
-    CANONICAL_SAMPLE_RATE_HZ, DecodedAudioInfo, chunk_pcm, decode_to_canonical,
-};
+use super::decode::{CANONICAL_SAMPLE_RATE_HZ, DecodedAudioInfo, chunk_pcm, decode_to_canonical};
 use super::duration::parse_duration;
 use crate::MainError;
 
@@ -119,16 +117,16 @@ fn parse_offset_ms(raw: Option<&str>) -> Result<Option<u64>, MainError> {
     raw.map(parse_duration)
         .transpose()
         .map_err(MainError::InvalidArgs)?
-        .map(|d| u64::try_from(d.as_millis()).map_err(|_| {
-            MainError::InvalidArgs("offset is too large".into())
-        }))
+        .map(|d| {
+            u64::try_from(d.as_millis())
+                .map_err(|_| MainError::InvalidArgs("offset is too large".into()))
+        })
         .transpose()
 }
 
 fn run_transcription(prepared: &Prepared) -> Result<(), MainError> {
     eprintln!("Decoding {}…", prepared.input.display());
-    let (pcm, info) =
-        decode_to_canonical(&prepared.input, prepared.start_ms, prepared.end_ms)?;
+    let (pcm, info) = decode_to_canonical(&prepared.input, prepared.start_ms, prepared.end_ms)?;
     report_decode(&info);
 
     let time_offset_ms = i64::try_from(prepared.start_ms.unwrap_or(0)).unwrap_or(0);
@@ -137,9 +135,8 @@ fn run_transcription(prepared: &Prepared) -> Result<(), MainError> {
     let partial = Arc::clone(&collector.partial);
     let errors = Arc::clone(&collector.errors);
 
-    let handle = start_transcription(prepared.locale.clone(), Box::new(collector)).map_err(
-        |err| MainError::Internal(format!("start transcription: {err}")),
-    )?;
+    let handle = start_transcription(prepared.locale.clone(), Box::new(collector))
+        .map_err(|err| MainError::Internal(format!("start transcription: {err}")))?;
 
     let started = Instant::now();
     let total_ms = info.window_duration_ms.max(1);
@@ -210,9 +207,8 @@ fn write_output(
             ))
         })?;
     }
-    std::fs::write(path, body.as_bytes()).map_err(|err| {
-        MainError::Io(format!("failed to write '{}': {err}", path.display()))
-    })
+    std::fs::write(path, body.as_bytes())
+        .map_err(|err| MainError::Io(format!("failed to write '{}': {err}", path.display())))
 }
 
 fn report_decode(info: &DecodedAudioInfo) {
