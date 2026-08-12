@@ -130,12 +130,18 @@ SpeechAnalyzerBridge.onResult
 
 ### CLI Output Behavior
 
+The analyzer's partial/final contract is pinned on the TTY transcript:
+`isFinal: false` always renders 未確定 and `isFinal: true` always renders 確定,
+never the reverse. Lines are prefixed with the capture source — `[SYS]` for
+system/app audio, `[MIC]` for the microphone, `[SYS+MIC]` for the mixed
+(AEC) stream:
+
 ```
 $ koe record --source system --app-id com.google.Chrome
-Recording... (press Ctrl-C to stop)
-[00:00:05.200] This is what I heard so far...          # partial, overwrites in-place
-[00:00:05.200 → 00:00:08.400] This is the final text. # final, new line
-[00:00:08.600] And now a new utterance is starting...   # next partial
+Recording | ⣾ 00:00:05 | FLAC 48kHz stereo | App: Google Chrome (PID 4201)
+[SYS][未確定] [00:00:05] "This is what I heard so far..."   # partial, overwrites in-place
+[SYS][確定] [00:00:08] "This is the final text."            # final, new line
+[SYS][未確定] [00:00:08] "And now a new utterance..."       # next partial
 ```
 
 ### GUI Output Behavior
