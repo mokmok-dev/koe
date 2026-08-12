@@ -500,10 +500,7 @@ async fn run_recording(prepared: PreparedSession) -> Result<(), MainError> {
         .await
         .map_err(map_pipeline_error)?;
 
-    eprintln!(
-        "Recording → {}",
-        output_path.display()
-    );
+    eprintln!("Recording → {}", output_path.display());
 
     let stop_reason = wait_until_done(
         &pipeline,
@@ -539,7 +536,9 @@ async fn wait_until_done(
     loop {
         let until_deadline = deadline.map(|at| at.saturating_duration_since(Instant::now()));
         let until_silence = silence_timeout.map(|timeout| {
-            timeout.saturating_sub(last_sound.elapsed()).max(silence_tick)
+            timeout
+                .saturating_sub(last_sound.elapsed())
+                .max(silence_tick)
         });
         let sleep_for = match (until_deadline, until_silence) {
             (Some(d), Some(s)) => d.min(s),
@@ -732,8 +731,8 @@ mod tests {
 
     #[test]
     fn resolve_system_requires_target() {
-        let args =
-            RecordArgs::try_parse_from(["record", "--source", "system", "-o", "out.ogg"]).expect("parse");
+        let args = RecordArgs::try_parse_from(["record", "--source", "system", "-o", "out.ogg"])
+            .expect("parse");
         let err = resolve_source(&args).expect_err("need target");
         assert!(matches!(err, MainError::InvalidArgs(_)));
     }
@@ -758,10 +757,7 @@ mod tests {
 
     #[test]
     fn parse_duration_compound() {
-        assert_eq!(
-            parse_duration("2h30m").unwrap(),
-            Duration::from_mins(150)
-        );
+        assert_eq!(parse_duration("2h30m").unwrap(), Duration::from_mins(150));
         assert_eq!(parse_duration("45s").unwrap(), Duration::from_secs(45));
         assert_eq!(parse_duration("90").unwrap(), Duration::from_secs(90));
         assert!(parse_duration("").is_err());
@@ -802,9 +798,6 @@ mod tests {
         let prepared = prepare_session(&args).expect("prepare");
         assert!(!prepared.config.transcribe);
         assert!(prepared.config.transcript_output_path.is_none());
-        assert_eq!(
-            prepared.max_duration,
-            Some(Duration::from_secs(30))
-        );
+        assert_eq!(prepared.max_duration, Some(Duration::from_secs(30)));
     }
 }
