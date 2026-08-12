@@ -459,7 +459,7 @@ fn list_locales() {
 }
 
 async fn run_until_shutdown_trigger(
-    prepared: PreparedSession,
+    prepared: PreparedSession
 ) -> Result<PendingShutdown, MainError> {
     let meta = ProgressMeta::new(
         &prepared.config.audio_format,
