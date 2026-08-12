@@ -40,20 +40,20 @@ pub fn start_capture(
     callback: AudioCallbackRef,
 ) -> Result<Arc<CaptureHandle>, CaptureError> {
     validate_capture_source(&source)?;
-    let handle = Arc::new(CaptureHandle::new(source.clone(), callback));
-    #[cfg(target_os = "macos")]
-    {
-        let session = crate::macos_capture::start_session(&source, Arc::clone(&handle))?;
-        handle.attach_session(session);
-    }
     #[cfg(not(target_os = "macos"))]
     {
-        let _ = source;
-        return Err(CaptureError::Internal {
+        let _ = (source, callback);
+        Err(CaptureError::Internal {
             msg: "audio capture is only available on macOS".to_owned(),
-        });
+        })
     }
-    Ok(handle)
+    #[cfg(target_os = "macos")]
+    {
+        let handle = Arc::new(CaptureHandle::new(source.clone(), callback));
+        let session = crate::macos_capture::start_session(&source, Arc::clone(&handle))?;
+        handle.attach_session(session);
+        Ok(handle)
+    }
 }
 
 #[allow(clippy::needless_pass_by_value)]
