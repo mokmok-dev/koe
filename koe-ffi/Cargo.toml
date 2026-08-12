@@ -30,8 +30,11 @@ objc2-av-foundation = { workspace = true, features = [
 objc2-foundation = { workspace = true, features = [
   "NSArray",
   "NSEnumerator",
+  "NSLocale",
+  "NSSet",
   "NSString",
 ] }
+objc2-speech = { workspace = true, features = ["SFSpeechRecognizer"] }
 
 [lints]
 workspace = true

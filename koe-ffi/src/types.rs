@@ -44,6 +44,25 @@ pub struct AppInfo {
     pub has_audio: bool,
 }
 
+/// Default Core Audio device identity (name + persistent UID).
+///
+/// Rust hosts only (not a `UniFFI` record). Consumed by `koe info` and any
+/// future Rust GUI that needs the same diagnostics.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AudioDeviceInfo {
+    pub name: String,
+    pub uid: String,
+}
+
+impl std::fmt::Display for AudioDeviceInfo {
+    fn fmt(
+        &self,
+        f: &mut std::fmt::Formatter<'_>,
+    ) -> std::fmt::Result {
+        write!(f, "{} ({})", self.name, self.uid)
+    }
+}
+
 #[derive(Debug, Clone, uniffi::Enum)]
 pub enum OutputFormat {
     Ogg { quality: f32 },
