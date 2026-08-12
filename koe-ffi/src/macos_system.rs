@@ -3,6 +3,11 @@
 //! Device and speech-locale lookups live here rather than on
 //! [`crate::NativeProvider`]: the CLI already installs an in-process discovery
 //! provider, and these queries do not need the Swift bridge.
+//!
+//! Unlike permission/app enumeration, these helpers are process-global OS
+//! reads and are not injectable via `NativeProvider` (intentional: keeps the
+//! UniFFI callback surface small). On non-macOS hosts they degrade to
+//! `None` / empty via stubs in `lib.rs`.
 
 #![allow(unsafe_code)]
 
@@ -80,19 +85,26 @@ pub fn default_output_device() -> Option<AudioDeviceInfo> {
 
 /// BCP-47 locale identifiers from `SFSpeechRecognizer.supportedLocales()`.
 ///
-/// Sorted for stable CLI / JSON output. Empty if the Speech framework returns
-/// nothing (unusual on a stock macOS install).
+/// Identifiers are normalized from Apple's underscore form (`en_US`) to
+/// BCP-47 hyphen form (`en-US`) so they match `--locale` / pipeline
+/// conventions. Sorted for stable CLI / JSON output. Empty if the Speech
+/// framework returns nothing (unusual on a stock macOS install).
 #[must_use]
 pub fn supported_speech_locales() -> Vec<String> {
     // SAFETY: class method; returns an immutable set of NSLocale.
     let locales = unsafe { SFSpeechRecognizer::supportedLocales() };
     let mut out: Vec<String> = locales
         .iter()
-        .map(|locale: &NSLocale| locale.localeIdentifier().to_string())
+        .map(|locale: &NSLocale| to_bcp47(&locale.localeIdentifier().to_string()))
         .collect();
     out.sort_unstable();
     out.dedup();
     out
+}
+
+/// Apple `localeIdentifier` uses `_`; Koe CLI/pipeline locale flags use `-`.
+fn to_bcp47(identifier: &str) -> String {
+    identifier.replace('_', "-")
 }
 
 fn default_device(selector: u32) -> Option<AudioDeviceInfo> {
@@ -155,10 +167,21 @@ fn cf_string_property(
     if status != 0 || cf_string.is_null() {
         return None;
     }
-    let value = cf_string_to_string(cf_string);
-    // SAFETY: we own the CFString returned by AudioObjectGetPropertyData.
-    unsafe { CFRelease(cf_string) };
-    value
+    // Release even if conversion panics or returns None.
+    let _owned = CfString(cf_string);
+    cf_string_to_string(cf_string)
+}
+
+/// Owns a `CFString` and releases it on drop.
+struct CfString(CFStringRef);
+
+impl Drop for CfString {
+    fn drop(&mut self) {
+        if !self.0.is_null() {
+            // SAFETY: we uniquely own this CFString from AudioObjectGetPropertyData.
+            unsafe { CFRelease(self.0) };
+        }
+    }
 }
 
 fn cf_string_to_string(cf_string: CFStringRef) -> Option<String> {
@@ -175,13 +198,14 @@ fn cf_string_to_string(cf_string: CFStringRef) -> Option<String> {
     }
     // +1 for the NUL that CFStringGetCString writes.
     let buf_len = usize::try_from(max_size).ok()?.checked_add(1)?;
+    let buffer_size = CFIndex::try_from(buf_len).ok()?;
     let mut buf = vec![0u8; buf_len];
     // SAFETY: buffer is writable and sized per CFStringGetMaximumSizeForEncoding.
     let ok = unsafe {
         CFStringGetCString(
             cf_string,
             buf.as_mut_ptr(),
-            CFIndex::try_from(buf_len).ok()?,
+            buffer_size,
             K_CF_STRING_ENCODING_UTF8,
         )
     };
@@ -189,5 +213,17 @@ fn cf_string_to_string(cf_string: CFStringRef) -> Option<String> {
         return None;
     }
     let nul = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
-    String::from_utf8(buf[..nul].to_vec()).ok()
+    std::str::from_utf8(&buf[..nul]).ok().map(str::to_owned)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::to_bcp47;
+
+    #[test]
+    fn to_bcp47_normalizes_underscore() {
+        assert_eq!(to_bcp47("en_US"), "en-US");
+        assert_eq!(to_bcp47("zh_Hans_CN"), "zh-Hans-CN");
+        assert_eq!(to_bcp47("ja-JP"), "ja-JP");
+    }
 }

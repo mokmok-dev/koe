@@ -162,7 +162,7 @@ fn format_device_line(
 ) {
     match device {
         Some(device) => {
-            let _ = writeln!(out, "  {label:<16} {} ({})", device.name, device.uid);
+            let _ = writeln!(out, "  {label:<16} {device}");
         },
         None => {
             let _ = writeln!(out, "  {label:<16} unavailable");

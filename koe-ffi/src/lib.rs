@@ -118,6 +118,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(not(target_os = "macos"))]
     fn system_queries_degrade_without_macos() {
         assert!(default_input_device().is_none());
         assert!(default_output_device().is_none());
