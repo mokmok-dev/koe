@@ -6,8 +6,7 @@ use std::time::{Duration, Instant};
 use clap::Parser;
 use koe_core::{
     AudioSourceConfig, OutputFormat, PipelineConfig, PipelineError, RecordingError,
-    RecordingPipeline, RecordingSummary, StopResult, TranscriptFormat, enumerate_apps,
-    native_provider_registered,
+    RecordingPipeline, StopResult, TranscriptFormat, enumerate_apps, native_provider_registered,
 };
 
 use super::Run;
@@ -15,6 +14,7 @@ use super::apps_table::{format_apps_table, prepare_apps};
 use super::duration::parse_duration;
 use crate::MainError;
 use crate::config::{self, KoeConfig, builtin};
+use crate::progress::{ProgressMeta, ProgressRenderer, create_renderer};
 use crate::signals::{SignalEvent, SignalListener, StopSignal};
 
 /// Canonical capture / encode rate (pipeline is fixed to this today).
@@ -23,6 +23,8 @@ const CANONICAL_SAMPLE_RATE_HZ: u32 = builtin::SAMPLE_RATE_HZ;
 const CANONICAL_CHANNELS: u8 = builtin::CHANNELS;
 /// Peak level below this is treated as silence for `--silence-timeout`.
 const SILENCE_PEAK_THRESHOLD: f32 = 0.01;
+/// Paint status ~10 Hz (pipeline meters arrive faster).
+const STATUS_INTERVAL: Duration = Duration::from_millis(100);
 
 /// Start a recording session with optional live transcription.
 ///
@@ -451,25 +453,40 @@ fn list_locales() {
 }
 
 async fn run_recording(prepared: PreparedSession) -> Result<(), MainError> {
-    let output_path = prepared.config.output_path.clone();
-    let transcript_path = prepared.config.transcript_output_path.clone();
+    let meta = ProgressMeta::new(
+        &prepared.config.audio_format,
+        &prepared.config.source,
+        prepared.config.output_path.clone(),
+        prepared.config.transcript_output_path.clone(),
+    );
+    let mut renderer = create_renderer(meta);
 
     let mut pipeline = RecordingPipeline::start(prepared.config)
         .await
         .map_err(map_pipeline_error)?;
 
-    eprintln!("Recording → {}", output_path.display());
+    // Subscribe before installing signals so early meter/ASR events are not lost.
+    let progress = pipeline.subscribe_progress();
+    let segments = pipeline.subscribe_segments();
 
     let mut signals = SignalListener::install().map_err(MainError::Internal)?;
 
     let stop_reason = wait_until_done(
         &mut pipeline,
         &mut signals,
-        prepared.max_duration,
-        prepared.max_bytes,
-        prepared.silence_timeout,
+        ProgressFeeds { progress, segments },
+        renderer.as_mut(),
+        WaitLimits {
+            max_duration: prepared.max_duration,
+            max_bytes: prepared.max_bytes,
+            silence_timeout: prepared.silence_timeout,
+        },
     )
     .await?;
+
+    // Always clear the live TTY block before finalize (interrupt path also
+    // clears earlier for the human-readable notice).
+    renderer.prepare_message();
 
     let summary = match stop_reason {
         StopReason::Interrupted { force } => {
@@ -478,7 +495,7 @@ async fn run_recording(prepared: PreparedSession) -> Result<(), MainError> {
         _ => pipeline.stop().await.map_err(map_pipeline_error)?,
     };
 
-    print_summary(&summary, &output_path, transcript_path.as_deref());
+    renderer.finish(&summary);
 
     if matches!(stop_reason, StopReason::Interrupted { .. }) {
         return Err(MainError::Interrupted);
@@ -513,121 +530,144 @@ async fn second_interrupt_pending(signals: &mut SignalListener) -> bool {
     }
 }
 
-async fn wait_until_done(
-    pipeline: &mut RecordingPipeline,
-    signals: &mut SignalListener,
+struct ProgressFeeds {
+    progress: tokio::sync::broadcast::Receiver<koe_core::RecordingStatus>,
+    segments: tokio::sync::broadcast::Receiver<koe_core::TranscriptionSegment>,
+}
+
+struct WaitLimits {
     max_duration: Option<Duration>,
     max_bytes: Option<u64>,
     silence_timeout: Option<Duration>,
+}
+
+async fn wait_until_done(
+    pipeline: &mut RecordingPipeline,
+    signals: &mut SignalListener,
+    feeds: ProgressFeeds,
+    renderer: &mut dyn ProgressRenderer,
+    limits: WaitLimits,
 ) -> Result<StopReason, MainError> {
-    let mut progress = pipeline.subscribe_progress();
+    let ProgressFeeds {
+        mut progress,
+        mut segments,
+    } = feeds;
+    let WaitLimits {
+        max_duration,
+        max_bytes,
+        silence_timeout,
+    } = limits;
+
     let deadline = max_duration.map(|d| Instant::now() + d);
     let mut last_sound = Instant::now();
-    // Poll silence even when no meter updates arrive.
     let silence_tick = Duration::from_millis(200);
+    let mut last_status_paint = Instant::now()
+        .checked_sub(STATUS_INTERVAL)
+        .unwrap_or_else(Instant::now);
+    let mut last_painted_state: Option<koe_core::RecordingState> = None;
 
     loop {
-        let until_deadline = deadline.map(|at| at.saturating_duration_since(Instant::now()));
-        let until_silence = silence_timeout.map(|timeout| {
-            timeout
-                .saturating_sub(last_sound.elapsed())
-                .max(silence_tick)
-        });
-        let sleep_for = match (until_deadline, until_silence) {
-            (Some(d), Some(s)) => d.min(s),
-            (Some(d), None) => d,
-            (None, Some(s)) => s,
-            (None, None) => Duration::from_mins(1),
-        };
+        let sleep_for = next_wake(deadline, silence_timeout, last_sound, silence_tick);
         let sleep_armed = deadline.is_some() || silence_timeout.is_some();
 
         tokio::select! {
             event = signals.recv() => {
-                match event {
-                    SignalEvent::Stop(kind) => {
-                        let force = kind == StopSignal::Force;
-                        if force {
-                            eprintln!("Force interrupt — stopping immediately…");
-                        } else {
-                            eprintln!("Interrupted — finishing recording…");
-                        }
-                        return Ok(StopReason::Interrupted { force });
-                    }
-                    SignalEvent::TogglePause => {
-                        if pipeline.is_paused() {
-                            pipeline.resume();
-                            eprintln!("Resumed");
-                        } else {
-                            pipeline.pause();
-                            eprintln!("Paused");
-                        }
-                    }
+                if let Some(reason) = handle_signal_event(event, pipeline, renderer) {
+                    return Ok(reason);
                 }
             }
             () = tokio::time::sleep(sleep_for), if sleep_armed => {
-                if let Some(at) = deadline
-                    && Instant::now() >= at
-                {
+                if deadline.is_some_and(|at| Instant::now() >= at) {
                     return Ok(StopReason::DurationLimit);
                 }
-                if let Some(timeout) = silence_timeout
-                    && last_sound.elapsed() >= timeout
-                {
+                if silence_timeout.is_some_and(|t| last_sound.elapsed() >= t) {
                     return Ok(StopReason::SilenceTimeout);
                 }
             }
             status = progress.recv() => {
                 match status {
                     Ok(status) => {
-                        if let Some(limit) = max_bytes
-                            && status.bytes_written >= limit
-                        {
+                        let state_changed = last_painted_state != Some(status.state);
+                        if state_changed || last_status_paint.elapsed() >= STATUS_INTERVAL {
+                            renderer.render_status(&status);
+                            last_status_paint = Instant::now();
+                            last_painted_state = Some(status.state);
+                        }
+                        if max_bytes.is_some_and(|limit| status.bytes_written >= limit) {
                             return Ok(StopReason::MaxSize);
                         }
                         if silence_timeout.is_some() {
                             let peak = status.level_left.max(status.level_right);
                             if peak >= SILENCE_PEAK_THRESHOLD {
                                 last_sound = Instant::now();
-                            } else if let Some(timeout) = silence_timeout
-                                && last_sound.elapsed() >= timeout
-                            {
+                            } else if silence_timeout.is_some_and(|t| last_sound.elapsed() >= t) {
                                 return Ok(StopReason::SilenceTimeout);
                             }
                         }
                     }
-                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
-                        // Best-effort progress; keep waiting.
-                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
                     Err(tokio::sync::broadcast::error::RecvError::Closed) => {
-                        // Progress publisher gone; finish gracefully.
                         return Ok(StopReason::DurationLimit);
                     }
+                }
+            }
+            segment = segments.recv() => {
+                match segment {
+                    Ok(segment) => renderer.render_segment(&segment),
+                    Err(
+                        tokio::sync::broadcast::error::RecvError::Lagged(_)
+                        | tokio::sync::broadcast::error::RecvError::Closed,
+                    ) => {}
                 }
             }
         }
     }
 }
 
-fn print_summary(
-    summary: &RecordingSummary,
-    output: &Path,
-    transcript: Option<&Path>,
-) {
-    eprintln!(
-        "Done: {:.1}s, {} bytes, {} segments → {}",
-        summary.duration_sec,
-        summary.bytes_written,
-        summary.transcript_segment_count,
-        output.display()
-    );
-    if let Some(path) = transcript {
-        eprintln!("Transcript → {}", path.display());
+fn next_wake(
+    deadline: Option<Instant>,
+    silence_timeout: Option<Duration>,
+    last_sound: Instant,
+    silence_tick: Duration,
+) -> Duration {
+    let until_deadline = deadline.map(|at| at.saturating_duration_since(Instant::now()));
+    let until_silence = silence_timeout.map(|timeout| {
+        timeout
+            .saturating_sub(last_sound.elapsed())
+            .max(silence_tick)
+    });
+    match (until_deadline, until_silence) {
+        (Some(d), Some(s)) => d.min(s),
+        (Some(d), None) => d,
+        (None, Some(s)) => s,
+        (None, None) => Duration::from_mins(1),
     }
-    if summary.dropped_audio_frames > 0 {
-        eprintln!(
-            "warning: dropped {} audio frames during capture",
-            summary.dropped_audio_frames
-        );
+}
+
+fn handle_signal_event(
+    event: SignalEvent,
+    pipeline: &mut RecordingPipeline,
+    renderer: &mut dyn ProgressRenderer,
+) -> Option<StopReason> {
+    match event {
+        SignalEvent::Stop(kind) => {
+            let force = kind == StopSignal::Force;
+            renderer.prepare_message();
+            if force {
+                eprintln!("Force interrupt — stopping immediately…");
+            } else {
+                eprintln!("Interrupted — finishing recording…");
+            }
+            Some(StopReason::Interrupted { force })
+        },
+        SignalEvent::TogglePause => {
+            if pipeline.is_paused() {
+                pipeline.resume();
+            } else {
+                pipeline.pause();
+            }
+            None
+        },
     }
 }
 
