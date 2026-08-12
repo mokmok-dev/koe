@@ -6,7 +6,7 @@ use std::time::{Duration, Instant};
 use clap::Parser;
 use koe_core::{
     AudioSourceConfig, OutputFormat, PipelineConfig, PipelineError, RecordingError,
-    RecordingPipeline, RecordingSummary, TranscriptFormat, enumerate_apps,
+    RecordingPipeline, RecordingSummary, StopResult, TranscriptFormat, enumerate_apps,
     native_provider_registered,
 };
 
@@ -15,6 +15,7 @@ use super::apps_table::{format_apps_table, prepare_apps};
 use super::duration::parse_duration;
 use crate::MainError;
 use crate::config::{self, KoeConfig, builtin};
+use crate::signals::{SignalEvent, SignalListener, StopSignal};
 
 /// Canonical capture / encode rate (pipeline is fixed to this today).
 const CANONICAL_SAMPLE_RATE_HZ: u32 = builtin::SAMPLE_RATE_HZ;
@@ -120,7 +121,10 @@ enum StopReason {
     DurationLimit,
     MaxSize,
     SilenceTimeout,
-    Interrupted,
+    /// SIGINT / SIGTERM. `force` is set when the double-tap window already fired.
+    Interrupted {
+        force: bool,
+    },
 }
 
 impl Run for RecordArgs {
@@ -456,26 +460,62 @@ async fn run_recording(prepared: PreparedSession) -> Result<(), MainError> {
 
     eprintln!("Recording → {}", output_path.display());
 
+    let mut signals = SignalListener::install().map_err(MainError::Internal)?;
+
     let stop_reason = wait_until_done(
-        &pipeline,
+        &mut pipeline,
+        &mut signals,
         prepared.max_duration,
         prepared.max_bytes,
         prepared.silence_timeout,
     )
     .await?;
 
-    let summary = pipeline.stop().await.map_err(map_pipeline_error)?;
+    let summary = match stop_reason {
+        StopReason::Interrupted { force } => {
+            stop_after_interrupt(&mut pipeline, &mut signals, force).await?
+        },
+        _ => pipeline.stop().await.map_err(map_pipeline_error)?,
+    };
 
     print_summary(&summary, &output_path, transcript_path.as_deref());
 
-    if matches!(stop_reason, StopReason::Interrupted) {
+    if matches!(stop_reason, StopReason::Interrupted { .. }) {
         return Err(MainError::Interrupted);
     }
     Ok(())
 }
 
+/// Stop after SIGINT/SIGTERM: prefer `force_stop` when the wait loop already
+/// saw a double-tap or a second interrupt is queued; otherwise graceful `stop`
+/// with a hard-exit watchdog for in-flight double-tap.
+async fn stop_after_interrupt(
+    pipeline: &mut RecordingPipeline,
+    signals: &mut SignalListener,
+    force: bool,
+) -> Result<StopResult, MainError> {
+    let force = force || second_interrupt_pending(signals).await;
+    if force {
+        eprintln!("Force stop — skipping transcript finalize…");
+        return pipeline.force_stop().await.map_err(map_pipeline_error);
+    }
+
+    crate::signals::spawn_force_exit_watchdog(signals.interrupt_flag());
+    pipeline.stop().await.map_err(map_pipeline_error)
+}
+
+/// Non-blocking poll: `true` when a second interrupt is already queued.
+async fn second_interrupt_pending(signals: &mut SignalListener) -> bool {
+    tokio::select! {
+        biased;
+        () = signals.recv_force_during_stop() => true,
+        () = std::future::ready(()) => false,
+    }
+}
+
 async fn wait_until_done(
-    pipeline: &RecordingPipeline,
+    pipeline: &mut RecordingPipeline,
+    signals: &mut SignalListener,
     max_duration: Option<Duration>,
     max_bytes: Option<u64>,
     silence_timeout: Option<Duration>,
@@ -485,7 +525,6 @@ async fn wait_until_done(
     let mut last_sound = Instant::now();
     // Poll silence even when no meter updates arrive.
     let silence_tick = Duration::from_millis(200);
-    let mut sigterm = install_terminate_signal()?;
 
     loop {
         let until_deadline = deadline.map(|at| at.saturating_duration_since(Instant::now()));
@@ -503,14 +542,27 @@ async fn wait_until_done(
         let sleep_armed = deadline.is_some() || silence_timeout.is_some();
 
         tokio::select! {
-            ctrl = tokio::signal::ctrl_c() => {
-                ctrl.map_err(|err| MainError::Internal(format!("signal: {err}")))?;
-                eprintln!("Interrupted — finishing recording…");
-                return Ok(StopReason::Interrupted);
-            }
-            () = recv_terminate(&mut sigterm) => {
-                eprintln!("Interrupted — finishing recording…");
-                return Ok(StopReason::Interrupted);
+            event = signals.recv() => {
+                match event {
+                    SignalEvent::Stop(kind) => {
+                        let force = kind == StopSignal::Force;
+                        if force {
+                            eprintln!("Force interrupt — stopping immediately…");
+                        } else {
+                            eprintln!("Interrupted — finishing recording…");
+                        }
+                        return Ok(StopReason::Interrupted { force });
+                    }
+                    SignalEvent::TogglePause => {
+                        if pipeline.is_paused() {
+                            pipeline.resume();
+                            eprintln!("Resumed");
+                        } else {
+                            pipeline.pause();
+                            eprintln!("Paused");
+                        }
+                    }
+                }
             }
             () = tokio::time::sleep(sleep_for), if sleep_armed => {
                 if let Some(at) = deadline
@@ -553,37 +605,6 @@ async fn wait_until_done(
                 }
             }
         }
-    }
-}
-
-#[cfg(unix)]
-struct TerminateSignal(tokio::signal::unix::Signal);
-
-#[cfg(not(unix))]
-struct TerminateSignal;
-
-fn install_terminate_signal() -> Result<TerminateSignal, MainError> {
-    #[cfg(unix)]
-    {
-        let signal = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-            .map_err(|err| MainError::Internal(format!("SIGTERM handler: {err}")))?;
-        Ok(TerminateSignal(signal))
-    }
-    #[cfg(not(unix))]
-    {
-        Ok(TerminateSignal)
-    }
-}
-
-async fn recv_terminate(signal: &mut TerminateSignal) {
-    #[cfg(unix)]
-    {
-        let _ = signal.0.recv().await;
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = signal;
-        std::future::pending::<()>().await;
     }
 }
 
