@@ -37,6 +37,9 @@ pub enum SignalEvent {
 /// Double-tap window for second SIGINT → force.
 pub const DOUBLE_TAP_WINDOW: Duration = Duration::from_secs(2);
 
+/// Process exit code for interrupt (matches CLI spec / `MainError::Interrupted`).
+const EXIT_INTERRUPTED: i32 = 5;
+
 /// Tracks whether a first interrupt has armed the force window.
 ///
 /// Pure state — no runtime. [`SignalListener`] owns the 2s reset timer.
@@ -63,7 +66,7 @@ impl InterruptGate {
     /// Records SIGINT. Second press while armed → [`StopSignal::Force`].
     #[must_use]
     pub fn on_sigint(&self) -> StopSignal {
-        if self.armed.swap(true, Ordering::SeqCst) {
+        if self.armed.swap(true, Ordering::Relaxed) {
             StopSignal::Force
         } else {
             StopSignal::Graceful
@@ -73,7 +76,7 @@ impl InterruptGate {
     /// Records SIGTERM (always graceful; still arms the force window for SIGINT).
     #[must_use]
     pub fn on_sigterm(&self) -> StopSignal {
-        self.armed.store(true, Ordering::SeqCst);
+        self.armed.store(true, Ordering::Relaxed);
         StopSignal::Graceful
     }
 }
@@ -131,23 +134,34 @@ impl SignalListener {
     }
 
     /// Waits for the next recording-related signal.
+    ///
+    /// Closed signal streams (`recv` → `None`) are ignored so a driver teardown
+    /// cannot be mistaken for Ctrl-C.
     pub async fn recv(&mut self) -> SignalEvent {
         #[cfg(unix)]
         {
-            tokio::select! {
-                _ = self.sigint.recv() => {
-                    let kind = self.gate.on_sigint();
-                    if kind == StopSignal::Graceful {
-                        self.spawn_double_tap_reset();
+            loop {
+                tokio::select! {
+                    Some(()) = self.sigint.recv() => {
+                        let kind = self.gate.on_sigint();
+                        if kind == StopSignal::Graceful {
+                            self.spawn_double_tap_reset();
+                        }
+                        return SignalEvent::Stop(kind);
                     }
-                    SignalEvent::Stop(kind)
+                    Some(()) = self.sigterm.recv() => {
+                        let kind = self.gate.on_sigterm();
+                        self.spawn_double_tap_reset();
+                        return SignalEvent::Stop(kind);
+                    }
+                    Some(()) = self.sigusr1.recv() => {
+                        return SignalEvent::TogglePause;
+                    }
+                    else => {
+                        // All signal drivers closed — park forever.
+                        std::future::pending::<()>().await;
+                    }
                 }
-                _ = self.sigterm.recv() => {
-                    let kind = self.gate.on_sigterm();
-                    self.spawn_double_tap_reset();
-                    SignalEvent::Stop(kind)
-                }
-                _ = self.sigusr1.recv() => SignalEvent::TogglePause,
             }
         }
         #[cfg(not(unix))]
@@ -160,6 +174,8 @@ impl SignalListener {
                     }
                     SignalEvent::Stop(kind)
                 },
+                // ctrl_c install/listen failure: treat as graceful stop request
+                // so the session still finalizes rather than hanging forever.
                 Err(_) => SignalEvent::Stop(StopSignal::Graceful),
             }
         }
@@ -167,7 +183,7 @@ impl SignalListener {
 
     /// Waits until an interrupt that should abort an in-flight graceful stop.
     ///
-    /// Ignores SIGUSR1. Used to race against `pipeline.stop()`.
+    /// Ignores SIGUSR1. Used for a non-blocking pending-interrupt poll.
     pub async fn recv_force_during_stop(&mut self) {
         loop {
             match self.recv().await {
@@ -181,16 +197,16 @@ impl SignalListener {
         let flag = self.gate.flag();
         tokio::spawn(async move {
             tokio::time::sleep(DOUBLE_TAP_WINDOW).await;
-            flag.store(false, Ordering::SeqCst);
+            flag.store(false, Ordering::Relaxed);
         });
     }
 }
 
 /// Spawns a watchdog that hard-exits on a second SIGINT while graceful stop runs.
 ///
-/// Prefer racing [`SignalListener::recv_force_during_stop`] when the listener is
-/// still owned by the caller. This helper exists for call sites that cannot poll
-/// the listener; tokio allows multiple `signal(SIGINT)` registrations.
+/// Needed because `pipeline.stop().await` holds `&mut RecordingPipeline`, so an
+/// in-flight escalate to `force_stop` is impossible. Tokio allows a second
+/// `signal(SIGINT)` registration alongside [`SignalListener`].
 pub fn spawn_force_exit_watchdog(armed: Arc<AtomicBool>) {
     #[cfg(unix)]
     {
@@ -204,11 +220,11 @@ pub fn spawn_force_exit_watchdog(armed: Arc<AtomicBool>) {
                 if sigint.recv().await.is_none() {
                     return;
                 }
-                if armed.load(Ordering::SeqCst) {
+                if armed.load(Ordering::Relaxed) {
                     eprintln!("Force exit — second interrupt during shutdown");
                     // In-flight `stop().await` holds `&mut self`; cannot escalate
                     // to `force_stop`. Hard exit matches the CLI signal contract.
-                    std::process::exit(5);
+                    std::process::exit(EXIT_INTERRUPTED);
                 }
             }
         });
@@ -220,9 +236,9 @@ pub fn spawn_force_exit_watchdog(armed: Arc<AtomicBool>) {
                 if tokio::signal::ctrl_c().await.is_err() {
                     return;
                 }
-                if armed.load(Ordering::SeqCst) {
+                if armed.load(Ordering::Relaxed) {
                     eprintln!("Force exit — second interrupt during shutdown");
-                    std::process::exit(5);
+                    std::process::exit(EXIT_INTERRUPTED);
                 }
             }
         });
@@ -265,7 +281,7 @@ mod tests {
     fn first_sigint_is_graceful_second_is_force() {
         let gate = InterruptGate::new();
         assert_eq!(gate.on_sigint(), StopSignal::Graceful);
-        assert!(gate.flag().load(Ordering::SeqCst));
+        assert!(gate.flag().load(Ordering::Relaxed));
         assert_eq!(gate.on_sigint(), StopSignal::Force);
     }
 
@@ -277,10 +293,10 @@ mod tests {
     }
 
     #[test]
-    fn clear_resets_force_window() {
+    fn clearing_flag_reopens_graceful_window() {
         let gate = InterruptGate::new();
         assert_eq!(gate.on_sigint(), StopSignal::Graceful);
-        gate.flag().store(false, Ordering::SeqCst);
+        gate.flag().store(false, Ordering::Relaxed);
         assert_eq!(gate.on_sigint(), StopSignal::Graceful);
     }
 }

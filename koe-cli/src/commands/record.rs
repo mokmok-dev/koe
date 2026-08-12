@@ -6,7 +6,7 @@ use std::time::{Duration, Instant};
 use clap::Parser;
 use koe_core::{
     AudioSourceConfig, OutputFormat, PipelineConfig, PipelineError, RecordingError,
-    RecordingPipeline, RecordingSummary, TranscriptFormat, enumerate_apps,
+    RecordingPipeline, RecordingSummary, StopResult, TranscriptFormat, enumerate_apps,
     native_provider_registered,
 };
 
@@ -498,7 +498,7 @@ async fn stop_after_interrupt(
     pipeline: &mut RecordingPipeline,
     signals: &mut SignalListener,
     force: bool,
-) -> Result<koe_core::StopResult, MainError> {
+) -> Result<StopResult, MainError> {
     let force = force || second_interrupt_pending(signals).await;
     if force {
         eprintln!("Force stop — skipping transcript finalize…");
