@@ -11,6 +11,17 @@ path = "src/main.rs"
 clap = { workspace = true, features = ["derive"] }
 koe-core = { path = "../koe-core" }
 serde_json = { workspace = true }
+symphonia = { workspace = true, features = [
+  "aac",
+  "aiff",
+  "flac",
+  "isomp4",
+  "mp3",
+  "ogg",
+  "pcm",
+  "vorbis",
+  "wav",
+] }
 thiserror = { workspace = true }
 tokio = { workspace = true, features = [
   "macros",

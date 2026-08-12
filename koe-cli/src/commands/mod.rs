@@ -1,17 +1,21 @@
 //! CLI subcommands.
 //!
-//! `transcribe` / `completions` wait on later tasks (26, 28+).
+//! `completions` waits on later tasks (28+).
 
 mod apps_table;
+mod decode;
+mod duration;
 mod info;
 mod list;
 mod permissions;
 mod record;
+mod transcribe;
 
 pub use info::InfoArgs;
 pub use list::ListArgs;
 pub use permissions::PermissionsArgs;
 pub use record::RecordArgs;
+pub use transcribe::TranscribeArgs;
 
 use crate::MainError;
 

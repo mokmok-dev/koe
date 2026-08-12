@@ -5,7 +5,7 @@ mod commands;
 use clap::{Parser, Subcommand};
 use thiserror::Error;
 
-use commands::{InfoArgs, ListArgs, PermissionsArgs, RecordArgs, Run};
+use commands::{InfoArgs, ListArgs, PermissionsArgs, RecordArgs, Run, TranscribeArgs};
 
 #[derive(Debug, Parser)]
 #[command(
@@ -25,6 +25,8 @@ enum Command {
     Record(Box<RecordArgs>),
     /// List capture-able apps and audio activity.
     List(ListArgs),
+    /// Transcribe an existing audio file (offline).
+    Transcribe(TranscribeArgs),
     /// Check and diagnose macOS permissions.
     Permissions(PermissionsArgs),
     /// Show build and host system information.
@@ -101,6 +103,7 @@ fn run() -> Result<(), MainError> {
     match cli.command {
         Command::Record(args) => (*args).run(),
         Command::List(args) => args.run(),
+        Command::Transcribe(args) => args.run(),
         Command::Permissions(args) => args.run(),
         Command::Info(args) => args.run(),
     }
@@ -121,6 +124,23 @@ mod tests {
     fn parses_list_flags() {
         let cli = Cli::try_parse_from(["koe", "list", "--audio-only", "--json"]).expect("parse");
         assert!(matches!(cli.command, Command::List(_)));
+    }
+
+    #[test]
+    fn parses_transcribe_flags() {
+        let cli = Cli::try_parse_from([
+            "koe",
+            "transcribe",
+            "--format",
+            "srt",
+            "--locale",
+            "ja-JP",
+            "--start-at",
+            "30s",
+            "meeting.ogg",
+        ])
+        .expect("parse");
+        assert!(matches!(cli.command, Command::Transcribe(_)));
     }
 
     #[test]
