@@ -19,7 +19,7 @@ pub use koe_ffi::RecordingError;
 /// Summary payload returned from [`RecordingPipeline::stop`].
 pub use koe_ffi::RecordingSummary;
 
-/// Discovery and permission entry points used by `koe-cli` (and GUI).
+/// Discovery, permission, and transcription entry points used by `koe-cli` (and GUI).
 pub use koe_ffi::{
     AppInfo, AudioSourceConfig, OutputFormat, Permission, PermissionStatus, TranscriptFormat,
     TranscriptionCallback, TranscriptionError, TranscriptionHandle, TranscriptionSegment,
@@ -28,6 +28,7 @@ pub use koe_ffi::{
     validate_locale,
 };
 
+/// Transcript formatters and path helpers for CLI/GUI output.
 pub use transcript::{
     TranscriptFormatter, TranscriptMeta, create_formatter, default_transcript_path,
     transcript_extension,

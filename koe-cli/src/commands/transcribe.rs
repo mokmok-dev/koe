@@ -154,7 +154,8 @@ fn run_transcription(prepared: &Prepared) -> Result<(), MainError> {
 
     finalize_transcription(handle);
 
-    if let Some(err) = errors.lock().ok().and_then(|guard| guard.clone()) {
+    let asr_error = errors.lock().ok().and_then(|guard| guard.clone());
+    if let Some(err) = asr_error.as_ref() {
         eprintln!("warning: transcription error: {err}");
     }
 
@@ -163,7 +164,20 @@ fn run_transcription(prepared: &Prepared) -> Result<(), MainError> {
         .map_err(|_| MainError::Internal("segment lock poisoned".into()))?
         .clone();
 
+    if finals.is_empty() {
+        if let Some(err) = asr_error {
+            return Err(MainError::Internal(format!(
+                "transcription failed with no segments: {err}"
+            )));
+        }
+        eprintln!(
+            "note: no final segments produced (native speech analyzer may be unavailable in this build)"
+        );
+    }
+
     let meta = TranscriptMeta::for_session(&AudioSourceConfig::Microphone, &prepared.locale);
+    // JSON `source` still uses AudioSourceConfig (no file variant yet). Offline
+    // transcription records Microphone as a stand-in until FFI gains a file source.
     let mut formatter = create_formatter(prepared.format, &meta);
     for segment in &finals {
         formatter.write_segment(segment);

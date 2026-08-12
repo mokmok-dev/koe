@@ -58,8 +58,25 @@ pub fn decode_to_canonical(
         .max(1);
 
     let source_duration_ms = track_duration_ms(&track);
-    validate_window(start_ms, end_ms, source_duration_ms)?;
-    maybe_seek_to_start(&mut *format, track_id, start_ms);
+    let (start_ms, end_ms) = normalize_window(start_ms, end_ms, source_duration_ms)?;
+
+    let seeked = maybe_seek_to_start(&mut *format, track_id, start_ms);
+    // After a successful seek the decoder timeline restarts near `start_ms`, so
+    // window bounds must be relative to that point. If seek failed (or was a
+    // no-op), keep absolute frame indices and skip via `append_windowed`.
+    let (start_frame, end_frame) = if seeked {
+        let relative_end = match (start_ms, end_ms) {
+            (Some(start), Some(end)) => Some(ms_to_frames(end.saturating_sub(start), source_rate)),
+            (None, Some(end)) => Some(ms_to_frames(end, source_rate)),
+            (_, None) => None,
+        };
+        (0, relative_end)
+    } else {
+        (
+            start_ms.map_or(0, |ms| ms_to_frames(ms, source_rate)),
+            end_ms.map(|ms| ms_to_frames(ms, source_rate)),
+        )
+    };
 
     let mut decoder = symphonia::default::get_codecs()
         .make(&track.codec_params, &DecoderOptions::default())
@@ -70,8 +87,6 @@ pub fn decode_to_canonical(
             ))
         })?;
 
-    let start_frame = start_ms.map_or(0, |ms| ms_to_frames(ms, source_rate));
-    let end_frame = end_ms.map(|ms| ms_to_frames(ms, source_rate));
     let raw = decode_window(
         path,
         &mut *format,
@@ -160,23 +175,27 @@ fn open_format(
     Ok((format, track))
 }
 
+/// Seeks near `start_ms`. Returns `true` when seek ran and succeeded so the
+/// caller can switch to relative frame windowing.
 fn maybe_seek_to_start(
     format: &mut dyn FormatReader,
     track_id: u32,
     start_ms: Option<u64>,
-) {
+) -> bool {
     let Some(start) = start_ms.filter(|ms| *ms > 0) else {
-        return;
+        return false;
     };
     #[allow(clippy::cast_precision_loss)]
     let secs = start as f64 / 1000.0;
-    let _ = format.seek(
-        SeekMode::Accurate,
-        SeekTo::Time {
-            time: Time::from(secs),
-            track_id: Some(track_id),
-        },
-    );
+    format
+        .seek(
+            SeekMode::Accurate,
+            SeekTo::Time {
+                time: Time::from(secs),
+                track_id: Some(track_id),
+            },
+        )
+        .is_ok()
 }
 
 fn decode_window(
@@ -234,7 +253,10 @@ fn decode_window(
             },
         };
 
-        if sample_buf.is_none() {
+        if sample_buf
+            .as_ref()
+            .is_none_or(|buf| audio_buf.capacity() > buf.capacity())
+        {
             let spec = *audio_buf.spec();
             let capacity = u64::try_from(audio_buf.capacity()).unwrap_or(0);
             sample_buf = Some(SampleBuffer::<f32>::new(capacity, spec));
@@ -278,11 +300,11 @@ fn track_duration_ms(track: &Track) -> Option<u64> {
     Some((secs * 1000.0).round() as u64)
 }
 
-fn validate_window(
+fn normalize_window(
     start_ms: Option<u64>,
     end_ms: Option<u64>,
     source_duration_ms: Option<u64>,
-) -> Result<(), MainError> {
+) -> Result<(Option<u64>, Option<u64>), MainError> {
     if let (Some(start), Some(end)) = (start_ms, end_ms)
         && start >= end
     {
@@ -297,14 +319,16 @@ fn validate_window(
             "--start-at ({start}ms) is past the end of the file ({total}ms)"
         )));
     }
-    if let (Some(end), Some(total)) = (end_ms, source_duration_ms)
-        && end > total
-    {
-        eprintln!(
-            "warning: --end-at ({end}ms) exceeds file duration ({total}ms); clamping"
-        );
-    }
-    Ok(())
+    let end_ms = match (end_ms, source_duration_ms) {
+        (Some(end), Some(total)) if end > total => {
+            eprintln!(
+                "warning: --end-at ({end}ms) exceeds file duration ({total}ms); clamping"
+            );
+            Some(total)
+        },
+        (end, _) => end,
+    };
+    Ok((start_ms, end_ms))
 }
 
 fn ms_to_frames(
@@ -486,6 +510,42 @@ mod tests {
         assert!((290..=310).contains(&info.window_duration_ms));
         let frames = pcm.len() / 2;
         assert!((14_000..=15_000).contains(&frames), "frames={frames}");
+    }
+
+    #[test]
+    fn start_end_window_keeps_marker_samples() {
+        // 1s @ 48 kHz mono: silence, then a loud marker only in [200ms, 500ms).
+        let mut samples = vec![0i16; 48_000];
+        for sample in &mut samples[9_600..24_000] {
+            *sample = 16_000;
+        }
+        let path = temp_wav("marker");
+        write_wav_i16(&path, 48_000, 1, &samples);
+        let (pcm, _) = decode_to_canonical(&path, Some(200), Some(500)).expect("decode");
+        let _ = std::fs::remove_file(&path);
+
+        let peak = pcm
+            .iter()
+            .copied()
+            .fold(0.0f32, |acc, sample| acc.max(sample.abs()));
+        assert!(
+            peak > 0.4,
+            "expected marker energy inside the window, peak={peak}"
+        );
+
+        // Decode only the silent head [0ms, 100ms) — marker begins at 200ms.
+        let path = temp_wav("silent-head");
+        write_wav_i16(&path, 48_000, 1, &samples);
+        let (head, _) = decode_to_canonical(&path, Some(0), Some(100)).expect("decode head");
+        let _ = std::fs::remove_file(&path);
+        let head_peak = head
+            .iter()
+            .copied()
+            .fold(0.0f32, |acc, sample| acc.max(sample.abs()));
+        assert!(
+            head_peak < 0.05,
+            "expected silence before marker, peak={head_peak}"
+        );
     }
 
     #[test]
