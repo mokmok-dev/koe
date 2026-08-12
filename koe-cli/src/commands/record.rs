@@ -6,32 +6,36 @@ use std::time::{Duration, Instant};
 use clap::Parser;
 use koe_core::{
     AudioSourceConfig, OutputFormat, PipelineConfig, PipelineError, RecordingError,
-    RecordingPipeline, RecordingSummary, TranscriptFormat, enumerate_apps,
-    native_provider_registered,
+    RecordingPipeline, StopResult, TranscriptFormat, enumerate_apps, native_provider_registered,
 };
 
 use super::Run;
 use super::apps_table::{format_apps_table, prepare_apps};
 use super::duration::parse_duration;
 use crate::MainError;
+use crate::config::{self, KoeConfig, builtin};
+use crate::progress::{ProgressMeta, ProgressRenderer, create_renderer};
+use crate::signals::{SignalEvent, SignalListener, StopSignal};
 
 /// Canonical capture / encode rate (pipeline is fixed to this today).
-const CANONICAL_SAMPLE_RATE_HZ: u32 = 48_000;
+const CANONICAL_SAMPLE_RATE_HZ: u32 = builtin::SAMPLE_RATE_HZ;
 /// Canonical channel count (stereo interleaved).
-const CANONICAL_CHANNELS: u8 = 2;
+const CANONICAL_CHANNELS: u8 = builtin::CHANNELS;
 /// Peak level below this is treated as silence for `--silence-timeout`.
 const SILENCE_PEAK_THRESHOLD: f32 = 0.01;
+/// Paint status ~10 Hz (pipeline meters arrive faster).
+const STATUS_INTERVAL: Duration = Duration::from_millis(100);
 
 /// Start a recording session with optional live transcription.
 ///
-/// Flag fields mirror CLI switches; they are independent toggles, not a state
-/// machine, so packing them into an enum would obscure the clap surface.
+/// Overridable fields are `Option` so config file values can fill gaps
+/// (CLI > config > built-in). `--no-*` bools force-disable when set.
 #[derive(Debug, Parser)]
 #[allow(clippy::struct_excessive_bools)]
 pub struct RecordArgs {
     /// Audio source: `system`, `mic`, or `both` (default: system).
-    #[arg(long, default_value = "system")]
-    pub source: String,
+    #[arg(long)]
+    pub source: Option<String>,
 
     /// Capture system audio from an app bundle id.
     #[arg(long)]
@@ -50,12 +54,12 @@ pub struct RecordArgs {
     pub list_sources: bool,
 
     /// Output sample rate in Hz (only `48000` is supported).
-    #[arg(long, default_value_t = CANONICAL_SAMPLE_RATE_HZ)]
-    pub sample_rate: u32,
+    #[arg(long)]
+    pub sample_rate: Option<u32>,
 
     /// Output channel count (only `2` is supported).
-    #[arg(long, default_value_t = CANONICAL_CHANNELS)]
-    pub channels: u8,
+    #[arg(long)]
+    pub channels: Option<u8>,
 
     /// Disable acoustic echo cancellation for `--source both`.
     #[arg(long)]
@@ -66,8 +70,8 @@ pub struct RecordArgs {
     pub no_comfort_noise: bool,
 
     /// Speech recognition locale (BCP-47).
-    #[arg(long, default_value = "en-US")]
-    pub locale: String,
+    #[arg(long)]
+    pub locale: Option<String>,
 
     /// Record audio only; skip transcription.
     #[arg(long)]
@@ -86,12 +90,12 @@ pub struct RecordArgs {
     pub output: Option<PathBuf>,
 
     /// Audio container: `ogg`, `wav`, or `flac`.
-    #[arg(long, default_value = "ogg")]
-    pub format: String,
+    #[arg(long)]
+    pub format: Option<String>,
 
     /// Transcript format: `txt`, `srt`, `vtt`, or `json`.
-    #[arg(long, default_value = "txt")]
-    pub transcript_format: String,
+    #[arg(long)]
+    pub transcript_format: Option<String>,
 
     /// Transcript output path (default: `<output>.<transcript-format>`).
     #[arg(long)]
@@ -119,11 +123,17 @@ enum StopReason {
     DurationLimit,
     MaxSize,
     SilenceTimeout,
-    Interrupted,
+    /// SIGINT / SIGTERM. `force` is set when the double-tap window already fired.
+    Interrupted {
+        force: bool,
+    },
 }
 
 impl Run for RecordArgs {
-    fn run(self) -> Result<(), MainError> {
+    fn run(
+        self,
+        config: &KoeConfig,
+    ) -> Result<(), MainError> {
         if self.list_sources {
             return list_sources();
         }
@@ -132,16 +142,19 @@ impl Run for RecordArgs {
             return Ok(());
         }
 
-        let prepared = prepare_session(&self)?;
-        // Keep async work on the CLI main thread so ScreenCaptureKit start/stop
-        // can pump the AppKit main runloop (multi-thread runtimes call stop on
-        // worker threads, leaving SCStream active after the session ends).
-        let runtime = tokio::runtime::Builder::new_current_thread()
+        let prepared = prepare_session(&self, config)?;
+        let runtime = tokio::runtime::Builder::new_multi_thread()
             .enable_all()
             .build()
             .map_err(|err| MainError::Internal(format!("tokio runtime: {err}")))?;
 
-        runtime.block_on(run_recording(prepared))
+        let mut pending = runtime.block_on(run_until_shutdown_trigger(prepared))?;
+
+        // `block_on` returns on the CLI main thread — stop ScreenCaptureKit here
+        // so `stopCapture` completion handlers run on the AppKit main runloop.
+        pending.pipeline.stop_native_captures();
+
+        runtime.block_on(finalize_recording(pending))
     }
 }
 
@@ -153,30 +166,25 @@ struct PreparedSession {
     silence_timeout: Option<Duration>,
 }
 
-fn prepare_session(args: &RecordArgs) -> Result<PreparedSession, MainError> {
+fn prepare_session(
+    args: &RecordArgs,
+    file: &KoeConfig,
+) -> Result<PreparedSession, MainError> {
     if args.display.is_some() {
         return Err(MainError::InvalidArgs(
             "--display is not supported yet (no display capture source in the pipeline)".into(),
         ));
     }
-    if args.sample_rate != CANONICAL_SAMPLE_RATE_HZ {
-        return Err(MainError::InvalidArgs(format!(
-            "--sample-rate must be {CANONICAL_SAMPLE_RATE_HZ} (canonical pipeline rate)"
-        )));
-    }
-    if args.channels != CANONICAL_CHANNELS {
-        return Err(MainError::InvalidArgs(format!(
-            "--channels must be {CANONICAL_CHANNELS} (canonical stereo pipeline)"
-        )));
-    }
 
+    let merged = merge_record_options(args, file)?;
     let output = args.output.clone().ok_or_else(|| {
         MainError::InvalidArgs("--output is required unless listing sources/locales".into())
     })?;
+    let output = config::resolve_under_output_dir(&output, file);
+    let source = resolve_source(args, &merged.source)?;
+    let audio_format = parse_audio_format(&merged.format)?;
+    let transcript_format = parse_transcript_format(&merged.transcript_format)?;
 
-    let source = resolve_source(args)?;
-    let audio_format = parse_audio_format(&args.format)?;
-    let transcript_format = parse_transcript_format(&args.transcript_format)?;
     let max_duration = args
         .duration
         .as_deref()
@@ -199,38 +207,35 @@ fn prepare_session(args: &RecordArgs) -> Result<PreparedSession, MainError> {
     let transcribe = !args.no_transcribe;
     if !transcribe
         && (args.transcript_output.is_some()
-            || args.transcript_format != "txt"
-            || args.locale != "en-US")
+            || args.transcript_format.is_some()
+            || args.locale.is_some())
     {
         eprintln!(
             "warning: --no-transcribe ignores --locale / --transcript-format / --transcript-output"
         );
     }
     let transcript_output_path = if transcribe {
-        Some(
-            args.transcript_output
-                .clone()
-                .unwrap_or_else(|| default_transcript_path(&output, transcript_format)),
-        )
+        Some(args.transcript_output.as_ref().map_or_else(
+            || default_transcript_path(&output, transcript_format),
+            |path| config::resolve_under_output_dir(path, file),
+        ))
     } else {
         None
     };
-
-    let estimated_duration_hours = max_duration.map(|d| d.as_secs_f64() / 3600.0);
 
     Ok(PreparedSession {
         config: PipelineConfig {
             source,
             output_path: output,
             transcript_output_path,
-            locale: args.locale.clone(),
+            locale: merged.locale,
             audio_format,
             transcript_format,
-            enable_aec: !args.no_aec,
-            comfort_noise: !args.no_comfort_noise,
+            enable_aec: merged.enable_aec,
+            comfort_noise: merged.comfort_noise,
             monitor: args.monitor,
             transcribe,
-            estimated_duration_hours,
+            estimated_duration_hours: max_duration.map(|d| d.as_secs_f64() / 3600.0),
         },
         max_duration,
         max_bytes,
@@ -238,14 +243,81 @@ fn prepare_session(args: &RecordArgs) -> Result<PreparedSession, MainError> {
     })
 }
 
-fn resolve_source(args: &RecordArgs) -> Result<AudioSourceConfig, MainError> {
+struct MergedRecordOptions {
+    source: String,
+    format: String,
+    transcript_format: String,
+    locale: String,
+    enable_aec: bool,
+    comfort_noise: bool,
+}
+
+fn merge_record_options(
+    args: &RecordArgs,
+    file: &KoeConfig,
+) -> Result<MergedRecordOptions, MainError> {
+    let sample_rate = config::coalesce_copy(
+        args.sample_rate,
+        file.defaults.sample_rate,
+        builtin::SAMPLE_RATE_HZ,
+    );
+    let channels = config::coalesce_copy(args.channels, file.defaults.channels, builtin::CHANNELS);
+    if sample_rate != CANONICAL_SAMPLE_RATE_HZ {
+        return Err(MainError::InvalidArgs(format!(
+            "sample-rate must be {CANONICAL_SAMPLE_RATE_HZ} (canonical pipeline rate); got {sample_rate}"
+        )));
+    }
+    if channels != CANONICAL_CHANNELS {
+        return Err(MainError::InvalidArgs(format!(
+            "channels must be {CANONICAL_CHANNELS} (canonical stereo pipeline); got {channels}"
+        )));
+    }
+
+    Ok(MergedRecordOptions {
+        source: config::coalesce_owned(
+            args.source.clone(),
+            file.defaults.source.as_deref(),
+            builtin::SOURCE,
+        ),
+        format: config::coalesce_owned(
+            args.format.clone(),
+            file.defaults.format.as_deref(),
+            builtin::FORMAT,
+        ),
+        transcript_format: config::coalesce_owned(
+            args.transcript_format.clone(),
+            file.defaults.transcript_format.as_deref(),
+            builtin::TRANSCRIPT_FORMAT,
+        ),
+        locale: config::coalesce_owned(
+            args.locale.clone(),
+            file.defaults.locale.as_deref(),
+            builtin::LOCALE,
+        ),
+        enable_aec: if args.no_aec {
+            false
+        } else {
+            file.aec.enabled.unwrap_or(builtin::AEC_ENABLED)
+        },
+        comfort_noise: if args.no_comfort_noise {
+            false
+        } else {
+            file.aec.comfort_noise.unwrap_or(builtin::COMFORT_NOISE)
+        },
+    })
+}
+
+fn resolve_source(
+    args: &RecordArgs,
+    source_name: &str,
+) -> Result<AudioSourceConfig, MainError> {
     if args.app_id.is_some() && args.pid.is_some() {
         return Err(MainError::InvalidArgs(
             "--app-id and --pid are mutually exclusive".into(),
         ));
     }
 
-    let source = args.source.trim().to_ascii_lowercase();
+    let source = source_name.trim().to_ascii_lowercase();
     match source.as_str() {
         "mic" | "microphone" => {
             if args.app_id.is_some() || args.pid.is_some() {
@@ -281,7 +353,7 @@ fn resolve_source(args: &RecordArgs) -> Result<AudioSourceConfig, MainError> {
             })
         },
         other => Err(MainError::InvalidArgs(format!(
-            "unknown --source '{other}' (expected system, mic, or both)"
+            "unknown source '{other}' (expected system, mic, or both)"
         ))),
     }
 }
@@ -296,7 +368,7 @@ fn parse_audio_format(value: &str) -> Result<OutputFormat, MainError> {
             compression_level: 5,
         }),
         other => Err(MainError::InvalidArgs(format!(
-            "unknown --format '{other}' (expected ogg, wav, or flac)"
+            "unknown format '{other}' (expected ogg, wav, or flac)"
         ))),
     }
 }
@@ -308,7 +380,7 @@ fn parse_transcript_format(value: &str) -> Result<TranscriptFormat, MainError> {
         "vtt" => Ok(TranscriptFormat::Vtt),
         "json" => Ok(TranscriptFormat::Json),
         other => Err(MainError::InvalidArgs(format!(
-            "unknown --transcript-format '{other}' (expected txt, srt, vtt, or json)"
+            "unknown transcript-format '{other}' (expected txt, srt, vtt, or json)"
         ))),
     }
 }
@@ -386,167 +458,240 @@ fn list_locales() {
     }
 }
 
-async fn run_recording(prepared: PreparedSession) -> Result<(), MainError> {
-    let output_path = prepared.config.output_path.clone();
-    let transcript_path = prepared.config.transcript_output_path.clone();
+async fn run_until_shutdown_trigger(
+    prepared: PreparedSession,
+) -> Result<PendingShutdown, MainError> {
+    let meta = ProgressMeta::new(
+        &prepared.config.audio_format,
+        &prepared.config.source,
+        prepared.config.output_path.clone(),
+        prepared.config.transcript_output_path.clone(),
+    );
+    let mut renderer = create_renderer(meta);
 
     let mut pipeline = RecordingPipeline::start(prepared.config)
         .await
         .map_err(map_pipeline_error)?;
 
-    eprintln!("Recording → {}", output_path.display());
+    // Subscribe before installing signals so early meter/ASR events are not lost.
+    let progress = pipeline.subscribe_progress();
+    let segments = pipeline.subscribe_segments();
+
+    let mut signals = SignalListener::install().map_err(MainError::Internal)?;
 
     let stop_reason = wait_until_done(
-        &pipeline,
-        prepared.max_duration,
-        prepared.max_bytes,
-        prepared.silence_timeout,
+        &mut pipeline,
+        &mut signals,
+        ProgressFeeds { progress, segments },
+        renderer.as_mut(),
+        WaitLimits {
+            max_duration: prepared.max_duration,
+            max_bytes: prepared.max_bytes,
+            silence_timeout: prepared.silence_timeout,
+        },
     )
     .await?;
 
-    let summary = pipeline.stop().await.map_err(map_pipeline_error)?;
+    Ok(PendingShutdown {
+        pipeline,
+        stop_reason,
+        renderer,
+        signals,
+    })
+}
 
-    print_summary(&summary, &output_path, transcript_path.as_deref());
+struct PendingShutdown {
+    pipeline: RecordingPipeline,
+    stop_reason: StopReason,
+    renderer: Box<dyn ProgressRenderer>,
+    signals: SignalListener,
+}
 
-    if matches!(stop_reason, StopReason::Interrupted) {
+async fn finalize_recording(mut pending: PendingShutdown) -> Result<(), MainError> {
+    // Always clear the live TTY block before finalize (interrupt path also
+    // clears earlier for the human-readable notice).
+    pending.renderer.prepare_message();
+
+    let summary = match pending.stop_reason {
+        StopReason::Interrupted { force } => {
+            stop_after_interrupt(&mut pending.pipeline, &mut pending.signals, force).await?
+        },
+        _ => pending.pipeline.stop().await.map_err(map_pipeline_error)?,
+    };
+
+    pending.renderer.finish(&summary);
+
+    if matches!(pending.stop_reason, StopReason::Interrupted { .. }) {
         return Err(MainError::Interrupted);
     }
     Ok(())
 }
 
-async fn wait_until_done(
-    pipeline: &RecordingPipeline,
+/// Stop after SIGINT/SIGTERM: prefer `force_stop` when the wait loop already
+/// saw a double-tap or a second interrupt is queued; otherwise graceful `stop`
+/// with a hard-exit watchdog for in-flight double-tap.
+async fn stop_after_interrupt(
+    pipeline: &mut RecordingPipeline,
+    signals: &mut SignalListener,
+    force: bool,
+) -> Result<StopResult, MainError> {
+    let force = force || second_interrupt_pending(signals).await;
+    if force {
+        eprintln!("Force stop — skipping transcript finalize…");
+        return pipeline.force_stop().await.map_err(map_pipeline_error);
+    }
+
+    crate::signals::spawn_force_exit_watchdog(signals.interrupt_flag());
+    pipeline.stop().await.map_err(map_pipeline_error)
+}
+
+/// Non-blocking poll: `true` when a second interrupt is already queued.
+async fn second_interrupt_pending(signals: &mut SignalListener) -> bool {
+    tokio::select! {
+        biased;
+        () = signals.recv_force_during_stop() => true,
+        () = std::future::ready(()) => false,
+    }
+}
+
+struct ProgressFeeds {
+    progress: tokio::sync::broadcast::Receiver<koe_core::RecordingStatus>,
+    segments: tokio::sync::broadcast::Receiver<koe_core::TranscriptionSegment>,
+}
+
+struct WaitLimits {
     max_duration: Option<Duration>,
     max_bytes: Option<u64>,
     silence_timeout: Option<Duration>,
+}
+
+async fn wait_until_done(
+    pipeline: &mut RecordingPipeline,
+    signals: &mut SignalListener,
+    feeds: ProgressFeeds,
+    renderer: &mut dyn ProgressRenderer,
+    limits: WaitLimits,
 ) -> Result<StopReason, MainError> {
-    let mut progress = pipeline.subscribe_progress();
+    let ProgressFeeds {
+        mut progress,
+        mut segments,
+    } = feeds;
+    let WaitLimits {
+        max_duration,
+        max_bytes,
+        silence_timeout,
+    } = limits;
+
     let deadline = max_duration.map(|d| Instant::now() + d);
     let mut last_sound = Instant::now();
-    // Poll silence even when no meter updates arrive.
     let silence_tick = Duration::from_millis(200);
-    let mut sigterm = install_terminate_signal()?;
+    let mut last_status_paint = Instant::now()
+        .checked_sub(STATUS_INTERVAL)
+        .unwrap_or_else(Instant::now);
+    let mut last_painted_state: Option<koe_core::RecordingState> = None;
 
     loop {
-        let until_deadline = deadline.map(|at| at.saturating_duration_since(Instant::now()));
-        let until_silence = silence_timeout.map(|timeout| {
-            timeout
-                .saturating_sub(last_sound.elapsed())
-                .max(silence_tick)
-        });
-        let sleep_for = match (until_deadline, until_silence) {
-            (Some(d), Some(s)) => d.min(s),
-            (Some(d), None) => d,
-            (None, Some(s)) => s,
-            (None, None) => Duration::from_mins(1),
-        };
+        let sleep_for = next_wake(deadline, silence_timeout, last_sound, silence_tick);
         let sleep_armed = deadline.is_some() || silence_timeout.is_some();
 
         tokio::select! {
-            ctrl = tokio::signal::ctrl_c() => {
-                ctrl.map_err(|err| MainError::Internal(format!("signal: {err}")))?;
-                eprintln!("Interrupted — finishing recording…");
-                return Ok(StopReason::Interrupted);
-            }
-            () = recv_terminate(&mut sigterm) => {
-                eprintln!("Interrupted — finishing recording…");
-                return Ok(StopReason::Interrupted);
+            event = signals.recv() => {
+                if let Some(reason) = handle_signal_event(event, pipeline, renderer) {
+                    return Ok(reason);
+                }
             }
             () = tokio::time::sleep(sleep_for), if sleep_armed => {
-                if let Some(at) = deadline
-                    && Instant::now() >= at
-                {
+                if deadline.is_some_and(|at| Instant::now() >= at) {
                     return Ok(StopReason::DurationLimit);
                 }
-                if let Some(timeout) = silence_timeout
-                    && last_sound.elapsed() >= timeout
-                {
+                if silence_timeout.is_some_and(|t| last_sound.elapsed() >= t) {
                     return Ok(StopReason::SilenceTimeout);
                 }
             }
             status = progress.recv() => {
                 match status {
                     Ok(status) => {
-                        if let Some(limit) = max_bytes
-                            && status.bytes_written >= limit
-                        {
+                        let state_changed = last_painted_state != Some(status.state);
+                        if state_changed || last_status_paint.elapsed() >= STATUS_INTERVAL {
+                            renderer.render_status(&status);
+                            last_status_paint = Instant::now();
+                            last_painted_state = Some(status.state);
+                        }
+                        if max_bytes.is_some_and(|limit| status.bytes_written >= limit) {
                             return Ok(StopReason::MaxSize);
                         }
                         if silence_timeout.is_some() {
                             let peak = status.level_left.max(status.level_right);
                             if peak >= SILENCE_PEAK_THRESHOLD {
                                 last_sound = Instant::now();
-                            } else if let Some(timeout) = silence_timeout
-                                && last_sound.elapsed() >= timeout
-                            {
+                            } else if silence_timeout.is_some_and(|t| last_sound.elapsed() >= t) {
                                 return Ok(StopReason::SilenceTimeout);
                             }
                         }
                     }
-                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
-                        // Best-effort progress; keep waiting.
-                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
                     Err(tokio::sync::broadcast::error::RecvError::Closed) => {
-                        // Progress publisher gone; finish gracefully.
                         return Ok(StopReason::DurationLimit);
                     }
+                }
+            }
+            segment = segments.recv() => {
+                match segment {
+                    Ok(segment) => renderer.render_segment(&segment),
+                    Err(
+                        tokio::sync::broadcast::error::RecvError::Lagged(_)
+                        | tokio::sync::broadcast::error::RecvError::Closed,
+                    ) => {}
                 }
             }
         }
     }
 }
 
-#[cfg(unix)]
-struct TerminateSignal(tokio::signal::unix::Signal);
-
-#[cfg(not(unix))]
-struct TerminateSignal;
-
-fn install_terminate_signal() -> Result<TerminateSignal, MainError> {
-    #[cfg(unix)]
-    {
-        let signal = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-            .map_err(|err| MainError::Internal(format!("SIGTERM handler: {err}")))?;
-        Ok(TerminateSignal(signal))
-    }
-    #[cfg(not(unix))]
-    {
-        Ok(TerminateSignal)
-    }
-}
-
-async fn recv_terminate(signal: &mut TerminateSignal) {
-    #[cfg(unix)]
-    {
-        let _ = signal.0.recv().await;
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = signal;
-        std::future::pending::<()>().await;
+fn next_wake(
+    deadline: Option<Instant>,
+    silence_timeout: Option<Duration>,
+    last_sound: Instant,
+    silence_tick: Duration,
+) -> Duration {
+    let until_deadline = deadline.map(|at| at.saturating_duration_since(Instant::now()));
+    let until_silence = silence_timeout.map(|timeout| {
+        timeout
+            .saturating_sub(last_sound.elapsed())
+            .max(silence_tick)
+    });
+    match (until_deadline, until_silence) {
+        (Some(d), Some(s)) => d.min(s),
+        (Some(d), None) => d,
+        (None, Some(s)) => s,
+        (None, None) => Duration::from_mins(1),
     }
 }
 
-fn print_summary(
-    summary: &RecordingSummary,
-    output: &Path,
-    transcript: Option<&Path>,
-) {
-    eprintln!(
-        "Done: {:.1}s, {} bytes, {} segments → {}",
-        summary.duration_sec,
-        summary.bytes_written,
-        summary.transcript_segment_count,
-        output.display()
-    );
-    if let Some(path) = transcript {
-        eprintln!("Transcript → {}", path.display());
-    }
-    if summary.dropped_audio_frames > 0 {
-        eprintln!(
-            "warning: dropped {} audio frames during capture",
-            summary.dropped_audio_frames
-        );
+fn handle_signal_event(
+    event: SignalEvent,
+    pipeline: &mut RecordingPipeline,
+    renderer: &mut dyn ProgressRenderer,
+) -> Option<StopReason> {
+    match event {
+        SignalEvent::Stop(kind) => {
+            let force = kind == StopSignal::Force;
+            renderer.prepare_message();
+            if force {
+                eprintln!("Force interrupt — stopping immediately…");
+            } else {
+                eprintln!("Interrupted — finishing recording…");
+            }
+            Some(StopReason::Interrupted { force })
+        },
+        SignalEvent::TogglePause => {
+            if pipeline.is_paused() {
+                pipeline.resume();
+            } else {
+                pipeline.pause();
+            }
+            None
+        },
     }
 }
 
@@ -604,7 +749,7 @@ mod tests {
         ])
         .expect("parse");
         assert!(args.no_transcribe);
-        assert_eq!(args.source, "mic");
+        assert_eq!(args.source.as_deref(), Some("mic"));
     }
 
     #[test]
@@ -619,7 +764,7 @@ mod tests {
             "out.wav",
         ])
         .expect("parse");
-        let err = prepare_session(&args).expect_err("rate");
+        let err = prepare_session(&args, &KoeConfig::default()).expect_err("rate");
         assert!(matches!(err, MainError::InvalidArgs(_)));
     }
 
@@ -627,7 +772,7 @@ mod tests {
     fn resolve_system_requires_target() {
         let args = RecordArgs::try_parse_from(["record", "--source", "system", "-o", "out.ogg"])
             .expect("parse");
-        let err = resolve_source(&args).expect_err("need target");
+        let err = resolve_source(&args, "system").expect_err("need target");
         assert!(matches!(err, MainError::InvalidArgs(_)));
     }
 
@@ -643,7 +788,7 @@ mod tests {
             "out.ogg",
         ])
         .expect("parse");
-        match resolve_source(&args).expect("source") {
+        match resolve_source(&args, "both").expect("source") {
             AudioSourceConfig::Both { bundle_id } => assert_eq!(bundle_id, "us.zoom.xos"),
             other => panic!("unexpected {other:?}"),
         }
@@ -678,9 +823,100 @@ mod tests {
             "30s",
         ])
         .expect("parse");
-        let prepared = prepare_session(&args).expect("prepare");
+        let prepared = prepare_session(&args, &KoeConfig::default()).expect("prepare");
         assert!(!prepared.config.transcribe);
         assert!(prepared.config.transcript_output_path.is_none());
         assert_eq!(prepared.max_duration, Some(Duration::from_secs(30)));
+    }
+
+    #[test]
+    fn prepare_inherits_config_defaults() {
+        let args = RecordArgs::try_parse_from(["record", "--source", "mic", "-o", "clip.flac"])
+            .expect("parse");
+        let file = config::parse_toml(
+            r#"
+[defaults]
+format = "flac"
+locale = "ja-JP"
+transcript-format = "srt"
+[aec]
+enabled = false
+comfort-noise = false
+"#,
+        )
+        .expect("config");
+        let prepared = prepare_session(&args, &file).expect("prepare");
+        assert!(matches!(
+            prepared.config.audio_format,
+            OutputFormat::Flac { .. }
+        ));
+        assert_eq!(prepared.config.locale, "ja-JP");
+        assert_eq!(prepared.config.transcript_format, TranscriptFormat::Srt);
+        assert!(!prepared.config.enable_aec);
+        assert!(!prepared.config.comfort_noise);
+    }
+
+    #[test]
+    fn prepare_cli_overrides_config() {
+        let args = RecordArgs::try_parse_from([
+            "record", "--source", "mic", "--format", "wav", "--locale", "en-US", "--no-aec", "-o",
+            "out.wav",
+        ])
+        .expect("parse");
+        let file = config::parse_toml(
+            r#"
+[defaults]
+format = "flac"
+locale = "ja-JP"
+[aec]
+enabled = true
+"#,
+        )
+        .expect("config");
+        let prepared = prepare_session(&args, &file).expect("prepare");
+        assert!(matches!(
+            prepared.config.audio_format,
+            OutputFormat::Wav { .. }
+        ));
+        assert_eq!(prepared.config.locale, "en-US");
+        assert!(!prepared.config.enable_aec);
+    }
+
+    #[test]
+    fn prepare_resolves_relative_output_via_config_dir() {
+        let args = RecordArgs::try_parse_from(["record", "--source", "mic", "-o", "meet.ogg"])
+            .expect("parse");
+        let mut file = KoeConfig::default();
+        file.output.directory = Some("/tmp/koe-recs".into());
+        let prepared = prepare_session(&args, &file).expect("prepare");
+        assert_eq!(
+            prepared.config.output_path,
+            PathBuf::from("/tmp/koe-recs/meet.ogg")
+        );
+        assert_eq!(
+            prepared.config.transcript_output_path.as_deref(),
+            Some(Path::new("/tmp/koe-recs/meet.txt"))
+        );
+    }
+
+    #[test]
+    fn prepare_resolves_relative_transcript_output() {
+        let args = RecordArgs::try_parse_from([
+            "record",
+            "--source",
+            "mic",
+            "-o",
+            "meet.ogg",
+            "--transcript-output",
+            "notes.srt",
+        ])
+        .expect("parse");
+        let mut file = KoeConfig::default();
+        file.output.directory = Some("/tmp/koe-recs".into());
+        let prepared = prepare_session(&args, &file).expect("prepare");
+        assert_eq!(
+            prepared.config.transcript_output_path.as_deref(),
+            Some(Path::new("/tmp/koe-recs/notes.srt"))
+        );
     }
 }

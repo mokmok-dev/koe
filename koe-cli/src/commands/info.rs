@@ -14,14 +14,17 @@ use serde_json::json;
 
 use super::Run;
 use crate::MainError;
+use crate::config::{self, KoeConfig};
 
-/// Interim path used for the free-space probe until a real default output
-/// directory is configured (task 28+). Prefer `~/Movies` when `$HOME` is set.
-fn interim_disk_check_path() -> PathBuf {
-    interim_disk_check_path_from(std::env::var_os("HOME").as_deref())
+/// Prefer `[output].directory` from config; otherwise `~/Movies` or `.`.
+fn disk_check_path(config: &KoeConfig) -> PathBuf {
+    if let Some(dir) = config::output_directory(config) {
+        return dir;
+    }
+    disk_check_path_from_home(std::env::var_os("HOME").as_deref())
 }
 
-fn interim_disk_check_path_from(home: Option<&std::ffi::OsStr>) -> PathBuf {
+fn disk_check_path_from_home(home: Option<&std::ffi::OsStr>) -> PathBuf {
     home.map_or_else(|| PathBuf::from("."), |h| PathBuf::from(h).join("Movies"))
 }
 
@@ -48,8 +51,11 @@ struct SystemInfo {
 }
 
 impl Run for InfoArgs {
-    fn run(self) -> Result<(), MainError> {
-        let info = collect_system_info();
+    fn run(
+        self,
+        config: &KoeConfig,
+    ) -> Result<(), MainError> {
+        let info = collect_system_info(config);
         if self.json {
             println!("{}", format_info_json(&info)?);
         } else {
@@ -59,8 +65,8 @@ impl Run for InfoArgs {
     }
 }
 
-fn collect_system_info() -> SystemInfo {
-    let disk_path = interim_disk_check_path();
+fn collect_system_info(config: &KoeConfig) -> SystemInfo {
+    let disk_path = disk_check_path(config);
     let disk_check_path = disk_path.display().to_string();
     let disk_space_bytes = match available_disk_space(&disk_path) {
         Ok(bytes) => Some(bytes),
@@ -338,9 +344,19 @@ mod tests {
     }
 
     #[test]
-    fn interim_path_uses_home_movies_when_set() {
-        let path = interim_disk_check_path_from(Some(std::ffi::OsStr::new("/tmp/koe-info-home")));
+    fn disk_path_uses_home_movies_when_set() {
+        let path = disk_check_path_from_home(Some(std::ffi::OsStr::new("/tmp/koe-info-home")));
         assert_eq!(path, Path::new("/tmp/koe-info-home/Movies"));
-        assert_eq!(interim_disk_check_path_from(None), PathBuf::from("."));
+        assert_eq!(disk_check_path_from_home(None), PathBuf::from("."));
+    }
+
+    #[test]
+    fn disk_path_prefers_config_output_directory() {
+        let mut config = KoeConfig::default();
+        config.output.directory = Some("/tmp/koe-configured-out".into());
+        assert_eq!(
+            disk_check_path(&config),
+            PathBuf::from("/tmp/koe-configured-out")
+        );
     }
 }

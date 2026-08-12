@@ -24,7 +24,10 @@ pub struct ListArgs {
 }
 
 impl Run for ListArgs {
-    fn run(self) -> Result<(), MainError> {
+    fn run(
+        self,
+        _config: &crate::config::KoeConfig,
+    ) -> Result<(), MainError> {
         if !native_provider_registered() {
             return Err(MainError::NativeBridgeUnavailable("list"));
         }
@@ -53,7 +56,7 @@ mod tests {
             audio_only: false,
             json: false,
         }
-        .run()
+        .run(&crate::config::KoeConfig::default())
         .expect_err("must fail without provider");
         assert!(matches!(err, MainError::NativeBridgeUnavailable("list")));
     }

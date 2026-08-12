@@ -34,6 +34,7 @@ pub use disk_check::{available_disk_space, check_disk_space};
 pub use error::PipelineError;
 pub use file_writer::FileWriter;
 /// Progress payload types for [`RecordingPipeline::subscribe_progress`].
+/// Segment live feed: [`RecordingPipeline::subscribe_segments`].
 pub use koe_ffi::{RecordingState, RecordingStatus};
 pub use metrics::{PipelineMetrics, PipelineMetricsSnapshot};
 pub use monitor::{
@@ -118,6 +119,7 @@ pub struct RecordingPipeline {
     metrics: Arc<PipelineMetrics>,
     segments: Arc<Mutex<Vec<TranscriptionSegment>>>,
     progress_tx: broadcast::Sender<RecordingStatus>,
+    segment_tx: broadcast::Sender<TranscriptionSegment>,
     /// Pause-aware origin shared with the consumer progress clock.
     started_at: Arc<Mutex<Instant>>,
     bytes_written: Arc<AtomicU64>,
@@ -229,6 +231,8 @@ struct PipelineTranscriptionCallback {
     segments: Arc<Mutex<Vec<TranscriptionSegment>>>,
     transcript: Arc<Mutex<Box<dyn TranscriptFormatter>>>,
     metrics: Arc<PipelineMetrics>,
+    /// Live feed for CLI/GUI progress (partials + finals).
+    segment_tx: broadcast::Sender<TranscriptionSegment>,
 }
 
 impl TranscriptionCallback for PipelineTranscriptionCallback {
@@ -241,6 +245,7 @@ impl TranscriptionCallback for PipelineTranscriptionCallback {
         if let Ok(mut transcript) = self.transcript.lock() {
             transcript.write_segment(&segment);
         }
+        let _ = self.segment_tx.send(segment.clone());
         if segment.is_final {
             if let Ok(mut segments) = self.segments.lock() {
                 segments.push(segment);
@@ -298,8 +303,14 @@ impl RecordingPipeline {
         let transcript_fmt = create_formatter(config.transcript_format, &transcript_meta);
         let transcript = Arc::new(Mutex::new(transcript_fmt));
 
-        let (transcription_handle, speech) =
-            open_transcription(&config, &segments, &transcript, &metrics)?;
+        let (segment_tx, _) = broadcast::channel(256);
+        let (transcription_handle, speech) = open_transcription(
+            &config,
+            &segments,
+            &transcript,
+            &metrics,
+            segment_tx.clone(),
+        )?;
 
         let (audio_tx, _audio_rx) = broadcast::channel(64);
         let (capture_handles, mixer_task) = start_captures(
@@ -357,6 +368,7 @@ impl RecordingPipeline {
             metrics,
             segments,
             progress_tx,
+            segment_tx,
             started_at,
             bytes_written,
             monitor,
@@ -452,6 +464,22 @@ impl RecordingPipeline {
         self.progress_tx.subscribe()
     }
 
+    /// Subscribes to live transcription segments (partials and finals).
+    ///
+    /// Delivery is best-effort over a bounded broadcast channel. Unlike
+    /// [`Self::subscribe_progress`] (where a missed meter tick is just a stale
+    /// snapshot), a lagged subscriber **permanently skips** those segment
+    /// events — finals are not resent. Handle
+    /// [`broadcast::error::RecvError::Lagged`] accordingly.
+    ///
+    /// When transcription is disabled, no events are sent; `recv` stays pending
+    /// until the pipeline (and this sender) are dropped — use `select!` rather
+    /// than awaiting this channel alone.
+    #[must_use]
+    pub fn subscribe_segments(&self) -> broadcast::Receiver<TranscriptionSegment> {
+        self.segment_tx.subscribe()
+    }
+
     fn publish_status(
         &self,
         state: RecordingState,
@@ -504,6 +532,7 @@ fn open_transcription(
     segments: &Arc<Mutex<Vec<TranscriptionSegment>>>,
     transcript: &Arc<Mutex<Box<dyn TranscriptFormatter>>>,
     metrics: &Arc<PipelineMetrics>,
+    segment_tx: broadcast::Sender<TranscriptionSegment>,
 ) -> Result<TranscriptionSetup, PipelineError> {
     if !config.transcribe {
         return Ok((None, Arc::new(NullSpeechFeeder)));
@@ -512,6 +541,7 @@ fn open_transcription(
         segments: Arc::clone(segments),
         transcript: Arc::clone(transcript),
         metrics: Arc::clone(metrics),
+        segment_tx,
     };
     let handle = start_transcription(config.locale.clone(), Box::new(transcription_callback))?;
     let feeder = Arc::new(TranscriptionFeeder::new(Arc::clone(&handle)));

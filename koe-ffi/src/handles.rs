@@ -1,5 +1,6 @@
 //! Opaque session handles exported across the FFI boundary.
 
+#[cfg(target_os = "macos")]
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -28,6 +29,8 @@ pub struct CaptureHandle {
 }
 
 impl CaptureHandle {
+    // Constructed from `start_capture` on macOS; tests exercise it on all targets.
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     pub(crate) fn new(
         source: AudioSourceConfig,
         callback: AudioCallbackRef,
@@ -53,18 +56,20 @@ impl CaptureHandle {
         *guard = Some(session);
     }
 
+    #[cfg(target_os = "macos")]
     pub(crate) fn stop_session(&self) {
-        #[cfg(target_os = "macos")]
-        {
-            let mut guard = self
-                .session
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            if let Some(mut session) = guard.take() {
-                session.stop();
-            }
+        let mut guard = self
+            .session
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(mut session) = guard.take() {
+            session.stop();
         }
     }
+
+    #[cfg(not(target_os = "macos"))]
+    #[expect(clippy::unused_self)]
+    pub(crate) const fn stop_session(&self) {}
 }
 
 impl Drop for CaptureHandle {

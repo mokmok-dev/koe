@@ -402,8 +402,8 @@ impl CaptureSession for ScreenAudioSession {
             teardown_stream(&self.stream, &self.output);
         } else {
             // Best-effort when a multi-thread runtime calls stop from a worker.
-            // Prefer `current_thread` Tokio (see `koe record`) or invoke stop
-            // from the GUI main thread for reliable SCK release.
+            // CLI hosts should call `RecordingPipeline::stop_native_captures` on
+            // the main thread before async `stop` (see `koe record`).
             let proto: &ProtocolObject<dyn SCStreamOutput> =
                 ProtocolObject::from_ref(&*self.output);
             unsafe {

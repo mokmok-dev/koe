@@ -1,11 +1,17 @@
 //! koe-cli — command-line interface for Koe.
 
 mod commands;
+mod config;
+mod progress;
+mod signals;
+
+use std::path::PathBuf;
 
 use clap::{Parser, Subcommand};
 use thiserror::Error;
 
 use commands::{InfoArgs, ListArgs, PermissionsArgs, RecordArgs, Run, TranscribeArgs};
+use config::KoeConfig;
 
 #[derive(Debug, Parser)]
 #[command(
@@ -15,6 +21,10 @@ use commands::{InfoArgs, ListArgs, PermissionsArgs, RecordArgs, Run, TranscribeA
     arg_required_else_help = true,
 )]
 struct Cli {
+    /// Path to config file (default: ~/.config/koe/config.toml).
+    #[arg(long, global = true)]
+    config: Option<PathBuf>,
+
     #[command(subcommand)]
     command: Command,
 }
@@ -100,13 +110,18 @@ fn run() -> Result<(), MainError> {
     let _ = koe_core::install_default_native_provider();
 
     let cli = Cli::parse();
+    let config = load_config(cli.config.as_deref())?;
     match cli.command {
-        Command::Record(args) => (*args).run(),
-        Command::List(args) => args.run(),
-        Command::Transcribe(args) => args.run(),
-        Command::Permissions(args) => args.run(),
-        Command::Info(args) => args.run(),
+        Command::Record(args) => (*args).run(&config),
+        Command::List(args) => args.run(&config),
+        Command::Transcribe(args) => args.run(&config),
+        Command::Permissions(args) => args.run(&config),
+        Command::Info(args) => args.run(&config),
     }
+}
+
+fn load_config(explicit: Option<&std::path::Path>) -> Result<KoeConfig, MainError> {
+    config::load(explicit).map_err(MainError::InvalidArgs)
 }
 
 #[cfg(test)]
@@ -117,6 +132,20 @@ mod tests {
     #[test]
     fn parses_record_list_sources() {
         let cli = Cli::try_parse_from(["koe", "record", "--list-sources"]).expect("parse");
+        assert!(matches!(cli.command, Command::Record(_)));
+    }
+
+    #[test]
+    fn parses_global_config_flag() {
+        let cli = Cli::try_parse_from([
+            "koe",
+            "--config",
+            "/tmp/other.toml",
+            "record",
+            "--list-sources",
+        ])
+        .expect("parse");
+        assert_eq!(cli.config, Some(PathBuf::from("/tmp/other.toml")));
         assert!(matches!(cli.command, Command::Record(_)));
     }
 
