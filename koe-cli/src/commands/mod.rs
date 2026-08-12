@@ -1,15 +1,16 @@
-//! CLI subcommands backed by APIs delivered in tasks 01–17.
+//! CLI subcommands.
 //!
-//! `record` / `transcribe` / `completions` are intentionally absent until their
-//! remaining dependencies (tasks 20–22, 24, 26, 28–30) land.
+//! `transcribe` / `completions` wait on later tasks (26, 28+).
 
 mod info;
 mod list;
 mod permissions;
+mod record;
 
 pub use info::InfoArgs;
 pub use list::ListArgs;
 pub use permissions::PermissionsArgs;
+pub use record::RecordArgs;
 
 use crate::MainError;
 

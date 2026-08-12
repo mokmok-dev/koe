@@ -348,6 +348,7 @@ mod tests {
             enable_aec: false,
             comfort_noise: false,
             monitor: false,
+            transcribe: true,
             estimated_duration_hours: None,
         }
     }

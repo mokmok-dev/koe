@@ -5,7 +5,7 @@ mod commands;
 use clap::{Parser, Subcommand};
 use thiserror::Error;
 
-use commands::{InfoArgs, ListArgs, PermissionsArgs, Run};
+use commands::{InfoArgs, ListArgs, PermissionsArgs, RecordArgs, Run};
 
 #[derive(Debug, Parser)]
 #[command(
@@ -19,9 +19,10 @@ struct Cli {
     command: Command,
 }
 
-// record / transcribe / completions wait on unfinished task deps (20–22, 24, 26, 28–30).
 #[derive(Debug, Subcommand)]
 enum Command {
+    /// Start a recording with optional transcription.
+    Record(Box<RecordArgs>),
     /// List capture-able apps and audio activity.
     List(ListArgs),
     /// Check and diagnose macOS permissions.
@@ -45,13 +46,52 @@ pub(crate) enum MainError {
 
     #[error("one or more permissions are not authorized")]
     PermissionsNotAuthorized,
+
+    #[error("permission denied: {0} (tip: run `koe permissions`)")]
+    PermissionDenied(String),
+
+    #[error("invalid arguments: {0}")]
+    InvalidArgs(String),
+
+    #[error("capture error: {0}")]
+    Capture(String),
+
+    #[error("I/O error: {0}")]
+    Io(String),
+
+    #[error("interrupted")]
+    Interrupted,
+
+    #[error("internal error: {0}")]
+    Internal(String),
+}
+
+impl MainError {
+    /// Process exit code per the CLI interface spec.
+    const fn exit_code(&self) -> i32 {
+        match self {
+            Self::PermissionDenied(_) | Self::PermissionsNotAuthorized => 1,
+            Self::InvalidArgs(_) | Self::Json(_) => 2,
+            Self::Capture(_) => 3,
+            Self::Io(_) => 4,
+            Self::Interrupted => 5,
+            Self::NativeBridgeUnavailable(_) | Self::Internal(_) => 6,
+        }
+    }
 }
 
 fn main() {
-    if let Err(error) = run() {
-        eprintln!("{error}");
-        std::process::exit(1);
-    }
+    let code = match run() {
+        Ok(()) => 0,
+        Err(error) => {
+            // Interrupted is an expected exit path; keep the message short.
+            if !matches!(error, MainError::Interrupted) {
+                eprintln!("{error}");
+            }
+            error.exit_code()
+        },
+    };
+    std::process::exit(code);
 }
 
 fn run() -> Result<(), MainError> {
@@ -59,6 +99,7 @@ fn run() -> Result<(), MainError> {
 
     let cli = Cli::parse();
     match cli.command {
+        Command::Record(args) => (*args).run(),
         Command::List(args) => args.run(),
         Command::Permissions(args) => args.run(),
         Command::Info(args) => args.run(),
@@ -69,6 +110,12 @@ fn run() -> Result<(), MainError> {
 mod tests {
     use super::*;
     use clap::Parser;
+
+    #[test]
+    fn parses_record_list_sources() {
+        let cli = Cli::try_parse_from(["koe", "record", "--list-sources"]).expect("parse");
+        assert!(matches!(cli.command, Command::Record(_)));
+    }
 
     #[test]
     fn parses_list_flags() {
@@ -86,5 +133,15 @@ mod tests {
     fn parses_info() {
         let cli = Cli::try_parse_from(["koe", "info", "--json"]).expect("parse");
         assert!(matches!(cli.command, Command::Info(_)));
+    }
+
+    #[test]
+    fn exit_codes_match_spec() {
+        assert_eq!(MainError::PermissionDenied("mic".into()).exit_code(), 1);
+        assert_eq!(MainError::InvalidArgs("bad".into()).exit_code(), 2);
+        assert_eq!(MainError::Capture("tap".into()).exit_code(), 3);
+        assert_eq!(MainError::Io("disk".into()).exit_code(), 4);
+        assert_eq!(MainError::Interrupted.exit_code(), 5);
+        assert_eq!(MainError::Internal("x".into()).exit_code(), 6);
     }
 }
