@@ -2,6 +2,7 @@
 
 mod commands;
 mod config;
+mod signals;
 
 use std::path::PathBuf;
 
