@@ -4,7 +4,10 @@ use koe_ffi::TranscriptionSegment;
 
 use super::{SegmentBuffer, TranscriptFormatter};
 
-/// One line per finalized segment, no timestamps.
+/// Plain text transcript, no timestamps.
+///
+/// Segment boundaries and Japanese full stops (`。`) become line breaks for
+/// readability while keeping the file format lightweight.
 pub struct TxtFormatter {
     buffer: SegmentBuffer,
 }
@@ -24,9 +27,27 @@ impl TxtFormatter {
             if index > 0 {
                 out.push('\n');
             }
-            out.push_str(&segment.text);
+            append_with_japanese_full_stop_breaks(&mut out, &segment.text);
         }
         out
+    }
+}
+
+fn append_with_japanese_full_stop_breaks(
+    out: &mut String,
+    text: &str,
+) {
+    let mut chars = text.chars().peekable();
+    while let Some(ch) = chars.next() {
+        out.push(ch);
+        if ch == '。' {
+            while chars.peek().is_some_and(|next| next.is_whitespace()) {
+                chars.next();
+            }
+            if chars.peek().is_some() {
+                out.push('\n');
+            }
+        }
     }
 }
 
@@ -83,6 +104,16 @@ mod tests {
         assert_eq!(
             fmt.finalize(),
             "This is the first utterance.\nThis is the second utterance."
+        );
+    }
+
+    #[test]
+    fn txt_breaks_after_japanese_full_stops() {
+        let mut fmt = TxtFormatter::new();
+        fmt.write_segment(&seg("最初の文です。 次の文です。最後の文です。", true));
+        assert_eq!(
+            fmt.finalize(),
+            "最初の文です。\n次の文です。\n最後の文です。"
         );
     }
 
