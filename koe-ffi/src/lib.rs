@@ -36,7 +36,7 @@ pub use macos_discovery::install_default_native_provider;
 /// No-op on non-macOS targets.
 #[cfg(not(target_os = "macos"))]
 #[must_use]
-pub fn install_default_native_provider() -> bool {
+pub const fn install_default_native_provider() -> bool {
     false
 }
 
