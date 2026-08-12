@@ -19,12 +19,11 @@ When stderr is a TTY, render a live-updating status block:
 
 ```
 Recording | ⣾ 00:02:34 | FLAC 48kHz stereo | App: Google Chrome (PID 4201)
-[SYS][未確定] [00:02:30] "This is what I heard..."
+[SYS] [00:02:30] "This is what I heard..."
 ```
 
 - Status line: spinner + elapsed time + format + source info
 - Transcript lines carry the capture source tag: `[SYS]` (system/app audio), `[MIC]` (microphone), `[SYS+MIC]` (mixed both)
-- Partial segments are pinned `[未確定]`, finals are pinned `[確定]` (source of truth: `TranscriptionSegment.is_final`)
 - Partial segments overwrite in-place (no newline)
 - Final segments: new line each
 

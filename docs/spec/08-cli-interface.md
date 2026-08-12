@@ -93,9 +93,9 @@ stderr is not a TTY, it falls back to periodic newline-delimited JSON:
 ```
 # TTY mode:
 Recording | ⣾ 00:02:34 | FLAC 48kHz stereo | App: Google Chrome (PID 4201)
-[SYS][未確定] [00:02:30] "This is what I heard..."
-# ... newer partials overwrite the 未確定 line in place ...
-[SYS][確定] [00:02:30] "This is what I heard all together."
+[SYS] [00:02:30] "This is what I heard..."
+# ... newer partials overwrite the line in place ...
+[SYS] [00:02:30] "This is what I heard all together."
 
 # Non-TTY mode (--output-format json on stderr):
 {"type":"status","elapsed_ms":154000,"size_bytes":1843200}

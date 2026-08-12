@@ -185,12 +185,7 @@ impl ProgressRenderer for TtyRenderer {
         segment: &TranscriptionSegment,
     ) {
         let text = truncate_display(&segment.text, SEGMENT_TEXT_DISPLAY_CHARS);
-        let line = format_segment_line(
-            self.meta.source_tag,
-            segment.start_ms,
-            segment.is_final,
-            &text,
-        );
+        let line = format_segment_line(self.meta.source_tag, segment.start_ms, &text);
         if segment.is_final {
             // Commit the segment as a permanent line above the live block.
             self.clear_live();
@@ -334,17 +329,14 @@ const fn source_tag(source: &AudioSourceConfig) -> &'static str {
     }
 }
 
-/// Formats one live transcript line, pinning the analyzer's result contract:
-/// partial segments are always 未確定 and finals are always 確定.
+/// Formats one live transcript line with its capture-source prefix.
 fn format_segment_line(
     source_tag: &str,
     start_ms: i64,
-    is_final: bool,
     text: &str,
 ) -> String {
-    let determination = if is_final { "確定" } else { "未確定" };
     format!(
-        "{source_tag}[{determination}] [{}] \"{text}\"",
+        "{source_tag} [{}] \"{text}\"",
         format_hms(millis_u64(start_ms)),
     )
 }
@@ -540,11 +532,11 @@ mod tests {
     }
 
     #[test]
-    fn segment_line_pins_partial_and_final() {
-        let partial = format_segment_line("[MIC]", 154_000, false, "hello");
-        assert_eq!(partial, "[MIC][未確定] [00:02:34] \"hello\"");
-        let final_line = format_segment_line("[SYS]", 154_000, true, "hello");
-        assert_eq!(final_line, "[SYS][確定] [00:02:34] \"hello\"");
+    fn segment_line_includes_source_and_timestamp() {
+        assert_eq!(
+            format_segment_line("[MIC]", 154_000, "hello"),
+            "[MIC] [00:02:34] \"hello\""
+        );
     }
 
     #[test]
