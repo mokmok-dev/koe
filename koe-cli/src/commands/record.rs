@@ -5,12 +5,13 @@ use std::time::{Duration, Instant};
 
 use clap::Parser;
 use koe_core::{
-    AppInfo, AudioSourceConfig, OutputFormat, PipelineConfig, PipelineError, RecordingError,
+    AudioSourceConfig, OutputFormat, PipelineConfig, PipelineError, RecordingError,
     RecordingPipeline, RecordingSummary, TranscriptFormat, enumerate_apps,
     native_provider_registered,
 };
 
 use super::Run;
+use super::apps_table::{format_apps_table, prepare_apps};
 use crate::MainError;
 
 /// Canonical capture / encode rate (pipeline is fixed to this today).
@@ -431,51 +432,10 @@ fn list_sources() -> Result<(), MainError> {
     if !native_provider_registered() {
         return Err(MainError::NativeBridgeUnavailable("record --list-sources"));
     }
-    let apps = enumerate_apps();
-    print!("{}", format_sources_table(&apps));
+    let apps = prepare_apps(enumerate_apps(), false);
+    print!("{}", format_apps_table(&apps));
     eprintln!("Re-run with --app-id <bundle> or --pid <pid> to record.");
     Ok(())
-}
-
-fn format_sources_table(apps: &[AppInfo]) -> String {
-    use std::fmt::Write as _;
-
-    let mut out = String::from(
-        "  PID    NAME                  BUNDLE ID               HAS AUDIO\n  ─────  ────────────────────  ──────────────────────  ─────────\n",
-    );
-    for app in apps {
-        let name = sanitize_for_table(&app.name);
-        let bundle = app
-            .bundle_id
-            .as_deref()
-            .map_or_else(|| "-".to_owned(), sanitize_for_table);
-        let has_audio = if app.has_audio { "yes" } else { "no" };
-        let _ = writeln!(
-            out,
-            "  {:<5}  {:<20}  {:<22}  {}",
-            app.pid,
-            truncate(&name, 20),
-            truncate(&bundle, 22),
-            has_audio
-        );
-    }
-    out
-}
-
-fn sanitize_for_table(value: &str) -> String {
-    value.chars().filter(|c| !c.is_control()).collect()
-}
-
-fn truncate(
-    value: &str,
-    max: usize,
-) -> String {
-    if value.chars().count() <= max {
-        return value.to_owned();
-    }
-    let mut truncated: String = value.chars().take(max.saturating_sub(1)).collect();
-    truncated.push('…');
-    truncated
 }
 
 fn list_locales() {

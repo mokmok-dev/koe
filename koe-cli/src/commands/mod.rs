@@ -2,6 +2,7 @@
 //!
 //! `transcribe` / `completions` wait on later tasks (26, 28+).
 
+mod apps_table;
 mod info;
 mod list;
 mod permissions;
