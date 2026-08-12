@@ -1,17 +1,14 @@
 //! koe-core — shared pipeline, AEC, codecs, and state.
 
-pub mod aec;
-pub mod codec;
-pub mod pipeline;
-pub mod transcript;
+pub(crate) mod aec;
+pub(crate) mod codec;
+pub(crate) mod pipeline;
+pub(crate) mod transcript;
 
 pub use aec::{AcousticEchoCanceller, AecConfig};
 pub use pipeline::{
-    AudioChunk, AudioMonitor, FORCE_JOIN_BUDGET, FileWriter, MONITOR_BUFFER_FRAMES,
-    MONITOR_CHANNEL_COUNT, MONITOR_SAMPLE_RATE_HZ, MonitorError, PipelineConfig, PipelineError,
-    PipelineMetrics, PipelineMetricsSnapshot, PipelineState, RecordingPipeline, RecordingState,
-    RecordingStatus, SHUTDOWN_BUDGET, ShutdownMode, StopResult, available_disk_space,
-    create_monitor, create_monitor_or_null,
+    PipelineConfig, PipelineError, PipelineMetricsSnapshot, RecordingPipeline, RecordingState,
+    RecordingStatus, StopResult, available_disk_space,
 };
 
 /// Error returned by [`available_disk_space`] and recording setup.

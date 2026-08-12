@@ -53,22 +53,10 @@ impl SpeechFeeder for TranscriptionFeeder {
     }
 }
 
-/// No-op feeder used when [`super::PipelineConfig::transcribe`] is false.
-#[derive(Debug, Default)]
-pub struct NullSpeechFeeder;
-
-impl SpeechFeeder for NullSpeechFeeder {
-    fn feed_audio(
-        &self,
-        _pcm: Vec<f32>,
-    ) {
-    }
-}
-
 /// Shared state passed into the consumer task.
 pub struct ConsumerContext {
     pub encoder: Arc<Mutex<Box<dyn AudioEncoder>>>,
-    pub speech: Arc<dyn SpeechFeeder>,
+    pub speech: Option<Arc<dyn SpeechFeeder>>,
     pub writer: Arc<AsyncMutex<FileWriter>>,
     pub metrics: Arc<PipelineMetrics>,
     pub shutdown: Arc<AtomicBool>,
@@ -78,8 +66,8 @@ pub struct ConsumerContext {
     pub started_at: Arc<Mutex<Instant>>,
     /// Running total of encoded bytes written (avoids re-locking the writer).
     pub bytes_written: Arc<AtomicU64>,
-    /// Clean-audio sink for live monitoring (null sink when disabled).
-    pub monitor: Arc<dyn AudioMonitor>,
+    /// Clean-audio sink for live monitoring (`None` when disabled).
+    pub monitor: Option<Arc<dyn AudioMonitor>>,
 }
 
 /// Spawns the background consumer that encodes audio and feeds transcription.
@@ -145,18 +133,22 @@ async fn process_chunk(
     // Feed the monitor before encode so pass-through latency stays ~one block
     // plus the device buffer (spec: ~15–35 ms), independent of codec cost.
     // Failures are non-fatal: monitoring must not abort the recording path.
-    if let Err(err) = ctx.monitor.write(&chunk.samples) {
+    if let Some(monitor) = &ctx.monitor
+        && let Err(err) = monitor.write(&chunk.samples)
+    {
         log::warn!("audio monitor write failed: {err}");
     }
 
     let encoder_slot = Arc::clone(&ctx.encoder);
     let pcm = chunk.samples;
+    let keep_pcm = ctx.speech.is_some();
     let (encoded_bytes, pcm) = tokio::task::spawn_blocking(move || {
         let mut guard = encoder_slot
             .lock()
             .map_err(|_| PipelineError::InvalidState("encoder lock poisoned".to_owned()))?;
         let encoded_bytes = guard.encode(&pcm)?;
         drop(guard);
+        let pcm = keep_pcm.then_some(pcm);
         Ok::<_, PipelineError>((encoded_bytes, pcm))
     })
     .await
@@ -170,12 +162,14 @@ async fn process_chunk(
         ctx.bytes_written.fetch_add(written, Ordering::Relaxed);
     }
 
-    ctx.speech.feed_audio(pcm);
+    if let (Some(speech), Some(pcm)) = (&ctx.speech, pcm) {
+        speech.feed_audio(pcm);
+    }
 
     ctx.metrics
         .record_frames(u64::try_from(frame_count).unwrap_or(0));
 
-    emit_progress(ctx, level_left, level_right, None)?;
+    emit_progress(ctx, level_left, level_right);
 
     Ok(())
 }
@@ -185,35 +179,24 @@ fn emit_progress(
     ctx: &ConsumerContext,
     level_left: f32,
     level_right: f32,
-    state_override: Option<RecordingState>,
-) -> Result<(), PipelineError> {
-    let state = state_override.unwrap_or_else(|| {
-        if ctx.shutdown.load(Ordering::Acquire) {
-            RecordingState::Stopping
-        } else if ctx.paused.load(Ordering::Relaxed) {
-            RecordingState::Paused
-        } else {
-            RecordingState::Recording
-        }
-    });
+) {
+    let state = if ctx.shutdown.load(Ordering::Acquire) {
+        RecordingState::Stopping
+    } else if ctx.paused.load(Ordering::Relaxed) {
+        RecordingState::Paused
+    } else {
+        RecordingState::Recording
+    };
 
-    let started_at = ctx
-        .started_at
-        .lock()
-        .map_err(|_| PipelineError::InvalidState("started_at lock poisoned".to_owned()))?;
-    let elapsed_ms = u64::try_from(started_at.elapsed().as_millis()).unwrap_or(u64::MAX);
-    drop(started_at);
+    let elapsed_ms = super::elapsed_ms(&ctx.started_at);
 
-    let status = RecordingStatus {
+    let _ = ctx.progress_tx.send(RecordingStatus {
         elapsed_ms,
         bytes_written: ctx.bytes_written.load(Ordering::Relaxed),
         level_left,
         level_right,
         state,
-    };
-
-    let _ = ctx.progress_tx.send(status);
-    Ok(())
+    });
 }
 
 fn peak_levels(samples: &[f32]) -> (f32, f32) {
@@ -232,12 +215,11 @@ mod tests {
     use std::sync::atomic::AtomicUsize;
     use std::time::Duration;
 
-    use koe_ffi::OutputFormat;
     use tokio::sync::broadcast;
 
     use super::*;
     use crate::codec::{AudioEncoder, CodecError};
-    use crate::pipeline::monitor::{NullMonitor, RecordingMonitor};
+    use crate::pipeline::monitor::RecordingMonitor;
 
     struct CountingEncoder {
         encode_count: Arc<AtomicUsize>,
@@ -262,18 +244,6 @@ mod tests {
 
         fn finalize(&mut self) -> Result<Vec<u8>, CodecError> {
             Ok(Vec::new())
-        }
-
-        fn format(&self) -> OutputFormat {
-            OutputFormat::Ogg { quality: 0.5 }
-        }
-
-        fn sample_rate(&self) -> u32 {
-            48_000
-        }
-
-        fn channel_count(&self) -> u16 {
-            2
         }
     }
 
@@ -307,11 +277,11 @@ mod tests {
 
     fn context(
         codec: Arc<Mutex<Box<dyn AudioEncoder>>>,
-        speech: Arc<dyn SpeechFeeder>,
+        speech: Option<Arc<dyn SpeechFeeder>>,
         writer: Arc<AsyncMutex<FileWriter>>,
         shutdown: Arc<AtomicBool>,
         progress_tx: broadcast::Sender<RecordingStatus>,
-        monitor: Arc<dyn AudioMonitor>,
+        monitor: Option<Arc<dyn AudioMonitor>>,
     ) -> (ConsumerContext, Arc<PipelineMetrics>) {
         let metrics = PipelineMetrics::new();
         let ctx = ConsumerContext {
@@ -343,10 +313,10 @@ mod tests {
                 encode_count: Arc::clone(&encode_count),
                 delay: Duration::ZERO,
             })));
-        let speech: Arc<dyn SpeechFeeder> = Arc::new(CountingSpeech {
+        let speech: Option<Arc<dyn SpeechFeeder>> = Some(Arc::new(CountingSpeech {
             feed_count: Arc::clone(&feed_count),
             samples: Arc::clone(&fed_samples),
-        });
+        }));
 
         let (tx, rx) = broadcast::channel(64);
         let (ctx, metrics) = context(
@@ -355,7 +325,7 @@ mod tests {
             Arc::clone(&writer),
             Arc::clone(&shutdown),
             progress_tx,
-            Arc::new(NullMonitor),
+            None,
         );
         let task = spawn_consumer(rx, ctx);
 
@@ -409,10 +379,10 @@ mod tests {
                 encode_count: Arc::clone(&encode_count),
                 delay: Duration::from_millis(30),
             })));
-        let speech: Arc<dyn SpeechFeeder> = Arc::new(CountingSpeech {
+        let speech: Option<Arc<dyn SpeechFeeder>> = Some(Arc::new(CountingSpeech {
             feed_count: Arc::clone(&feed_count),
             samples: Arc::new(Mutex::new(Vec::new())),
-        });
+        }));
 
         // Tiny buffer so a slow consumer must lag.
         let (tx, rx) = broadcast::channel(1);
@@ -422,7 +392,7 @@ mod tests {
             writer,
             Arc::clone(&shutdown),
             progress_tx,
-            Arc::new(NullMonitor),
+            None,
         );
         let task = spawn_consumer(rx, ctx);
 
@@ -459,10 +429,10 @@ mod tests {
                 encode_count: Arc::clone(&encode_count),
                 delay: Duration::ZERO,
             })));
-        let speech: Arc<dyn SpeechFeeder> = Arc::new(CountingSpeech {
+        let speech: Option<Arc<dyn SpeechFeeder>> = Some(Arc::new(CountingSpeech {
             feed_count: Arc::clone(&feed_count),
             samples: Arc::new(Mutex::new(Vec::new())),
-        });
+        }));
 
         let (tx, rx) = broadcast::channel(64);
         let (ctx, _) = context(
@@ -471,7 +441,7 @@ mod tests {
             writer,
             Arc::clone(&shutdown),
             progress_tx,
-            Arc::new(NullMonitor),
+            None,
         );
         let task = spawn_consumer(rx, ctx);
 
@@ -503,10 +473,10 @@ mod tests {
                 encode_count: Arc::clone(&encode_count),
                 delay: Duration::ZERO,
             })));
-        let speech: Arc<dyn SpeechFeeder> = Arc::new(CountingSpeech {
+        let speech: Option<Arc<dyn SpeechFeeder>> = Some(Arc::new(CountingSpeech {
             feed_count: Arc::clone(&feed_count),
             samples: Arc::new(Mutex::new(Vec::new())),
-        });
+        }));
 
         let (tx, rx) = broadcast::channel(64);
         let (ctx, _) = context(
@@ -515,7 +485,7 @@ mod tests {
             writer,
             Arc::clone(&shutdown),
             progress_tx,
-            Arc::clone(&monitor) as Arc<dyn AudioMonitor>,
+            Some(Arc::clone(&monitor) as Arc<dyn AudioMonitor>),
         );
         let task = spawn_consumer(rx, ctx);
 
@@ -549,10 +519,10 @@ mod tests {
                 encode_count: Arc::clone(&encode_count),
                 delay: Duration::ZERO,
             })));
-        let speech: Arc<dyn SpeechFeeder> = Arc::new(CountingSpeech {
+        let speech: Option<Arc<dyn SpeechFeeder>> = Some(Arc::new(CountingSpeech {
             feed_count: Arc::clone(&feed_count),
             samples: Arc::new(Mutex::new(Vec::new())),
-        });
+        }));
 
         let (tx, rx) = broadcast::channel(64);
         let (ctx, _) = context(
@@ -561,7 +531,7 @@ mod tests {
             writer,
             Arc::clone(&shutdown),
             progress_tx,
-            Arc::clone(&monitor) as Arc<dyn AudioMonitor>,
+            Some(Arc::clone(&monitor) as Arc<dyn AudioMonitor>),
         );
         let task = spawn_consumer(rx, ctx);
 

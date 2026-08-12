@@ -10,16 +10,19 @@ mod mixer;
 mod monitor;
 mod shutdown;
 
+#[cfg(test)]
+mod test_support;
+
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use koe_ffi::{
-    AudioCallback, AudioSourceConfig, OutputFormat, Permission, PermissionStatus, RecordingError,
-    SpeechEngine, TranscriptFormat, TranscriptionCallback, TranscriptionSegment, check_permission,
-    start_capture, start_transcription, validate_capture_source, validate_locale,
-    validate_output_path,
+    AudioCallback, AudioSourceConfig, CaptureHandle, OutputFormat, Permission, PermissionStatus,
+    RecordingError, SpeechEngine, TranscriptFormat, TranscriptionCallback, TranscriptionHandle,
+    TranscriptionSegment, check_permission, start_capture, start_transcription,
+    validate_capture_source, validate_locale, validate_output_path,
 };
 use tokio::sync::{Mutex as AsyncMutex, broadcast, mpsc};
 use tokio::task::JoinHandle;
@@ -27,22 +30,19 @@ use tokio::task::JoinHandle;
 use crate::codec::{AudioEncoder, OggComments, create_encoder};
 use crate::transcript::{TranscriptFormatter, TranscriptMeta, create_formatter};
 
-pub use chunk::AudioChunk;
-pub use consumer::{
-    ConsumerContext, NullSpeechFeeder, SpeechFeeder, TranscriptionFeeder, spawn_consumer,
-};
-pub use disk_check::{available_disk_space, check_disk_space};
+use chunk::AudioChunk;
+use consumer::{ConsumerContext, SpeechFeeder, spawn_consumer};
+pub use disk_check::available_disk_space;
+use disk_check::check_disk_space;
 pub use error::PipelineError;
-pub use file_writer::FileWriter;
+use file_writer::FileWriter;
 /// Progress payload types for [`RecordingPipeline::subscribe_progress`].
 /// Segment live feed: [`RecordingPipeline::subscribe_segments`].
 pub use koe_ffi::{RecordingState, RecordingStatus};
-pub use metrics::{PipelineMetrics, PipelineMetricsSnapshot};
-pub use monitor::{
-    AudioMonitor, MONITOR_BUFFER_FRAMES, MONITOR_BYTES_PER_FRAME, MONITOR_CHANNEL_COUNT,
-    MONITOR_SAMPLE_RATE_HZ, MonitorError, NullMonitor, create_monitor, create_monitor_or_null,
-};
-pub use shutdown::{FORCE_JOIN_BUDGET, SHUTDOWN_BUDGET, ShutdownMode, StopResult};
+use metrics::PipelineMetrics;
+pub use metrics::PipelineMetricsSnapshot;
+use monitor::{AudioMonitor, start_session_monitor};
+pub use shutdown::StopResult;
 
 /// Configuration for a recording session.
 ///
@@ -87,22 +87,12 @@ pub struct PipelineConfig {
 }
 
 /// Lifecycle state of the recording pipeline.
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy)]
 pub enum PipelineState {
-    /// Pipeline created but not yet recording.
-    Idle,
     /// Actively recording.
-    Recording {
-        start_time: Instant,
-        bytes_written: u64,
-        segments: Vec<TranscriptionSegment>,
-    },
+    Recording,
     /// Recording paused; tap remains alive.
-    Paused {
-        elapsed_before_pause: Duration,
-        bytes_written: u64,
-        segments: Vec<TranscriptionSegment>,
-    },
+    Paused { elapsed_before_pause: Duration },
     /// Recording has been stopped.
     Stopped,
 }
@@ -114,13 +104,13 @@ pub struct RecordingPipeline {
     encoder: Arc<Mutex<Box<dyn AudioEncoder>>>,
     transcript_fmt: Arc<Mutex<Box<dyn TranscriptFormatter>>>,
     file_writer: Arc<AsyncMutex<FileWriter>>,
-    capture_handles: Vec<Arc<koe_ffi::CaptureHandle>>,
+    capture_handles: Vec<Arc<CaptureHandle>>,
     mixer_task: Option<JoinHandle<()>>,
-    transcription_handle: Option<Arc<koe_ffi::TranscriptionHandle>>,
+    transcription_handle: Option<Arc<TranscriptionHandle>>,
     consumer_task: Option<JoinHandle<Result<(), PipelineError>>>,
     shutdown: Arc<AtomicBool>,
     paused: Arc<AtomicBool>,
-    drop_counter: Arc<std::sync::atomic::AtomicU64>,
+    drop_counter: Arc<AtomicU64>,
     metrics: Arc<PipelineMetrics>,
     segments: Arc<Mutex<Vec<TranscriptionSegment>>>,
     progress_tx: broadcast::Sender<RecordingStatus>,
@@ -128,17 +118,34 @@ pub struct RecordingPipeline {
     /// Pause-aware origin shared with the consumer progress clock.
     started_at: Arc<Mutex<Instant>>,
     bytes_written: Arc<AtomicU64>,
-    /// Live pass-through sink (null when [`PipelineConfig::monitor`] is false).
-    monitor: Arc<dyn AudioMonitor>,
+    /// Live pass-through sink (`None` when monitoring is off or failed to open).
+    monitor: Option<Arc<dyn AudioMonitor>>,
 }
 
-struct PipelineAudioCallback {
-    tx: broadcast::Sender<AudioChunk>,
+enum AudioSink {
+    Mixed(broadcast::Sender<AudioChunk>),
+    Side(mpsc::Sender<AudioChunk>),
+}
+
+impl AudioSink {
+    fn try_push(
+        &self,
+        chunk: AudioChunk,
+    ) -> bool {
+        match self {
+            Self::Mixed(tx) => tx.send(chunk).is_ok(),
+            Self::Side(tx) => tx.try_send(chunk).is_ok(),
+        }
+    }
+}
+
+struct CaptureAudioCallback {
+    sink: AudioSink,
     paused: Arc<AtomicBool>,
-    drop_counter: Arc<std::sync::atomic::AtomicU64>,
+    drop_counter: Arc<AtomicU64>,
 }
 
-impl AudioCallback for PipelineAudioCallback {
+impl AudioCallback for CaptureAudioCallback {
     fn on_audio(
         &self,
         pcm: Vec<f32>,
@@ -147,45 +154,21 @@ impl AudioCallback for PipelineAudioCallback {
         if self.paused.load(Ordering::Relaxed) {
             return;
         }
-        if self.tx.send(AudioChunk::new(pcm, timestamp_ms)).is_err() {
+        if !self.sink.try_push(AudioChunk::new(pcm, timestamp_ms)) {
             self.drop_counter.fetch_add(1, Ordering::Relaxed);
         }
     }
 }
 
-struct SideAudioCallback {
-    tx: mpsc::Sender<AudioChunk>,
-    paused: Arc<AtomicBool>,
-    drop_counter: Arc<std::sync::atomic::AtomicU64>,
-}
+type CaptureSetup = (Vec<Arc<CaptureHandle>>, Option<JoinHandle<()>>);
 
-impl AudioCallback for SideAudioCallback {
-    fn on_audio(
-        &self,
-        pcm: Vec<f32>,
-        timestamp_ms: u64,
-    ) {
-        if self.paused.load(Ordering::Relaxed) {
-            return;
-        }
-        if self
-            .tx
-            .try_send(AudioChunk::new(pcm, timestamp_ms))
-            .is_err()
-        {
-            self.drop_counter.fetch_add(1, Ordering::Relaxed);
-        }
-    }
-}
-
-#[allow(clippy::type_complexity)]
 fn start_captures(
     config: &PipelineConfig,
     audio_tx: broadcast::Sender<AudioChunk>,
     paused: Arc<AtomicBool>,
-    drop_counter: Arc<std::sync::atomic::AtomicU64>,
+    drop_counter: Arc<AtomicU64>,
     shutdown: Arc<AtomicBool>,
-) -> Result<(Vec<Arc<koe_ffi::CaptureHandle>>, Option<JoinHandle<()>>), PipelineError> {
+) -> Result<CaptureSetup, PipelineError> {
     match &config.source {
         AudioSourceConfig::Both { bundle_id } => {
             let (far_tx, far_rx) = mpsc::channel(1024);
@@ -194,16 +177,16 @@ fn start_captures(
                 AudioSourceConfig::AppAudio {
                     bundle_id: bundle_id.clone(),
                 },
-                Box::new(SideAudioCallback {
-                    tx: far_tx,
+                Box::new(CaptureAudioCallback {
+                    sink: AudioSink::Side(far_tx),
                     paused: Arc::clone(&paused),
                     drop_counter: Arc::clone(&drop_counter),
                 }),
             )?;
             let mic = start_capture(
                 AudioSourceConfig::Microphone,
-                Box::new(SideAudioCallback {
-                    tx: near_tx,
+                Box::new(CaptureAudioCallback {
+                    sink: AudioSink::Side(near_tx),
                     paused,
                     drop_counter,
                 }),
@@ -221,8 +204,8 @@ fn start_captures(
         source => {
             let handle = start_capture(
                 source.clone(),
-                Box::new(PipelineAudioCallback {
-                    tx: audio_tx,
+                Box::new(CaptureAudioCallback {
+                    sink: AudioSink::Mixed(audio_tx),
                     paused,
                     drop_counter,
                 }),
@@ -301,7 +284,7 @@ impl RecordingPipeline {
         // run on the runtime's initial (CLI main) thread.
         let shutdown = Arc::new(AtomicBool::new(false));
         let paused = Arc::new(AtomicBool::new(false));
-        let drop_counter = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let drop_counter = Arc::new(AtomicU64::new(0));
         let metrics = PipelineMetrics::new();
         let segments = Arc::new(Mutex::new(Vec::new()));
         let transcript_meta = TranscriptMeta::for_session(&config.source, &config.locale);
@@ -317,10 +300,10 @@ impl RecordingPipeline {
             segment_tx.clone(),
         )?;
 
-        let (audio_tx, _audio_rx) = broadcast::channel(64);
+        let (audio_tx, audio_rx) = broadcast::channel(64);
         let (capture_handles, mixer_task) = start_captures(
             &config,
-            audio_tx.clone(),
+            audio_tx,
             Arc::clone(&paused),
             Arc::clone(&drop_counter),
             Arc::clone(&shutdown),
@@ -331,10 +314,14 @@ impl RecordingPipeline {
         let encoder = Arc::new(Mutex::new(encoder));
         let file_writer = Arc::new(AsyncMutex::new(file_writer));
         let (progress_tx, _) = broadcast::channel(32);
-        let started_at = Instant::now();
-        let started_at = Arc::new(Mutex::new(started_at));
+        let start_time = Instant::now();
+        let started_at = Arc::new(Mutex::new(start_time));
         let bytes_written = Arc::new(AtomicU64::new(0));
-        let monitor = create_monitor_or_null(config.monitor);
+        let monitor = if config.monitor {
+            start_session_monitor()
+        } else {
+            None
+        };
 
         let consumer_ctx = ConsumerContext {
             encoder: Arc::clone(&encoder),
@@ -346,20 +333,15 @@ impl RecordingPipeline {
             progress_tx: progress_tx.clone(),
             started_at: Arc::clone(&started_at),
             bytes_written: Arc::clone(&bytes_written),
-            monitor: Arc::clone(&monitor),
+            monitor: monitor.clone(),
         };
-        let consumer_task = spawn_consumer(audio_tx.subscribe(), consumer_ctx);
-        let start_time = *started_at
-            .lock()
-            .map_err(|_| PipelineError::InvalidState("started_at lock poisoned".to_owned()))?;
+        // Use the original receiver so chunks that arrive while the output
+        // file is created are not discarded with a leftover `_audio_rx`.
+        let consumer_task = spawn_consumer(audio_rx, consumer_ctx);
 
         Ok(Self {
             config,
-            state: PipelineState::Recording {
-                start_time,
-                bytes_written: 0,
-                segments: Vec::new(),
-            },
+            state: PipelineState::Recording,
             encoder,
             transcript_fmt: transcript,
             file_writer,
@@ -382,17 +364,10 @@ impl RecordingPipeline {
 
     /// Pauses audio production while keeping the native tap alive.
     pub fn pause(&mut self) {
-        if let PipelineState::Recording {
-            start_time,
-            bytes_written,
-            segments,
-        } = std::mem::replace(&mut self.state, PipelineState::Idle)
-        {
+        if matches!(self.state, PipelineState::Recording) {
             self.paused.store(true, Ordering::Relaxed);
             self.state = PipelineState::Paused {
-                elapsed_before_pause: start_time.elapsed(),
-                bytes_written,
-                segments,
+                elapsed_before_pause: self.elapsed(),
             };
             self.publish_status(RecordingState::Paused, 0.0, 0.0);
         }
@@ -402,9 +377,7 @@ impl RecordingPipeline {
     pub fn resume(&mut self) {
         if let PipelineState::Paused {
             elapsed_before_pause,
-            bytes_written,
-            segments,
-        } = std::mem::replace(&mut self.state, PipelineState::Idle)
+        } = self.state
         {
             self.paused.store(false, Ordering::Relaxed);
             let start_time = Instant::now()
@@ -413,13 +386,15 @@ impl RecordingPipeline {
             if let Ok(mut origin) = self.started_at.lock() {
                 *origin = start_time;
             }
-            self.state = PipelineState::Recording {
-                start_time,
-                bytes_written,
-                segments,
-            };
+            self.state = PipelineState::Recording;
             self.publish_status(RecordingState::Recording, 0.0, 0.0);
         }
+    }
+
+    fn elapsed(&self) -> Duration {
+        self.started_at
+            .lock()
+            .map_or(Duration::ZERO, |origin| origin.elapsed())
     }
 
     /// Returns whether the pipeline is paused.
@@ -429,15 +404,10 @@ impl RecordingPipeline {
     }
 
     /// Current lifecycle state.
+    #[cfg(test)]
     #[must_use]
-    pub const fn state(&self) -> &PipelineState {
-        &self.state
-    }
-
-    /// Active configuration.
-    #[must_use]
-    pub const fn config(&self) -> &PipelineConfig {
-        &self.config
+    pub(crate) const fn state(&self) -> PipelineState {
+        self.state
     }
 
     /// Runtime metrics snapshot.
@@ -447,14 +417,16 @@ impl RecordingPipeline {
     }
 
     /// Returns the primary capture handle when a session is active.
+    #[cfg(test)]
     #[must_use]
-    pub fn capture_handle(&self) -> Option<&Arc<koe_ffi::CaptureHandle>> {
+    pub(crate) fn capture_handle(&self) -> Option<&Arc<CaptureHandle>> {
         self.capture_handles.first()
     }
 
     /// Transcription handle for test injection of segments.
+    #[cfg(test)]
     #[must_use]
-    pub const fn transcription_handle(&self) -> Option<&Arc<koe_ffi::TranscriptionHandle>> {
+    pub(crate) const fn transcription_handle(&self) -> Option<&Arc<TranscriptionHandle>> {
         self.transcription_handle.as_ref()
     }
 
@@ -491,9 +463,7 @@ impl RecordingPipeline {
         level_left: f32,
         level_right: f32,
     ) {
-        let elapsed_ms = self.started_at.lock().map_or(0, |started_at| {
-            u64::try_from(started_at.elapsed().as_millis()).unwrap_or(u64::MAX)
-        });
+        let elapsed_ms = elapsed_ms(&self.started_at);
         let _ = self.progress_tx.send(RecordingStatus {
             elapsed_ms,
             bytes_written: self.bytes_written.load(Ordering::Relaxed),
@@ -502,6 +472,12 @@ impl RecordingPipeline {
             state,
         });
     }
+}
+
+fn elapsed_ms(started_at: &Mutex<Instant>) -> u64 {
+    started_at.lock().map_or(0, |origin| {
+        u64::try_from(origin.elapsed().as_millis()).unwrap_or(u64::MAX)
+    })
 }
 
 fn validate_config(config: &PipelineConfig) -> Result<(), PipelineError> {
@@ -540,7 +516,7 @@ fn open_transcription(
     segment_tx: broadcast::Sender<TranscriptionSegment>,
 ) -> Result<TranscriptionSetup, PipelineError> {
     if !config.transcribe {
-        return Ok((None, Arc::new(NullSpeechFeeder)));
+        return Ok((None, None));
     }
     let transcription_callback = PipelineTranscriptionCallback {
         segments: Arc::clone(segments),
@@ -553,13 +529,13 @@ fn open_transcription(
         config.speech_engine,
         Box::new(transcription_callback),
     )?;
-    let feeder = Arc::new(TranscriptionFeeder::new(Arc::clone(&handle)));
-    Ok((Some(handle), feeder))
+    let feeder = Arc::new(consumer::TranscriptionFeeder::new(Arc::clone(&handle)));
+    Ok((Some(handle), Some(feeder)))
 }
 
 type TranscriptionSetup = (
-    Option<Arc<koe_ffi::TranscriptionHandle>>,
-    Arc<dyn SpeechFeeder>,
+    Option<Arc<TranscriptionHandle>>,
+    Option<Arc<dyn SpeechFeeder>>,
 );
 
 fn check_permissions(source: &AudioSourceConfig) -> Result<(), PipelineError> {
@@ -595,77 +571,15 @@ const fn permission_name(permission: Permission) -> &'static str {
 
 #[cfg(test)]
 mod tests {
-    use std::path::Path;
+    use koe_ffi::{Permission, PermissionStatus};
 
-    use koe_ffi::{
-        AppInfo, NativeProvider, Permission, PermissionStatus, register_native_provider,
-    };
-
+    use super::test_support::{install_provider, test_config, unique_path};
     use super::*;
-
-    struct TestProvider {
-        permissions: Vec<(Permission, PermissionStatus)>,
-    }
-
-    impl NativeProvider for TestProvider {
-        fn check_permission(
-            &self,
-            permission: Permission,
-        ) -> PermissionStatus {
-            self.permissions
-                .iter()
-                .find(|(perm, _)| *perm == permission)
-                .map_or(PermissionStatus::NotDetermined, |(_, status)| *status)
-        }
-
-        fn request_permission(
-            &self,
-            permission: Permission,
-        ) -> PermissionStatus {
-            self.check_permission(permission)
-        }
-
-        fn enumerate_apps(&self) -> Vec<AppInfo> {
-            Vec::new()
-        }
-    }
-
-    fn install_provider(permissions: Vec<(Permission, PermissionStatus)>) {
-        koe_ffi::set_capture_stub(true);
-        koe_ffi::set_transcription_stub(true);
-        register_native_provider(Box::new(TestProvider { permissions }));
-    }
-
-    fn test_config(output: &Path) -> PipelineConfig {
-        PipelineConfig {
-            source: AudioSourceConfig::Microphone,
-            output_path: output.to_path_buf(),
-            transcript_output_path: None,
-            locale: "en-US".into(),
-            speech_engine: koe_ffi::SpeechEngine::Auto,
-            audio_format: OutputFormat::Wav {
-                bits_per_sample: 16,
-            },
-            transcript_format: TranscriptFormat::Txt,
-            enable_aec: false,
-            comfort_noise: false,
-            monitor: false,
-            transcribe: true,
-            estimated_duration_hours: None,
-        }
-    }
 
     #[tokio::test]
     async fn start_stop_with_authorized_permissions() {
         install_provider(vec![(Permission::Microphone, PermissionStatus::Authorized)]);
-        let output = std::env::temp_dir().join(format!(
-            "koe-pipeline-{}-{}.wav",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .expect("clock")
-                .as_nanos()
-        ));
+        let output = unique_path("start-stop");
 
         let mut pipeline = RecordingPipeline::start(test_config(&output))
             .await
@@ -686,14 +600,7 @@ mod tests {
     #[tokio::test]
     async fn pause_resume_cycle() {
         install_provider(vec![(Permission::Microphone, PermissionStatus::Authorized)]);
-        let output = std::env::temp_dir().join(format!(
-            "koe-pipeline-pause-{}-{}.wav",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .expect("clock")
-                .as_nanos()
-        ));
+        let output = unique_path("pause");
 
         let mut pipeline = RecordingPipeline::start(test_config(&output))
             .await
@@ -721,14 +628,7 @@ mod tests {
     #[tokio::test]
     async fn progress_emits_lifecycle_states() {
         install_provider(vec![(Permission::Microphone, PermissionStatus::Authorized)]);
-        let output = std::env::temp_dir().join(format!(
-            "koe-pipeline-progress-{}-{}.wav",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .expect("clock")
-                .as_nanos()
-        ));
+        let output = unique_path("progress");
 
         let mut pipeline = RecordingPipeline::start(test_config(&output))
             .await
@@ -760,14 +660,7 @@ mod tests {
     #[tokio::test]
     async fn start_without_transcription() {
         install_provider(vec![(Permission::Microphone, PermissionStatus::Authorized)]);
-        let output = std::env::temp_dir().join(format!(
-            "koe-pipeline-no-asr-{}-{}.wav",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .expect("clock")
-                .as_nanos()
-        ));
+        let output = unique_path("no-asr");
 
         let mut config = test_config(&output);
         config.transcribe = false;
@@ -788,7 +681,7 @@ mod tests {
     #[tokio::test]
     async fn start_with_denied_permission_fails() {
         install_provider(vec![(Permission::Microphone, PermissionStatus::Denied)]);
-        let output = std::env::temp_dir().join("koe-pipeline-denied.wav");
+        let output = unique_path("denied");
         let Err(err) = RecordingPipeline::start(test_config(&output)).await else {
             panic!("permission denied");
         };
@@ -798,7 +691,7 @@ mod tests {
     #[tokio::test]
     async fn start_with_insufficient_disk_space_fails() {
         install_provider(vec![(Permission::Microphone, PermissionStatus::Authorized)]);
-        let output = std::env::temp_dir().join("koe-pipeline-disk.wav");
+        let output = unique_path("disk");
         let mut config = test_config(&output);
         config.estimated_duration_hours = Some(1_000_000.0);
         config.audio_format = OutputFormat::Wav {

@@ -1,13 +1,12 @@
 //! Async file writer for encoded audio and transcript output.
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use tokio::fs::File;
 use tokio::io::AsyncWriteExt;
 
 /// Buffered async writer for pipeline output files.
 pub struct FileWriter {
-    path: PathBuf,
     file: File,
     bytes_written: u64,
 }
@@ -21,7 +20,6 @@ impl FileWriter {
     pub async fn create(path: &Path) -> Result<Self, std::io::Error> {
         let file = File::create(path).await?;
         Ok(Self {
-            path: path.to_path_buf(),
             file,
             bytes_written: 0,
         })
@@ -56,11 +54,5 @@ impl FileWriter {
     #[must_use]
     pub const fn bytes_written(&self) -> u64 {
         self.bytes_written
-    }
-
-    /// Output path.
-    #[must_use]
-    pub fn path(&self) -> &Path {
-        &self.path
     }
 }

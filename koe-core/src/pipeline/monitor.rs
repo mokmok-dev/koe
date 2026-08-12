@@ -13,20 +13,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 pub use koe_ffi::MonitorError;
 use koe_ffi::{MonitorHandle, feed_monitor, start_monitor, stop_monitor};
 
-/// Canonical sample rate for monitored audio (matches capture / AEC).
-pub const MONITOR_SAMPLE_RATE_HZ: u32 = 48_000;
-/// Interleaved stereo.
-pub const MONITOR_CHANNEL_COUNT: u16 = 2;
-/// One host buffer = 20 ms at 48 kHz.
-pub const MONITOR_BUFFER_FRAMES: usize = 960;
-/// Bytes per interleaved stereo frame (Float32 × 2).
-pub const MONITOR_BYTES_PER_FRAME: usize = 8;
-
 /// Sink for clean (post-AEC) PCM destined for the default output device.
 ///
-/// PCM must be interleaved stereo [`f32`] at [`MONITOR_SAMPLE_RATE_HZ`]
-/// ([`MONITOR_CHANNEL_COUNT`] channels). Each write is typically one
-/// [`MONITOR_BUFFER_FRAMES`]-frame block (~20 ms).
+/// PCM must be interleaved stereo [`f32`] at 48 kHz, 2 channels.
 pub trait AudioMonitor: Send + Sync {
     /// Enqueues interleaved stereo Float32 samples for playback.
     ///
@@ -43,21 +32,6 @@ pub trait AudioMonitor: Send + Sync {
 
     /// Tears down the output queue. Safe to call more than once.
     fn stop(&self);
-}
-
-/// No-op monitor used when [`super::PipelineConfig::monitor`] is false.
-#[derive(Debug, Default)]
-pub struct NullMonitor;
-
-impl AudioMonitor for NullMonitor {
-    fn write(
-        &self,
-        _pcm: &[f32],
-    ) -> Result<(), MonitorError> {
-        Ok(())
-    }
-
-    fn stop(&self) {}
 }
 
 /// FFI-backed monitor that forwards PCM to the native `AudioQueue` bridge.
@@ -115,34 +89,14 @@ impl Drop for FfiMonitor {
     }
 }
 
-/// Builds the monitor sink for a pipeline session.
-///
-/// Returns [`NullMonitor`] when monitoring is disabled so the consumer always
-/// has a concrete sink (avoids branching on every chunk).
-///
-/// # Errors
-///
-/// Returns [`MonitorError`] when an enabled monitor cannot open the native
-/// output queue. Callers that must keep recording running should fall back to
-/// [`NullMonitor`] (see [`super::RecordingPipeline::start`]).
-pub fn create_monitor(enabled: bool) -> Result<Arc<dyn AudioMonitor>, MonitorError> {
-    if enabled {
-        Ok(Arc::new(FfiMonitor::start()?))
-    } else {
-        Ok(Arc::new(NullMonitor))
-    }
-}
-
-/// Like [`create_monitor`], but never fails the recording path.
-///
-/// On create failure logs a warning and returns [`NullMonitor`].
-#[must_use]
-pub fn create_monitor_or_null(enabled: bool) -> Arc<dyn AudioMonitor> {
-    match create_monitor(enabled) {
-        Ok(monitor) => monitor,
+/// Opens a monitor. Create failures are logged and treated as off so recording
+/// still proceeds. Callers skip this when monitoring is disabled.
+pub fn start_session_monitor() -> Option<Arc<dyn AudioMonitor>> {
+    match FfiMonitor::start() {
+        Ok(monitor) => Some(Arc::new(monitor)),
         Err(err) => {
             log::warn!("audio monitor unavailable; continuing without monitoring: {err}");
-            Arc::new(NullMonitor)
+            None
         },
     }
 }
@@ -189,49 +143,20 @@ mod tests {
 
     #[test]
     fn buffer_constants_match_spec() {
-        assert_eq!(MONITOR_SAMPLE_RATE_HZ, 48_000);
-        assert_eq!(MONITOR_CHANNEL_COUNT, 2);
-        assert_eq!(MONITOR_BUFFER_FRAMES, 960);
-        assert_eq!(
-            MONITOR_BUFFER_FRAMES * usize::from(MONITOR_CHANNEL_COUNT),
-            1_920
-        );
-        // 20 ms at 48 kHz.
-        assert_eq!(
-            MONITOR_BUFFER_FRAMES * 1_000 / MONITOR_SAMPLE_RATE_HZ as usize,
-            20
-        );
-        assert_eq!(MONITOR_BYTES_PER_FRAME, 8);
+        const SAMPLE_RATE_HZ: u32 = 48_000;
+        const CHANNEL_COUNT: u16 = 2;
+        const BUFFER_FRAMES: usize = 960;
+        const BYTES_PER_FRAME: usize = 8;
+        assert_eq!(BUFFER_FRAMES * usize::from(CHANNEL_COUNT), 1_920);
+        assert_eq!(BUFFER_FRAMES * 1_000 / SAMPLE_RATE_HZ as usize, 20);
+        assert_eq!(BYTES_PER_FRAME, 8);
     }
 
     #[test]
-    fn null_monitor_is_noop() {
-        let monitor = NullMonitor;
-        monitor.write(&[0.1, -0.1]).expect("write");
-        monitor.stop();
-        monitor.stop();
-    }
-
-    #[test]
-    fn create_monitor_disabled_returns_null() {
-        let monitor = create_monitor(false).expect("create");
-        monitor.write(&[0.0, 0.0]).expect("write");
-        monitor.stop();
-    }
-
-    #[test]
-    fn create_monitor_enabled_uses_ffi_stub() {
-        let monitor = create_monitor(true).expect("create");
+    fn enabled_monitor_uses_ffi_stub() {
+        let monitor = start_session_monitor().expect("create");
         monitor.write(&[0.1, -0.1, 0.2, -0.2]).expect("write");
         monitor.stop();
-        // Second stop is a no-op for FfiMonitor.
-        monitor.stop();
-    }
-
-    #[test]
-    fn create_monitor_or_null_never_fails() {
-        let monitor = create_monitor_or_null(true);
-        monitor.write(&[0.0, 0.0]).expect("write");
         monitor.stop();
     }
 

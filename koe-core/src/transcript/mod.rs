@@ -1,19 +1,17 @@
 //! Transcript formatters (TXT / SRT / VTT / JSON).
 
+mod cues;
 mod json;
-mod srt;
 mod txt;
-mod vtt;
 
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use koe_ffi::{AudioSourceConfig, TranscriptFormat, TranscriptionSegment};
 
-pub use json::JsonFormatter;
-pub use srt::SrtFormatter;
-pub use txt::TxtFormatter;
-pub use vtt::VttFormatter;
+use cues::CueFormatter;
+use json::JsonFormatter;
+use txt::TxtFormatter;
 
 /// Session metadata required by the JSON transcript schema.
 ///
@@ -29,16 +27,6 @@ pub struct TranscriptMeta {
 }
 
 impl TranscriptMeta {
-    /// Minimal metadata when session context is unavailable.
-    #[must_use]
-    pub fn basic() -> Self {
-        Self {
-            locale: "und".to_owned(),
-            created_at: String::new(),
-            source: AudioSourceConfig::Microphone,
-        }
-    }
-
     /// Builds metadata for a live recording session.
     #[must_use]
     pub fn for_session(
@@ -111,8 +99,8 @@ pub fn create_formatter(
 ) -> Box<dyn TranscriptFormatter> {
     match format {
         TranscriptFormat::Txt => Box::new(TxtFormatter::new()),
-        TranscriptFormat::Srt => Box::new(SrtFormatter::new()),
-        TranscriptFormat::Vtt => Box::new(VttFormatter::new()),
+        TranscriptFormat::Srt => Box::new(CueFormatter::srt()),
+        TranscriptFormat::Vtt => Box::new(CueFormatter::vtt()),
         TranscriptFormat::Json => Box::new(JsonFormatter::new(meta.clone())),
     }
 }

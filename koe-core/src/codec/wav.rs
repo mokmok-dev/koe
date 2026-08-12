@@ -1,7 +1,5 @@
 //! WAV (RIFF/WAVE) encoder — lossless PCM / IEEE float fallback.
 
-use koe_ffi::OutputFormat;
-
 use super::{AudioEncoder, CodecError};
 
 const SAMPLE_RATE: u32 = 48_000;
@@ -19,8 +17,7 @@ const WAVE_FORMAT_IEEE_FLOAT: u16 = 3;
 ///
 /// Canonical pipeline input is 48 kHz stereo. Use [`WavEncoder::with_channels`] for
 /// mono test fixtures; [`crate::codec::create_encoder`] always builds stereo because
-/// [`OutputFormat::Wav`] carries bit depth only — call [`AudioEncoder::channel_count`]
-/// for the active layout.
+/// [`koe_ffi::OutputFormat::Wav`] carries bit depth only.
 ///
 /// Bit depth `32` means IEEE float (`WAVE_FORMAT_IEEE_FLOAT`); `16` / `24` mean
 /// little-endian integer PCM. Integer paths clamp samples to `[-1.0, 1.0]` (NaN/Inf →
@@ -53,7 +50,7 @@ impl WavEncoder {
     /// Creates a WAV encoder with an explicit channel count (`1` or `2`).
     ///
     /// Prefer [`Self::new`] for production paths; mono is mainly for fixtures.
-    /// [`OutputFormat::Wav`] does not encode channel count, so
+    /// [`koe_ffi::OutputFormat::Wav`] does not encode channel count, so
     /// [`crate::codec::create_encoder`] cannot reconstruct a mono instance.
     ///
     /// # Errors
@@ -247,21 +244,6 @@ impl AudioEncoder for WavEncoder {
         out.append(&mut self.pcm_bytes);
         self.finished = true;
         Ok(out)
-    }
-
-    fn format(&self) -> OutputFormat {
-        // Channel count is not part of `OutputFormat::Wav`; see `channel_count()`.
-        OutputFormat::Wav {
-            bits_per_sample: self.bits_per_sample,
-        }
-    }
-
-    fn sample_rate(&self) -> u32 {
-        SAMPLE_RATE
-    }
-
-    fn channel_count(&self) -> u16 {
-        self.channel_count
     }
 }
 

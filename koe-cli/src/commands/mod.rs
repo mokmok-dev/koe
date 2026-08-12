@@ -40,6 +40,18 @@ fn parse_speech_engine(value: &str) -> Result<koe_core::SpeechEngine, MainError>
     }
 }
 
+fn parse_transcript_format(value: &str) -> Result<koe_core::TranscriptFormat, MainError> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "txt" => Ok(koe_core::TranscriptFormat::Txt),
+        "srt" => Ok(koe_core::TranscriptFormat::Srt),
+        "vtt" => Ok(koe_core::TranscriptFormat::Vtt),
+        "json" => Ok(koe_core::TranscriptFormat::Json),
+        other => Err(MainError::InvalidArgs(format!(
+            "unknown transcript format '{other}' (expected txt, srt, vtt, or json)"
+        ))),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -63,5 +75,18 @@ mod tests {
             koe_core::SpeechEngine::Network
         );
         assert!(parse_speech_engine("banana").is_err());
+    }
+
+    #[test]
+    fn parses_transcript_format_variants() {
+        assert_eq!(
+            parse_transcript_format("JSON").unwrap(),
+            koe_core::TranscriptFormat::Json
+        );
+        assert_eq!(
+            parse_transcript_format("srt").unwrap(),
+            koe_core::TranscriptFormat::Srt
+        );
+        assert!(parse_transcript_format("docx").is_err());
     }
 }

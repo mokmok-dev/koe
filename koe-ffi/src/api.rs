@@ -45,16 +45,20 @@ pub fn start_capture(
     validate_capture_source(&source)?;
     #[cfg(not(target_os = "macos"))]
     {
-        let _ = (source, callback);
-        Err(CaptureError::Internal {
-            msg: "audio capture is only available on macOS".to_owned(),
-        })
+        if !capture_stubbed() {
+            return Err(CaptureError::Internal {
+                msg: "audio capture is only available on macOS".to_owned(),
+            });
+        }
+        Ok(Arc::new(CaptureHandle::new(source, callback)))
     }
     #[cfg(target_os = "macos")]
     {
-        let handle = Arc::new(CaptureHandle::new(source.clone(), callback));
-        let session = crate::macos_capture::start_session(&source, Arc::clone(&handle))?;
-        handle.attach_session(session);
+        let handle = Arc::new(CaptureHandle::new(source, callback));
+        if !capture_stubbed() {
+            let session = crate::macos_capture::start_session(Arc::clone(&handle))?;
+            handle.attach_session(session);
+        }
         Ok(handle)
     }
 }
@@ -99,6 +103,22 @@ pub fn stop_monitor(handle: Arc<MonitorHandle>) {
     let _ = handle.id;
 }
 
+/// When true, [`start_capture`] returns a handle without a native session
+/// (test / CI harness only).
+static STUB_CAPTURE: AtomicBool = AtomicBool::new(false);
+
+/// Enables or disables no-op capture for tests that only need lifecycle.
+///
+/// Not part of the supported public API — test / CI harness only.
+#[doc(hidden)]
+pub fn set_capture_stub(enabled: bool) {
+    STUB_CAPTURE.store(enabled, Ordering::SeqCst);
+}
+
+fn capture_stubbed() -> bool {
+    STUB_CAPTURE.load(Ordering::SeqCst) || std::env::var_os("KOE_STUB_CAPTURE").is_some()
+}
+
 /// When true, [`start_transcription`] returns a handle without a native speech
 /// session (test / CI harness only — mirrors [`crate::set_capture_stub`]).
 static STUB_TRANSCRIPTION: AtomicBool = AtomicBool::new(false);
@@ -111,6 +131,7 @@ pub fn set_transcription_stub(enabled: bool) {
     STUB_TRANSCRIPTION.store(enabled, Ordering::SeqCst);
 }
 
+#[cfg(target_os = "macos")]
 fn transcription_stubbed() -> bool {
     STUB_TRANSCRIPTION.load(Ordering::SeqCst)
 }
@@ -119,13 +140,12 @@ fn transcription_stubbed() -> bool {
 #[allow(clippy::needless_pass_by_value)]
 fn start_transcription_native(
     handle: &Arc<TranscriptionHandle>,
-    locale: &str,
     engine: SpeechEngine,
 ) -> Result<(), TranscriptionError> {
     if transcription_stubbed() {
         return Ok(());
     }
-    let session = crate::speech_session::SpeechSession::start(handle, locale, engine)?;
+    let session = crate::speech_session::SpeechSession::start(handle, &handle.locale, engine)?;
     if engine == SpeechEngine::Auto && session.engine() == crate::speech_session::Engine::Network {
         eprintln!(
             "warning: on-device speech recognition is unavailable (Siri & Dictation \
@@ -144,10 +164,10 @@ pub fn start_transcription(
     callback: TranscriptionCallbackRef,
 ) -> Result<Arc<TranscriptionHandle>, TranscriptionError> {
     validate_locale(&locale)?;
-    let handle = Arc::new(TranscriptionHandle::new(locale.clone(), callback));
+    let handle = Arc::new(TranscriptionHandle::new(locale, callback));
     #[cfg(target_os = "macos")]
     {
-        start_transcription_native(&handle, &locale, engine)?;
+        start_transcription_native(&handle, engine)?;
     }
     #[cfg(not(target_os = "macos"))]
     let _ = engine;

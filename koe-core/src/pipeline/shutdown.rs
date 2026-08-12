@@ -85,7 +85,7 @@ impl RecordingPipeline {
     /// call multiple times; [`Self::stop`] skips capture teardown when handles
     /// are already gone.
     pub fn stop_native_captures(&mut self) {
-        if matches!(self.state, PipelineState::Stopped | PipelineState::Idle) {
+        if matches!(self.state, PipelineState::Stopped) {
             return;
         }
 
@@ -146,11 +146,11 @@ impl RecordingPipeline {
     ///
     /// Returns [`PipelineError`] when the pipeline is not running or a
     /// finalization step fails.
-    pub async fn stop_with(
+    pub(crate) async fn stop_with(
         &mut self,
         mode: ShutdownMode,
     ) -> Result<StopResult, PipelineError> {
-        if matches!(self.state, PipelineState::Stopped | PipelineState::Idle) {
+        if matches!(self.state, PipelineState::Stopped) {
             return Err(PipelineError::InvalidState(
                 "pipeline already stopped".to_owned(),
             ));
@@ -166,15 +166,16 @@ impl RecordingPipeline {
 
         // Tear down AudioQueue after the consumer has drained so late writes
         // during drain still reach the device, then release the output.
-        self.monitor.stop();
+        if let Some(monitor) = &self.monitor {
+            monitor.stop();
+        }
 
-        let duration_sec = match &self.state {
-            PipelineState::Recording { start_time, .. } => start_time.elapsed().as_secs_f64(),
+        let duration_sec = match self.state {
+            PipelineState::Recording => self.elapsed().as_secs_f64(),
             PipelineState::Paused {
                 elapsed_before_pause,
-                ..
             } => elapsed_before_pause.as_secs_f64(),
-            _ => 0.0,
+            PipelineState::Stopped => 0.0,
         };
 
         // Capture/consumer are gone; mark Stopped even if finalize fails so
@@ -305,79 +306,11 @@ mod tests {
     use std::sync::{Arc, Mutex};
     use std::time::Instant;
 
-    use koe_ffi::{
-        AppInfo, NativeProvider, OutputFormat, Permission, PermissionStatus, RecordingState,
-        TranscriptFormat, TranscriptionSegment, register_native_provider,
-    };
+    use koe_ffi::{OutputFormat, RecordingState, TranscriptionSegment};
 
     use super::*;
     use crate::codec::{AudioEncoder, CodecError};
-    use crate::pipeline::{NullMonitor, PipelineConfig, PipelineState};
-
-    struct TestProvider {
-        permissions: Vec<(Permission, PermissionStatus)>,
-    }
-
-    impl NativeProvider for TestProvider {
-        fn check_permission(
-            &self,
-            permission: Permission,
-        ) -> PermissionStatus {
-            self.permissions
-                .iter()
-                .find(|(perm, _)| *perm == permission)
-                .map_or(PermissionStatus::NotDetermined, |(_, status)| *status)
-        }
-
-        fn request_permission(
-            &self,
-            permission: Permission,
-        ) -> PermissionStatus {
-            self.check_permission(permission)
-        }
-
-        fn enumerate_apps(&self) -> Vec<AppInfo> {
-            Vec::new()
-        }
-    }
-
-    fn install_provider() {
-        koe_ffi::set_capture_stub(true);
-        koe_ffi::set_transcription_stub(true);
-        register_native_provider(Box::new(TestProvider {
-            permissions: vec![(Permission::Microphone, PermissionStatus::Authorized)],
-        }));
-    }
-
-    fn unique_path(label: &str) -> std::path::PathBuf {
-        std::env::temp_dir().join(format!(
-            "koe-shutdown-{label}-{}-{}.wav",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .expect("clock")
-                .as_nanos()
-        ))
-    }
-
-    fn test_config(output: &Path) -> PipelineConfig {
-        PipelineConfig {
-            source: koe_ffi::AudioSourceConfig::Microphone,
-            output_path: output.to_path_buf(),
-            transcript_output_path: None,
-            locale: "en-US".into(),
-            speech_engine: koe_ffi::SpeechEngine::Auto,
-            audio_format: OutputFormat::Wav {
-                bits_per_sample: 16,
-            },
-            transcript_format: TranscriptFormat::Txt,
-            enable_aec: false,
-            comfort_noise: false,
-            monitor: false,
-            transcribe: true,
-            estimated_duration_hours: None,
-        }
-    }
+    use crate::pipeline::test_support::{install_authorized_mic, test_config, unique_path};
 
     fn assert_valid_wav(path: &Path) {
         let bytes = std::fs::read(path).expect("read wav");
@@ -388,7 +321,7 @@ mod tests {
 
     #[tokio::test]
     async fn stop_immediately_is_clean() {
-        install_provider();
+        install_authorized_mic();
         let output = unique_path("immediate");
         let mut pipeline = RecordingPipeline::start(test_config(&output))
             .await
@@ -411,7 +344,7 @@ mod tests {
 
     #[tokio::test]
     async fn stop_with_monitor_enabled_is_clean() {
-        install_provider();
+        install_authorized_mic();
         let output = unique_path("monitor");
         let mut config = test_config(&output);
         config.monitor = true;
@@ -428,7 +361,7 @@ mod tests {
 
     #[tokio::test]
     async fn stop_after_audio_processes_all_frames() {
-        install_provider();
+        install_authorized_mic();
         let output = unique_path("drain");
         let mut pipeline = RecordingPipeline::start(test_config(&output))
             .await
@@ -464,7 +397,7 @@ mod tests {
 
     #[tokio::test]
     async fn force_stop_does_not_corrupt_wav() {
-        install_provider();
+        install_authorized_mic();
         let output = unique_path("force");
         let mut pipeline = RecordingPipeline::start(test_config(&output))
             .await
@@ -486,7 +419,7 @@ mod tests {
 
     #[tokio::test]
     async fn pause_then_stop_keeps_pre_pause_segments() {
-        install_provider();
+        install_authorized_mic();
         let output = unique_path("pause-stop");
         let transcript = output.with_extension("txt");
         let mut config = test_config(&output);
@@ -524,7 +457,7 @@ mod tests {
 
     #[tokio::test]
     async fn double_stop_is_rejected() {
-        install_provider();
+        install_authorized_mic();
         let output = unique_path("double");
         let mut pipeline = RecordingPipeline::start(test_config(&output))
             .await
@@ -537,7 +470,7 @@ mod tests {
 
     #[tokio::test]
     async fn stop_emits_stopping_then_stopped() {
-        install_provider();
+        install_authorized_mic();
         let output = unique_path("status");
         let mut pipeline = RecordingPipeline::start(test_config(&output))
             .await
@@ -583,18 +516,6 @@ mod tests {
         fn finalize(&mut self) -> Result<Vec<u8>, CodecError> {
             Ok(b"TRAILER".to_vec())
         }
-
-        fn format(&self) -> OutputFormat {
-            OutputFormat::Ogg { quality: 0.5 }
-        }
-
-        fn sample_rate(&self) -> u32 {
-            48_000
-        }
-
-        fn channel_count(&self) -> u16 {
-            2
-        }
     }
 
     #[tokio::test]
@@ -604,10 +525,11 @@ mod tests {
 
         use tokio::sync::{Mutex as AsyncMutex, broadcast};
 
+        use crate::pipeline::RecordingStatus;
+        use crate::pipeline::chunk::AudioChunk;
         use crate::pipeline::consumer::{ConsumerContext, SpeechFeeder, spawn_consumer};
         use crate::pipeline::file_writer::FileWriter;
         use crate::pipeline::metrics::PipelineMetrics;
-        use crate::pipeline::{AudioChunk, RecordingStatus};
 
         struct NoopSpeech;
         impl SpeechFeeder for NoopSpeech {
@@ -634,7 +556,7 @@ mod tests {
         let (tx, rx) = broadcast::channel(64);
         let ctx = ConsumerContext {
             encoder: Arc::clone(&encoder),
-            speech: Arc::new(NoopSpeech),
+            speech: Some(Arc::new(NoopSpeech)),
             writer: Arc::clone(&writer),
             metrics: PipelineMetrics::new(),
             shutdown: Arc::clone(&shutdown),
@@ -642,7 +564,7 @@ mod tests {
             progress_tx,
             started_at: Arc::new(Mutex::new(StdInstant::now())),
             bytes_written: Arc::new(AtomicU64::new(0)),
-            monitor: Arc::new(NullMonitor),
+            monitor: None,
         };
         let task = spawn_consumer(rx, ctx);
 
