@@ -145,7 +145,12 @@ fn run_transcription(prepared: &Prepared) -> Result<(), MainError> {
     let errors = Arc::clone(&collector.errors);
 
     let handle = start_transcription(prepared.locale.clone(), Box::new(collector))
-        .map_err(|err| MainError::Internal(format!("start transcription: {err}")))?;
+        .map_err(|err| match err {
+            koe_core::TranscriptionError::PermissionDenied { .. } => {
+                MainError::PermissionDenied(err.to_string())
+            },
+            other => MainError::Internal(format!("start transcription: {other}")),
+        })?;
 
     let started = Instant::now();
     let total_ms = info.window_duration_ms.max(1);
