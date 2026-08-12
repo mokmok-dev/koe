@@ -177,7 +177,7 @@ mod tests {
         let mut far = Vec::with_capacity(frames * 2);
         let mut near = Vec::with_capacity(frames * 2);
         for i in 0..frames {
-            let s = (i as f32 * 0.01).sin() * 0.4;
+            let s = (f32::from(u16::try_from(i).unwrap_or(u16::MAX)) * 0.01).sin() * 0.4;
             far.push(s);
             far.push(s * 0.8);
             near.push(s * 0.5);
