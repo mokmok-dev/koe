@@ -22,18 +22,23 @@ pub fn prepare_apps(
     apps
 }
 
-/// Active-audio apps first, then name (case-insensitive), then PID.
+/// Active-audio apps first, then name (ASCII case-insensitive), then PID.
 fn sort_apps(apps: &mut [AppInfo]) {
     apps.sort_by(|a, b| {
         b.has_audio
             .cmp(&a.has_audio)
-            .then_with(|| {
-                a.name
-                    .to_ascii_lowercase()
-                    .cmp(&b.name.to_ascii_lowercase())
-            })
+            .then_with(|| cmp_ascii_ignore_case(&a.name, &b.name))
             .then_with(|| a.pid.cmp(&b.pid))
     });
+}
+
+fn cmp_ascii_ignore_case(
+    left: &str,
+    right: &str,
+) -> std::cmp::Ordering {
+    left.chars()
+        .map(|c| c.to_ascii_lowercase())
+        .cmp(right.chars().map(|c| c.to_ascii_lowercase()))
 }
 
 pub fn format_apps_table(apps: &[AppInfo]) -> String {
@@ -146,6 +151,27 @@ mod tests {
         let prepared = prepare_apps(sample_apps(), false);
         let names: Vec<&str> = prepared.iter().map(|a| a.name.as_str()).collect();
         assert_eq!(names, ["Google Chrome", "Spotify", "Finder", "Helper"]);
+    }
+
+    #[test]
+    fn sort_is_ascii_case_insensitive_on_name() {
+        let apps = vec![
+            AppInfo {
+                pid: 2,
+                name: "beta".into(),
+                bundle_id: None,
+                has_audio: true,
+            },
+            AppInfo {
+                pid: 1,
+                name: "Alpha".into(),
+                bundle_id: None,
+                has_audio: true,
+            },
+        ];
+        let prepared = prepare_apps(apps, false);
+        assert_eq!(prepared[0].name, "Alpha");
+        assert_eq!(prepared[1].name, "beta");
     }
 
     #[test]
