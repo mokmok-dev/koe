@@ -20,6 +20,8 @@ pub enum TranscriptionError {
     UnsupportedLocale { locale: String },
     #[error("Analyzer not available on this OS version")]
     NotAvailable,
+    #[error("Permission denied: {msg}")]
+    PermissionDenied { msg: String },
     #[error("Transcription internal error: {msg}")]
     Internal { msg: String },
 }
@@ -150,6 +152,13 @@ mod tests {
         assert_eq!(
             TranscriptionError::NotAvailable.to_string(),
             "Analyzer not available on this OS version"
+        );
+        assert_eq!(
+            TranscriptionError::PermissionDenied {
+                msg: "speech".into()
+            }
+            .to_string(),
+            "Permission denied: speech"
         );
         assert_eq!(
             TranscriptionError::Internal { msg: "asr".into() }.to_string(),

@@ -1,6 +1,7 @@
 //! Exported FFI entry points.
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::callbacks::{AudioCallbackRef, ProgressCallbackRef, TranscriptionCallbackRef};
 use crate::error::{
@@ -96,14 +97,55 @@ pub fn stop_monitor(handle: Arc<MonitorHandle>) {
     let _ = handle.id;
 }
 
-#[allow(clippy::missing_errors_doc)]
+/// When true, [`start_transcription`] returns a handle without a native speech
+/// session (test / CI harness only — mirrors [`crate::set_capture_stub`]).
+static STUB_TRANSCRIPTION: AtomicBool = AtomicBool::new(false);
+
+/// Enables or disables no-op transcription for tests that only need lifecycle.
+///
+/// Not part of the supported public API — test / CI harness only.
+#[doc(hidden)]
+pub fn set_transcription_stub(enabled: bool) {
+    STUB_TRANSCRIPTION.store(enabled, Ordering::SeqCst);
+}
+
+fn transcription_stubbed() -> bool {
+    STUB_TRANSCRIPTION.load(Ordering::SeqCst)
+}
+
+#[cfg(target_os = "macos")]
+#[allow(clippy::needless_pass_by_value)]
+fn start_transcription_native(
+    handle: &Arc<TranscriptionHandle>,
+    locale: &str,
+) -> Result<(), TranscriptionError> {
+    if transcription_stubbed() {
+        return Ok(());
+    }
+    let session = crate::speech_session::SpeechSession::start(handle, locale)?;
+    if session.engine() == crate::speech_session::Engine::Network {
+        eprintln!(
+            "warning: on-device speech recognition is unavailable (Siri & Dictation \
+             disabled); falling back to network recognition — audio is sent to Apple's servers"
+        );
+    }
+    handle.attach_session(session);
+    Ok(())
+}
+
+#[allow(clippy::missing_errors_doc, clippy::needless_pass_by_value)]
 #[uniffi::export]
 pub fn start_transcription(
     locale: String,
     callback: TranscriptionCallbackRef,
 ) -> Result<Arc<TranscriptionHandle>, TranscriptionError> {
     validate_locale(&locale)?;
-    Ok(Arc::new(TranscriptionHandle::new(locale, callback)))
+    let handle = Arc::new(TranscriptionHandle::new(locale.clone(), callback));
+    #[cfg(target_os = "macos")]
+    {
+        start_transcription_native(&handle, &locale)?;
+    }
+    Ok(handle)
 }
 
 #[allow(clippy::needless_pass_by_value)]
@@ -112,13 +154,41 @@ pub fn feed_transcription_audio(
     handle: Arc<TranscriptionHandle>,
     pcm: Vec<f32>,
 ) {
-    let _ = (&handle.locale, &handle.callback, handle.id, pcm);
+    #[cfg(target_os = "macos")]
+    {
+        handle.with_session(|session| {
+            if let Some(session) = session {
+                session.feed(&pcm);
+            }
+        });
+    }
+    #[cfg(not(target_os = "macos"))]
+    drop((handle, pcm));
 }
 
 #[allow(clippy::needless_pass_by_value)]
 #[uniffi::export]
 pub fn finalize_transcription(handle: Arc<TranscriptionHandle>) {
-    let _ = (&handle.locale, &handle.callback, handle.id);
+    #[cfg(target_os = "macos")]
+    {
+        // Take the completion receiver and release the session lock before
+        // waiting: feeding may still be in flight from a capture thread.
+        let receiver = handle.with_session(|mut session| {
+            session
+                .as_mut()
+                .and_then(|session_ref| session_ref.start_finalize())
+        });
+        let Some(receiver) = receiver else {
+            // No active session (already finalized or never started).
+            eprintln!("warning: transcription session not active at finalize");
+            return;
+        };
+        if let Err(err) = crate::speech_session::wait_for_finalize(&receiver) {
+            eprintln!("warning: transcription finalize failed: {err}");
+        }
+    }
+    #[cfg(not(target_os = "macos"))]
+    drop(handle);
 }
 
 #[allow(clippy::too_many_arguments, clippy::missing_errors_doc)]

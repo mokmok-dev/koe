@@ -13,12 +13,14 @@ mod macos_capture;
 mod macos_discovery;
 #[cfg(target_os = "macos")]
 mod macos_system;
+#[cfg(target_os = "macos")]
+mod speech_session;
 
 pub use api::{
     check_permission, enumerate_apps, feed_monitor, feed_transcription_audio,
-    finalize_transcription, pause_recording, request_permission, resume_recording, start_capture,
-    start_monitor, start_recording, start_transcription, stop_capture, stop_monitor,
-    stop_recording,
+    finalize_transcription, pause_recording, request_permission, resume_recording,
+    set_transcription_stub, start_capture, start_monitor, start_recording, start_transcription,
+    stop_capture, stop_monitor, stop_recording,
 };
 pub use callbacks::{
     AudioCallback, AudioCallbackRef, ProgressCallback, ProgressCallbackRef, TranscriptionCallback,
@@ -49,6 +51,10 @@ pub use macos_system::{default_input_device, default_output_device, supported_sp
 pub const fn install_default_native_provider() -> bool {
     false
 }
+
+/// Transcription stub toggle (no-op off macOS).
+#[cfg(not(target_os = "macos"))]
+pub const fn set_transcription_stub(_enabled: bool) {}
 
 /// Capture stub toggle (no-op off macOS).
 #[cfg(not(target_os = "macos"))]
