@@ -522,7 +522,10 @@ mod tests {
             }),
             "[SYS]"
         );
-        assert_eq!(source_tag(&AudioSourceConfig::PidAudio { pid: 42 }), "[SYS]");
+        assert_eq!(
+            source_tag(&AudioSourceConfig::PidAudio { pid: 42 }),
+            "[SYS]"
+        );
         assert_eq!(
             source_tag(&AudioSourceConfig::Both {
                 bundle_id: "com.example.app".into()

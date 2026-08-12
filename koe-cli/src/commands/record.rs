@@ -492,7 +492,7 @@ async fn run_until_shutdown_trigger(
 
     let mut signals = SignalListener::install().map_err(MainError::Internal)?;
 
-    let stop_reason = wait_until_done(
+    let (stop_reason, segments) = wait_until_done(
         &mut pipeline,
         &mut signals,
         ProgressFeeds { progress, segments },
@@ -510,14 +510,18 @@ async fn run_until_shutdown_trigger(
         stop_reason,
         renderer,
         signals,
+        segments,
     })
 }
+
+type SegmentReceiver = tokio::sync::broadcast::Receiver<koe_core::TranscriptionSegment>;
 
 struct PendingShutdown {
     pipeline: RecordingPipeline,
     stop_reason: StopReason,
     renderer: Box<dyn ProgressRenderer>,
     signals: SignalListener,
+    segments: SegmentReceiver,
 }
 
 async fn finalize_recording(mut pending: PendingShutdown) -> Result<(), MainError> {
@@ -532,12 +536,31 @@ async fn finalize_recording(mut pending: PendingShutdown) -> Result<(), MainErro
         _ => pending.pipeline.stop().await.map_err(map_pipeline_error)?,
     };
 
+    render_pending_segments(&mut pending.segments, pending.renderer.as_mut());
     pending.renderer.finish(&summary);
 
     if matches!(pending.stop_reason, StopReason::Interrupted { .. }) {
         return Err(MainError::Interrupted);
     }
     Ok(())
+}
+
+/// Renders segment events queued while the pipeline was finalizing — notably
+/// final ASR results emitted by `pipeline.stop()` after the wait loop returned.
+fn render_pending_segments(
+    segments: &mut SegmentReceiver,
+    renderer: &mut dyn ProgressRenderer,
+) {
+    loop {
+        match segments.try_recv() {
+            Ok(segment) => renderer.render_segment(&segment),
+            Err(tokio::sync::broadcast::error::TryRecvError::Lagged(_)) => {},
+            Err(
+                tokio::sync::broadcast::error::TryRecvError::Empty
+                | tokio::sync::broadcast::error::TryRecvError::Closed,
+            ) => break,
+        }
+    }
 }
 
 /// Stop after SIGINT/SIGTERM: prefer `force_stop` when the wait loop already
@@ -569,7 +592,7 @@ async fn second_interrupt_pending(signals: &mut SignalListener) -> bool {
 
 struct ProgressFeeds {
     progress: tokio::sync::broadcast::Receiver<koe_core::RecordingStatus>,
-    segments: tokio::sync::broadcast::Receiver<koe_core::TranscriptionSegment>,
+    segments: SegmentReceiver,
 }
 
 struct WaitLimits {
@@ -584,7 +607,7 @@ async fn wait_until_done(
     feeds: ProgressFeeds,
     renderer: &mut dyn ProgressRenderer,
     limits: WaitLimits,
-) -> Result<StopReason, MainError> {
+) -> Result<(StopReason, SegmentReceiver), MainError> {
     let ProgressFeeds {
         mut progress,
         mut segments,
@@ -610,15 +633,15 @@ async fn wait_until_done(
         tokio::select! {
             event = signals.recv() => {
                 if let Some(reason) = handle_signal_event(event, pipeline, renderer) {
-                    return Ok(reason);
+                    return Ok((reason, segments));
                 }
             }
             () = tokio::time::sleep(sleep_for), if sleep_armed => {
                 if deadline.is_some_and(|at| Instant::now() >= at) {
-                    return Ok(StopReason::DurationLimit);
+                    return Ok((StopReason::DurationLimit, segments));
                 }
                 if silence_timeout.is_some_and(|t| last_sound.elapsed() >= t) {
-                    return Ok(StopReason::SilenceTimeout);
+                    return Ok((StopReason::SilenceTimeout, segments));
                 }
             }
             status = progress.recv() => {
@@ -631,20 +654,20 @@ async fn wait_until_done(
                             last_painted_state = Some(status.state);
                         }
                         if max_bytes.is_some_and(|limit| status.bytes_written >= limit) {
-                            return Ok(StopReason::MaxSize);
+                            return Ok((StopReason::MaxSize, segments));
                         }
                         if silence_timeout.is_some() {
                             let peak = status.level_left.max(status.level_right);
                             if peak >= SILENCE_PEAK_THRESHOLD {
                                 last_sound = Instant::now();
                             } else if silence_timeout.is_some_and(|t| last_sound.elapsed() >= t) {
-                                return Ok(StopReason::SilenceTimeout);
+                                return Ok((StopReason::SilenceTimeout, segments));
                             }
                         }
                     }
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
                     Err(tokio::sync::broadcast::error::RecvError::Closed) => {
-                        return Ok(StopReason::DurationLimit);
+                        return Ok((StopReason::DurationLimit, segments));
                     }
                 }
             }
@@ -940,5 +963,78 @@ enabled = true
             prepared.config.transcript_output_path.as_deref(),
             Some(Path::new("/tmp/koe-recs/notes.srt"))
         );
+    }
+
+    #[derive(Default)]
+    struct RecordingRenderer {
+        segments: Vec<(String, bool)>,
+    }
+
+    impl ProgressRenderer for RecordingRenderer {
+        fn render_status(
+            &mut self,
+            _status: &koe_core::RecordingStatus,
+        ) {
+        }
+
+        fn render_segment(
+            &mut self,
+            segment: &koe_core::TranscriptionSegment,
+        ) {
+            self.segments.push((segment.text.clone(), segment.is_final));
+        }
+
+        fn finish(
+            &mut self,
+            _summary: &koe_core::RecordingSummary,
+        ) {
+        }
+    }
+
+    fn segment(
+        text: &str,
+        is_final: bool,
+    ) -> koe_core::TranscriptionSegment {
+        koe_core::TranscriptionSegment {
+            text: text.to_owned(),
+            start_ms: 0,
+            end_ms: 0,
+            is_final,
+            confidence: 1.0,
+        }
+    }
+
+    #[test]
+    fn render_pending_segments_drains_finals_produced_during_stop() {
+        let (tx, rx) = tokio::sync::broadcast::channel(8);
+        let mut rx = rx;
+        // Simulate the finalize path: the analyzer emits its last final result
+        // after the wait loop has already returned.
+        tx.send(segment("first final", true)).expect("send");
+        tx.send(segment("last final", true)).expect("send");
+        drop(tx);
+
+        let mut renderer = RecordingRenderer::default();
+        render_pending_segments(&mut rx, &mut renderer);
+
+        assert_eq!(
+            renderer.segments,
+            vec![
+                ("first final".to_owned(), true),
+                ("last final".to_owned(), true),
+            ]
+        );
+    }
+
+    #[test]
+    fn render_pending_segments_is_noop_when_empty() {
+        let (tx, rx) = tokio::sync::broadcast::channel(8);
+        let mut rx = rx;
+        drop(tx);
+
+        let mut renderer = RecordingRenderer::default();
+        render_pending_segments(&mut rx, &mut renderer);
+
+        assert!(renderer.segments.is_empty());
     }
 }
