@@ -9,7 +9,7 @@ pub use aec::{AcousticEchoCanceller, AecConfig};
 pub use pipeline::{
     AudioChunk, FileWriter, PipelineConfig, PipelineError, PipelineMetrics,
     PipelineMetricsSnapshot, PipelineState, RecordingPipeline, RecordingState, RecordingStatus,
-    available_disk_space,
+    SHUTDOWN_BUDGET, ShutdownMode, available_disk_space,
 };
 
 /// Error returned by [`available_disk_space`] and recording setup.
