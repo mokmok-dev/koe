@@ -6,6 +6,7 @@ mod disk_check;
 mod error;
 mod file_writer;
 mod metrics;
+mod mixer;
 mod monitor;
 mod shutdown;
 
@@ -19,10 +20,9 @@ use koe_ffi::{
     TranscriptFormat, TranscriptionCallback, TranscriptionSegment, check_permission, start_capture,
     start_transcription, validate_capture_source, validate_locale, validate_output_path,
 };
-use tokio::sync::{Mutex as AsyncMutex, broadcast};
+use tokio::sync::{Mutex as AsyncMutex, broadcast, mpsc};
 use tokio::task::JoinHandle;
 
-use crate::aec::{AcousticEchoCanceller, AecConfig};
 use crate::codec::{AudioEncoder, OggComments, create_encoder};
 use crate::transcript::{TranscriptFormatter, TranscriptMeta, create_formatter};
 
@@ -105,18 +105,11 @@ pub enum PipelineState {
 pub struct RecordingPipeline {
     config: PipelineConfig,
     state: PipelineState,
-    /// Reserved until dual-stream (far/near) capture is wired into the consumer.
-    /// Constructed for `Both` + `enable_aec` so the pipeline is ready; audio is
-    /// not processed through it yet.
-    #[expect(
-        dead_code,
-        reason = "AEC audio path needs separate far/near FFI streams"
-    )]
-    aec: Option<AcousticEchoCanceller>,
     encoder: Arc<Mutex<Box<dyn AudioEncoder>>>,
     transcript_fmt: Arc<Mutex<Box<dyn TranscriptFormatter>>>,
     file_writer: Arc<AsyncMutex<FileWriter>>,
-    capture_handle: Option<Arc<koe_ffi::CaptureHandle>>,
+    capture_handles: Vec<Arc<koe_ffi::CaptureHandle>>,
+    mixer_task: Option<JoinHandle<()>>,
     transcription_handle: Option<Arc<koe_ffi::TranscriptionHandle>>,
     consumer_task: Option<JoinHandle<Result<(), PipelineError>>>,
     shutdown: Arc<AtomicBool>,
@@ -150,6 +143,85 @@ impl AudioCallback for PipelineAudioCallback {
         if self.tx.send(AudioChunk::new(pcm, timestamp_ms)).is_err() {
             self.drop_counter.fetch_add(1, Ordering::Relaxed);
         }
+    }
+}
+
+struct SideAudioCallback {
+    tx: mpsc::Sender<AudioChunk>,
+    paused: Arc<AtomicBool>,
+    drop_counter: Arc<std::sync::atomic::AtomicU64>,
+}
+
+impl AudioCallback for SideAudioCallback {
+    fn on_audio(
+        &self,
+        pcm: Vec<f32>,
+        timestamp_ms: u64,
+    ) {
+        if self.paused.load(Ordering::Relaxed) {
+            return;
+        }
+        if self
+            .tx
+            .try_send(AudioChunk::new(pcm, timestamp_ms))
+            .is_err()
+        {
+            self.drop_counter.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+}
+
+#[allow(clippy::type_complexity)]
+fn start_captures(
+    config: &PipelineConfig,
+    audio_tx: broadcast::Sender<AudioChunk>,
+    paused: Arc<AtomicBool>,
+    drop_counter: Arc<std::sync::atomic::AtomicU64>,
+    shutdown: Arc<AtomicBool>,
+) -> Result<(Vec<Arc<koe_ffi::CaptureHandle>>, Option<JoinHandle<()>>), PipelineError> {
+    match &config.source {
+        AudioSourceConfig::Both { bundle_id } => {
+            let (far_tx, far_rx) = mpsc::channel(1024);
+            let (near_tx, near_rx) = mpsc::channel(1024);
+            let system = start_capture(
+                AudioSourceConfig::AppAudio {
+                    bundle_id: bundle_id.clone(),
+                },
+                Box::new(SideAudioCallback {
+                    tx: far_tx,
+                    paused: Arc::clone(&paused),
+                    drop_counter: Arc::clone(&drop_counter),
+                }),
+            )?;
+            let mic = start_capture(
+                AudioSourceConfig::Microphone,
+                Box::new(SideAudioCallback {
+                    tx: near_tx,
+                    paused,
+                    drop_counter,
+                }),
+            )?;
+            let mixer = mixer::spawn_both_mixer(
+                far_rx,
+                near_rx,
+                audio_tx,
+                config.enable_aec,
+                config.comfort_noise,
+                shutdown,
+            );
+            Ok((vec![system, mic], Some(mixer)))
+        },
+        source => {
+            let handle = start_capture(
+                source.clone(),
+                Box::new(PipelineAudioCallback {
+                    tx: audio_tx,
+                    paused,
+                    drop_counter,
+                }),
+            )?;
+            Ok((vec![handle], None))
+        },
     }
 }
 
@@ -214,36 +286,31 @@ impl RecordingPipeline {
 
         let comments = OggComments::for_session(&config.source, &config.locale);
         let encoder = create_encoder(&audio_format, Some(&comments))?;
-        let file_writer = FileWriter::create(&config.output_path).await?;
-        let transcript_meta = TranscriptMeta::for_session(&config.source, &config.locale);
-        let transcript_fmt = create_formatter(config.transcript_format, &transcript_meta);
 
+        // Start capture before any `.await` so ScreenCaptureKit / CoreGraphics
+        // run on the runtime's initial (CLI main) thread.
         let shutdown = Arc::new(AtomicBool::new(false));
         let paused = Arc::new(AtomicBool::new(false));
         let drop_counter = Arc::new(std::sync::atomic::AtomicU64::new(0));
         let metrics = PipelineMetrics::new();
         let segments = Arc::new(Mutex::new(Vec::new()));
+        let transcript_meta = TranscriptMeta::for_session(&config.source, &config.locale);
+        let transcript_fmt = create_formatter(config.transcript_format, &transcript_meta);
         let transcript = Arc::new(Mutex::new(transcript_fmt));
 
         let (transcription_handle, speech) =
             open_transcription(&config, &segments, &transcript, &metrics)?;
 
         let (audio_tx, _audio_rx) = broadcast::channel(64);
-        let audio_callback = PipelineAudioCallback {
-            tx: audio_tx.clone(),
-            paused: Arc::clone(&paused),
-            drop_counter: Arc::clone(&drop_counter),
-        };
-        let capture_handle = start_capture(config.source.clone(), Box::new(audio_callback))?;
+        let (capture_handles, mixer_task) = start_captures(
+            &config,
+            audio_tx.clone(),
+            Arc::clone(&paused),
+            Arc::clone(&drop_counter),
+            Arc::clone(&shutdown),
+        )?;
 
-        let aec = if matches!(config.source, AudioSourceConfig::Both { .. }) && config.enable_aec {
-            Some(AcousticEchoCanceller::new(AecConfig {
-                comfort_noise: config.comfort_noise,
-                ..AecConfig::default()
-            }))
-        } else {
-            None
-        };
+        let file_writer = FileWriter::create(&config.output_path).await?;
 
         let encoder = Arc::new(Mutex::new(encoder));
         let file_writer = Arc::new(AsyncMutex::new(file_writer));
@@ -277,11 +344,11 @@ impl RecordingPipeline {
                 bytes_written: 0,
                 segments: Vec::new(),
             },
-            aec,
             encoder,
             transcript_fmt: transcript,
             file_writer,
-            capture_handle: Some(capture_handle),
+            capture_handles,
+            mixer_task,
             transcription_handle,
             consumer_task: Some(consumer_task),
             shutdown,
@@ -362,10 +429,10 @@ impl RecordingPipeline {
         self.metrics.snapshot()
     }
 
-    /// Capture handle for test injection of PCM frames.
+    /// Returns the primary capture handle when a session is active.
     #[must_use]
-    pub const fn capture_handle(&self) -> Option<&Arc<koe_ffi::CaptureHandle>> {
-        self.capture_handle.as_ref()
+    pub fn capture_handle(&self) -> Option<&Arc<koe_ffi::CaptureHandle>> {
+        self.capture_handles.first()
     }
 
     /// Transcription handle for test injection of segments.
@@ -525,6 +592,7 @@ mod tests {
     }
 
     fn install_provider(permissions: Vec<(Permission, PermissionStatus)>) {
+        koe_ffi::set_capture_stub(true);
         register_native_provider(Box::new(TestProvider { permissions }));
     }
 

@@ -1,9 +1,13 @@
 //! Opaque session handles exported across the FFI boundary.
 
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::callbacks::{AudioCallbackRef, ProgressCallbackRef, TranscriptionCallbackRef};
 use crate::types::{AudioSourceConfig, RecordingStatus, TranscriptionSegment};
+
+#[cfg(target_os = "macos")]
+use crate::macos_capture::CaptureSession;
 
 static NEXT_HANDLE_ID: AtomicU64 = AtomicU64::new(1);
 
@@ -14,9 +18,13 @@ fn next_handle_id() -> u64 {
 /// Active audio capture session.
 #[derive(uniffi::Object)]
 pub struct CaptureHandle {
+    #[expect(dead_code)]
     pub(crate) id: u64,
+    #[expect(dead_code)]
     pub(crate) source: AudioSourceConfig,
     pub(crate) callback: AudioCallbackRef,
+    #[cfg(target_os = "macos")]
+    session: Mutex<Option<Box<dyn CaptureSession>>>,
 }
 
 impl CaptureHandle {
@@ -28,7 +36,40 @@ impl CaptureHandle {
             id: next_handle_id(),
             source,
             callback,
+            #[cfg(target_os = "macos")]
+            session: Mutex::new(None),
         }
+    }
+
+    #[cfg(target_os = "macos")]
+    pub(crate) fn attach_session(
+        &self,
+        session: Box<dyn CaptureSession>,
+    ) {
+        let mut guard = self
+            .session
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *guard = Some(session);
+    }
+
+    pub(crate) fn stop_session(&self) {
+        #[cfg(target_os = "macos")]
+        {
+            let mut guard = self
+                .session
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if let Some(mut session) = guard.take() {
+                session.stop();
+            }
+        }
+    }
+}
+
+impl Drop for CaptureHandle {
+    fn drop(&mut self) {
+        self.stop_session();
     }
 }
 
