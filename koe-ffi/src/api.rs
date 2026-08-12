@@ -54,9 +54,9 @@ pub fn start_capture(
     }
     #[cfg(target_os = "macos")]
     {
-        let handle = Arc::new(CaptureHandle::new(source.clone(), callback));
+        let handle = Arc::new(CaptureHandle::new(source, callback));
         if !capture_stubbed() {
-            let session = crate::macos_capture::start_session(&source, Arc::clone(&handle))?;
+            let session = crate::macos_capture::start_session(Arc::clone(&handle))?;
             handle.attach_session(session);
         }
         Ok(handle)
@@ -140,13 +140,12 @@ fn transcription_stubbed() -> bool {
 #[allow(clippy::needless_pass_by_value)]
 fn start_transcription_native(
     handle: &Arc<TranscriptionHandle>,
-    locale: &str,
     engine: SpeechEngine,
 ) -> Result<(), TranscriptionError> {
     if transcription_stubbed() {
         return Ok(());
     }
-    let session = crate::speech_session::SpeechSession::start(handle, locale, engine)?;
+    let session = crate::speech_session::SpeechSession::start(handle, &handle.locale, engine)?;
     if engine == SpeechEngine::Auto && session.engine() == crate::speech_session::Engine::Network {
         eprintln!(
             "warning: on-device speech recognition is unavailable (Siri & Dictation \
@@ -165,12 +164,10 @@ pub fn start_transcription(
     callback: TranscriptionCallbackRef,
 ) -> Result<Arc<TranscriptionHandle>, TranscriptionError> {
     validate_locale(&locale)?;
-    #[cfg(target_os = "macos")]
-    let native_locale = locale.clone();
     let handle = Arc::new(TranscriptionHandle::new(locale, callback));
     #[cfg(target_os = "macos")]
     {
-        start_transcription_native(&handle, &native_locale, engine)?;
+        start_transcription_native(&handle, engine)?;
     }
     #[cfg(not(target_os = "macos"))]
     let _ = engine;

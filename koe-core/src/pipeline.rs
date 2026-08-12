@@ -410,12 +410,6 @@ impl RecordingPipeline {
         self.state
     }
 
-    /// Active configuration.
-    #[must_use]
-    pub const fn config(&self) -> &PipelineConfig {
-        &self.config
-    }
-
     /// Runtime metrics snapshot.
     #[must_use]
     pub fn metrics(&self) -> PipelineMetricsSnapshot {
