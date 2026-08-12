@@ -177,7 +177,7 @@ impl ProgressRenderer for TtyRenderer {
         if segment.is_final {
             // Commit the segment as a permanent line above the live block.
             self.clear_live();
-            eprintln!("[{}] \"{text}\"", format_hms(millis_u64(segment.start_ms)),);
+            eprintln!("[{}] \"{text}\"", format_hms(millis_u64(segment.start_ms)));
             self.partial_line = None;
             if !self.status_line.is_empty() {
                 self.paint();
