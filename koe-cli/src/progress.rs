@@ -22,6 +22,8 @@ pub struct ProgressMeta {
     pub format_label: String,
     /// e.g. `App: Google Chrome (PID 4201)` or `Mic`
     pub source_label: String,
+    /// `[SYS]` / `[MIC]` / `[SYS+MIC]` prefix pinned on live transcript lines.
+    pub source_tag: &'static str,
     /// Encoded audio output path (shown in the finish summary).
     pub output_path: PathBuf,
     /// Transcript path when transcription is enabled.
@@ -40,6 +42,7 @@ impl ProgressMeta {
         Self {
             format_label: format_label(audio_format),
             source_label: source_label(source),
+            source_tag: source_tag(source),
             output_path,
             transcript_path,
         }
@@ -181,11 +184,17 @@ impl ProgressRenderer for TtyRenderer {
         &mut self,
         segment: &TranscriptionSegment,
     ) {
-        let text = truncate_display(&segment.text, SEGMENT_TEXT_DISPLAY_CHARS);
+        let max_chars = if segment.is_final {
+            usize::MAX
+        } else {
+            SEGMENT_TEXT_DISPLAY_CHARS
+        };
+        let text = truncate_display(&segment.text, max_chars);
+        let line = format_segment_line(self.meta.source_tag, segment.start_ms, &text);
         if segment.is_final {
             // Commit the segment as a permanent line above the live block.
             self.clear_live();
-            eprintln!("[{}] \"{text}\"", format_hms(millis_u64(segment.start_ms)));
+            eprintln!("{line}");
             self.partial_line = None;
             if !self.status_line.is_empty() {
                 self.paint();
@@ -193,10 +202,7 @@ impl ProgressRenderer for TtyRenderer {
             return;
         }
 
-        self.partial_line = Some(format!(
-            "[{}] \"{text}\" (partial)",
-            format_hms(millis_u64(segment.start_ms)),
-        ));
+        self.partial_line = Some(line);
         self.paint();
     }
 
@@ -317,6 +323,29 @@ fn format_label(format: &OutputFormat) -> String {
     format!("{name} 48kHz stereo")
 }
 
+/// Tag pinning the capture source on live transcript lines: system audio is
+/// `[SYS]`, the microphone is `[MIC]`, and the mixed (AEC) stream — which
+/// cannot be attributed per utterance — is `[SYS+MIC]`.
+const fn source_tag(source: &AudioSourceConfig) -> &'static str {
+    match source {
+        AudioSourceConfig::Microphone => "[MIC]",
+        AudioSourceConfig::AppAudio { .. } | AudioSourceConfig::PidAudio { .. } => "[SYS]",
+        AudioSourceConfig::Both { .. } => "[SYS+MIC]",
+    }
+}
+
+/// Formats one live transcript line with its capture-source prefix.
+fn format_segment_line(
+    source_tag: &str,
+    start_ms: i64,
+    text: &str,
+) -> String {
+    format!(
+        "{source_tag} [{}] \"{text}\"",
+        format_hms(millis_u64(start_ms)),
+    )
+}
+
 fn source_label(source: &AudioSourceConfig) -> String {
     match source {
         AudioSourceConfig::Microphone => "Mic".to_owned(),
@@ -423,6 +452,7 @@ mod tests {
         ProgressMeta {
             format_label: "FLAC 48kHz stereo".into(),
             source_label: "Mic".into(),
+            source_tag: "[MIC]",
             output_path: PathBuf::from("out.flac"),
             transcript_path: Some(PathBuf::from("out.txt")),
         }
@@ -486,6 +516,35 @@ mod tests {
     #[test]
     fn source_label_mic() {
         assert_eq!(source_label(&AudioSourceConfig::Microphone), "Mic");
+    }
+
+    #[test]
+    fn source_tag_maps_capture_sources() {
+        assert_eq!(source_tag(&AudioSourceConfig::Microphone), "[MIC]");
+        assert_eq!(
+            source_tag(&AudioSourceConfig::AppAudio {
+                bundle_id: "com.example.app".into()
+            }),
+            "[SYS]"
+        );
+        assert_eq!(
+            source_tag(&AudioSourceConfig::PidAudio { pid: 42 }),
+            "[SYS]"
+        );
+        assert_eq!(
+            source_tag(&AudioSourceConfig::Both {
+                bundle_id: "com.example.app".into()
+            }),
+            "[SYS+MIC]"
+        );
+    }
+
+    #[test]
+    fn segment_line_includes_source_and_timestamp() {
+        assert_eq!(
+            format_segment_line("[MIC]", 154_000, "hello"),
+            "[MIC] [00:02:34] \"hello\""
+        );
     }
 
     #[test]

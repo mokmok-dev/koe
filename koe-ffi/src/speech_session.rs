@@ -34,10 +34,10 @@ use block2::RcBlock;
 use objc2::AnyThread;
 use objc2::rc::Retained;
 use objc2_avf_audio::{AVAudioCommonFormat, AVAudioFormat, AVAudioPCMBuffer};
-use objc2_foundation::{NSError, NSLocale, NSOperationQueue, NSString};
+use objc2_foundation::{NSArray, NSError, NSLocale, NSOperationQueue, NSString};
 use objc2_speech::{
     SFSpeechAudioBufferRecognitionRequest, SFSpeechRecognitionResult, SFSpeechRecognitionTask,
-    SFSpeechRecognizer, SFSpeechRecognizerAuthorizationStatus,
+    SFSpeechRecognizer, SFSpeechRecognizerAuthorizationStatus, SFTranscriptionSegment,
 };
 
 use crate::error::TranscriptionError;
@@ -510,30 +510,57 @@ fn deliver_result(
     // SAFETY: `bestTranscription` returns an owned transcription object; it
     // is valid while the result is retained.
     let best = unsafe { result.bestTranscription() };
-    // SAFETY: `segments` returns an owned array of segments.
+    // SAFETY: `formattedString` returns the whole recognized utterance. The
+    // per-word `segments` are still used below for timing/confidence only.
+    let text = unsafe { best.formattedString() }.to_string();
+    if text.is_empty() {
+        return;
+    }
+
+    // SAFETY: `segments` returns an owned array of word-level timing segments.
     let segments = unsafe { best.segments() };
+    let (start_ms, end_ms, confidence) = transcription_timing(&segments);
     // SAFETY: simple Boolean getter.
     let is_final = unsafe { result.isFinal() };
-    for segment in &segments {
-        // SAFETY: `substring` returns an owned NSString.
-        let text = unsafe { segment.substring() }.to_string();
+    handle.deliver_segment(TranscriptionSegment {
+        text,
+        start_ms,
+        end_ms,
+        is_final,
+        confidence,
+    });
+}
+
+fn transcription_timing(segments: &NSArray<SFTranscriptionSegment>) -> (i64, i64, f32) {
+    let mut start_ms: Option<i64> = None;
+    let mut end_ms = 0_i64;
+    let mut confidence_sum = 0.0_f32;
+    let mut count = 0_u32;
+
+    for segment in segments {
         // SAFETY: NSTimeInterval getters; values are finite doubles.
         let timestamp = unsafe { segment.timestamp() };
         let duration = unsafe { segment.duration() };
         let confidence = unsafe { segment.confidence() };
         // Rounding timestamps to whole ms; values stay well within i64 range.
         #[allow(clippy::cast_possible_truncation)]
-        let start_ms = (timestamp * 1_000.0).round() as i64;
+        let segment_start_ms = (timestamp * 1_000.0).round() as i64;
         #[allow(clippy::cast_possible_truncation)]
-        let end_ms = ((timestamp + duration) * 1_000.0).round() as i64;
-        handle.deliver_segment(TranscriptionSegment {
-            text,
-            start_ms,
-            end_ms,
-            is_final,
-            confidence,
-        });
+        let segment_end_ms = ((timestamp + duration) * 1_000.0).round() as i64;
+        start_ms = Some(start_ms.map_or(segment_start_ms, |start| start.min(segment_start_ms)));
+        end_ms = end_ms.max(segment_end_ms);
+        confidence_sum += confidence;
+        count = count.saturating_add(1);
     }
+
+    let start_ms = start_ms.unwrap_or(0);
+    #[allow(clippy::cast_precision_loss)]
+    let confidence = if count == 0 {
+        0.0
+    } else {
+        confidence_sum / count as f32
+    };
+    (start_ms, end_ms.max(start_ms), confidence)
 }
 
 // ---------------------------------------------------------------------------
