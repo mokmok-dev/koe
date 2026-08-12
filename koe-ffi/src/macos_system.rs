@@ -5,8 +5,8 @@
 //! provider, and these queries do not need the Swift bridge.
 //!
 //! Unlike permission/app enumeration, these helpers are process-global OS
-//! reads and are not injectable via `NativeProvider` (intentional: keeps the
-//! UniFFI callback surface small). On non-macOS hosts they degrade to
+//! reads and are not injectable via [`crate::NativeProvider`] (intentional: keeps the
+//! `UniFFI` callback surface small). On non-macOS hosts they degrade to
 //! `None` / empty via stubs in `lib.rs`.
 
 #![allow(unsafe_code)]
