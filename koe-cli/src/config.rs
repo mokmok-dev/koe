@@ -124,11 +124,7 @@ pub fn expand_tilde_path(path: &Path) -> PathBuf {
 /// Resolved output directory from config, if any.
 #[must_use]
 pub fn output_directory(config: &KoeConfig) -> Option<PathBuf> {
-    config
-        .output
-        .directory
-        .as_deref()
-        .map(expand_tilde)
+    config.output.directory.as_deref().map(expand_tilde)
 }
 
 /// Joins a relative output path onto the configured directory.
@@ -168,7 +164,10 @@ pub fn coalesce_copy<T: Copy>(
 
 /// Locale for `koe transcribe`: CLI > `[transcription]` > `[defaults]` > built-in.
 #[must_use]
-pub fn transcribe_locale(cli: Option<String>, config: &KoeConfig) -> String {
+pub fn transcribe_locale(
+    cli: Option<String>,
+    config: &KoeConfig,
+) -> String {
     coalesce_owned(
         cli,
         config
@@ -182,7 +181,10 @@ pub fn transcribe_locale(cli: Option<String>, config: &KoeConfig) -> String {
 
 /// Transcript format for `koe transcribe`.
 #[must_use]
-pub fn transcribe_format(cli: Option<String>, config: &KoeConfig) -> String {
+pub fn transcribe_format(
+    cli: Option<String>,
+    config: &KoeConfig,
+) -> String {
     coalesce_owned(
         cli,
         config
@@ -232,11 +234,11 @@ transcript-format = "srt"
         assert_eq!(config.defaults.transcript_format.as_deref(), Some("txt"));
         assert_eq!(config.aec.enabled, Some(true));
         assert_eq!(config.aec.comfort_noise, Some(true));
+        assert_eq!(config.output.directory.as_deref(), Some("~/Recordings/Koe"));
         assert_eq!(
-            config.output.directory.as_deref(),
-            Some("~/Recordings/Koe")
+            config.transcription.transcript_format.as_deref(),
+            Some("srt")
         );
-        assert_eq!(config.transcription.transcript_format.as_deref(), Some("srt"));
     }
 
     #[test]
@@ -267,10 +269,7 @@ enabled = false
             coalesce_owned(Some("mic".into()), Some("system"), builtin::SOURCE),
             "mic"
         );
-        assert_eq!(
-            coalesce_owned(None, Some("both"), builtin::SOURCE),
-            "both"
-        );
+        assert_eq!(coalesce_owned(None, Some("both"), builtin::SOURCE), "both");
         assert_eq!(coalesce_owned(None, None, builtin::SOURCE), "system");
         assert_eq!(coalesce_copy(Some(44_100), Some(48_000), 48_000), 44_100);
         assert_eq!(coalesce_copy(None, Some(44_100), 48_000), 44_100);
@@ -294,7 +293,10 @@ enabled = false
     #[test]
     fn expand_tilde_uses_home() {
         let home = home_dir().expect("HOME");
-        assert_eq!(expand_tilde("~/Recordings/Koe"), home.join("Recordings/Koe"));
+        assert_eq!(
+            expand_tilde("~/Recordings/Koe"),
+            home.join("Recordings/Koe")
+        );
         assert_eq!(expand_tilde("~"), home);
         assert_eq!(expand_tilde("/abs/path"), PathBuf::from("/abs/path"));
         assert_eq!(expand_tilde("relative"), PathBuf::from("relative"));
@@ -317,7 +319,9 @@ enabled = false
     #[test]
     fn rejects_unknown_keys() {
         let err = parse_toml("[defaults]\nunknown-key = 1\n").expect_err("unknown");
-        assert!(err.contains("unknown") || err.contains("unknown-key") || err.contains("did you mean"));
+        assert!(
+            err.contains("unknown") || err.contains("unknown-key") || err.contains("did you mean")
+        );
     }
 
     #[test]

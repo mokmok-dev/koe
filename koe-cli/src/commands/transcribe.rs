@@ -45,7 +45,10 @@ pub struct TranscribeArgs {
 }
 
 impl Run for TranscribeArgs {
-    fn run(self, config: &KoeConfig) -> Result<(), MainError> {
+    fn run(
+        self,
+        config: &KoeConfig,
+    ) -> Result<(), MainError> {
         let prepared = prepare(&self, config)?;
         run_transcription(&prepared)
     }
@@ -435,10 +438,7 @@ mod tests {
     #[test]
     fn prepare_uses_transcription_section() {
         let mut path = std::env::temp_dir();
-        path.push(format!(
-            "koe-transcribe-config-{}.wav",
-            std::process::id()
-        ));
+        path.push(format!("koe-transcribe-config-{}.wav", std::process::id()));
         std::fs::write(&path, b"RIFF").unwrap();
         let args =
             TranscribeArgs::try_parse_from(["transcribe", path.to_str().unwrap()]).expect("parse");
