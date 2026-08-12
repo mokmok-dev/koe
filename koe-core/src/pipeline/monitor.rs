@@ -89,12 +89,9 @@ impl Drop for FfiMonitor {
     }
 }
 
-/// Opens a monitor when enabled. Create failures are logged and treated as off
-/// so recording still proceeds.
-pub fn start_session_monitor(enabled: bool) -> Option<Arc<dyn AudioMonitor>> {
-    if !enabled {
-        return None;
-    }
+/// Opens a monitor. Create failures are logged and treated as off so recording
+/// still proceeds. Callers skip this when monitoring is disabled.
+pub fn start_session_monitor() -> Option<Arc<dyn AudioMonitor>> {
     match FfiMonitor::start() {
         Ok(monitor) => Some(Arc::new(monitor)),
         Err(err) => {
@@ -156,13 +153,8 @@ mod tests {
     }
 
     #[test]
-    fn disabled_monitor_is_none() {
-        assert!(start_session_monitor(false).is_none());
-    }
-
-    #[test]
     fn enabled_monitor_uses_ffi_stub() {
-        let monitor = start_session_monitor(true).expect("create");
+        let monitor = start_session_monitor().expect("create");
         monitor.write(&[0.1, -0.1, 0.2, -0.2]).expect("write");
         monitor.stop();
         monitor.stop();

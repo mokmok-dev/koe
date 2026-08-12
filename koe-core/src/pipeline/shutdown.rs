@@ -171,7 +171,7 @@ impl RecordingPipeline {
         }
 
         let duration_sec = match self.state {
-            PipelineState::Recording { start_time } => start_time.elapsed().as_secs_f64(),
+            PipelineState::Recording => self.elapsed().as_secs_f64(),
             PipelineState::Paused {
                 elapsed_before_pause,
             } => elapsed_before_pause.as_secs_f64(),

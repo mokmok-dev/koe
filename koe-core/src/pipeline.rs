@@ -90,7 +90,7 @@ pub struct PipelineConfig {
 #[derive(Debug, Clone, Copy)]
 pub enum PipelineState {
     /// Actively recording.
-    Recording { start_time: Instant },
+    Recording,
     /// Recording paused; tap remains alive.
     Paused { elapsed_before_pause: Duration },
     /// Recording has been stopped.
@@ -317,7 +317,11 @@ impl RecordingPipeline {
         let start_time = Instant::now();
         let started_at = Arc::new(Mutex::new(start_time));
         let bytes_written = Arc::new(AtomicU64::new(0));
-        let monitor = start_session_monitor(config.monitor);
+        let monitor = if config.monitor {
+            start_session_monitor()
+        } else {
+            None
+        };
 
         let consumer_ctx = ConsumerContext {
             encoder: Arc::clone(&encoder),
@@ -337,7 +341,7 @@ impl RecordingPipeline {
 
         Ok(Self {
             config,
-            state: PipelineState::Recording { start_time },
+            state: PipelineState::Recording,
             encoder,
             transcript_fmt: transcript,
             file_writer,
@@ -360,10 +364,10 @@ impl RecordingPipeline {
 
     /// Pauses audio production while keeping the native tap alive.
     pub fn pause(&mut self) {
-        if let PipelineState::Recording { start_time } = self.state {
+        if matches!(self.state, PipelineState::Recording) {
             self.paused.store(true, Ordering::Relaxed);
             self.state = PipelineState::Paused {
-                elapsed_before_pause: start_time.elapsed(),
+                elapsed_before_pause: self.elapsed(),
             };
             self.publish_status(RecordingState::Paused, 0.0, 0.0);
         }
@@ -382,9 +386,15 @@ impl RecordingPipeline {
             if let Ok(mut origin) = self.started_at.lock() {
                 *origin = start_time;
             }
-            self.state = PipelineState::Recording { start_time };
+            self.state = PipelineState::Recording;
             self.publish_status(RecordingState::Recording, 0.0, 0.0);
         }
+    }
+
+    fn elapsed(&self) -> Duration {
+        self.started_at
+            .lock()
+            .map_or(Duration::ZERO, |origin| origin.elapsed())
     }
 
     /// Returns whether the pipeline is paused.
@@ -459,9 +469,7 @@ impl RecordingPipeline {
         level_left: f32,
         level_right: f32,
     ) {
-        let elapsed_ms = self.started_at.lock().map_or(0, |started_at| {
-            u64::try_from(started_at.elapsed().as_millis()).unwrap_or(u64::MAX)
-        });
+        let elapsed_ms = elapsed_ms(&self.started_at);
         let _ = self.progress_tx.send(RecordingStatus {
             elapsed_ms,
             bytes_written: self.bytes_written.load(Ordering::Relaxed),
@@ -470,6 +478,12 @@ impl RecordingPipeline {
             state,
         });
     }
+}
+
+fn elapsed_ms(started_at: &Mutex<Instant>) -> u64 {
+    started_at.lock().map_or(0, |origin| {
+        u64::try_from(origin.elapsed().as_millis()).unwrap_or(u64::MAX)
+    })
 }
 
 fn validate_config(config: &PipelineConfig) -> Result<(), PipelineError> {

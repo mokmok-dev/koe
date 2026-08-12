@@ -188,9 +188,7 @@ fn emit_progress(
         RecordingState::Recording
     };
 
-    let elapsed_ms = ctx.started_at.lock().map_or(0, |started_at| {
-        u64::try_from(started_at.elapsed().as_millis()).unwrap_or(u64::MAX)
-    });
+    let elapsed_ms = super::elapsed_ms(&ctx.started_at);
 
     let _ = ctx.progress_tx.send(RecordingStatus {
         elapsed_ms,
