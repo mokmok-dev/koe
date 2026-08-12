@@ -23,7 +23,6 @@ mod screen_audio;
 mod timestamp;
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::error::CaptureError;
 use crate::handles::CaptureHandle;
@@ -31,19 +30,9 @@ use crate::types::AudioSourceConfig;
 
 pub use timestamp::monotonic_ms;
 
-/// When true, [`start_session`] returns a no-op session (unit tests / CI).
-static STUB_CAPTURE: AtomicBool = AtomicBool::new(false);
-
-/// Enables or disables no-op capture for tests that only need lifecycle.
-///
-/// Not part of the supported public API — test / CI harness only.
-#[doc(hidden)]
-pub fn set_capture_stub(enabled: bool) {
-    STUB_CAPTURE.store(enabled, Ordering::SeqCst);
-}
-
+/// When true, [`start_session`] returns a no-op session (`KOE_STUB_CAPTURE`).
 fn capture_stubbed() -> bool {
-    STUB_CAPTURE.load(Ordering::SeqCst) || std::env::var_os("KOE_STUB_CAPTURE").is_some()
+    std::env::var_os("KOE_STUB_CAPTURE").is_some()
 }
 
 /// Running native capture; stopped on [`Drop`] or [`CaptureSession::stop`].
