@@ -59,9 +59,23 @@
             inherit lib pkgs craneLib;
             args = crateArgs "koe-ffi";
           };
+
+          koe = craneLib.buildPackage (
+            crateArgs "koe-cli"
+            // {
+              pname = "koe";
+              cargoBuildProfile = "release";
+            }
+          );
         in
         {
-          apps = lib.optionalAttrs pkgs.stdenv.isDarwin {
+          apps = {
+            default = {
+              type = "app";
+              program = "${koe}/bin/koe";
+            };
+          }
+          // lib.optionalAttrs pkgs.stdenv.isDarwin {
             generate-ffi-bindings = {
               type = "app";
               program = "${koeFfiBindings.packages.koe-ffi-populate}/bin/populate-koe-ffi-bindings";
@@ -83,7 +97,10 @@
             shellHook = koeFfiBindings.devShellHook;
           };
 
-          inherit (koeFfiBindings) packages;
+          packages = koeFfiBindings.packages // {
+            inherit koe;
+            default = koe;
+          };
 
           checks =
             builtins.listToAttrs (
