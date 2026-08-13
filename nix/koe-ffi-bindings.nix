@@ -2,25 +2,13 @@
 {
   lib,
   pkgs,
-  rust-project,
+  craneLib,
+  args,
 }:
 let
-  craneLib = rust-project.crane-lib;
-  inherit (rust-project) src crates;
-
-  koeFfiArgs = crates.koe-ffi.crane.args // {
-    inherit src;
-    pname = "koe-ffi";
-    cargoExtraArgs = "-p koe-ffi";
-    strictDeps = true;
-  };
-
-  cargoArtifacts = craneLib.buildDepsOnly koeFfiArgs;
-
   koeFfiBindings = craneLib.cargoBuild (
-    koeFfiArgs
+    args
     // {
-      inherit cargoArtifacts;
       pname = "koe-ffi-bindings";
       version = "0.0.0";
       cargoBuildProfile = "release";

@@ -8,11 +8,7 @@
     git-hooks.inputs.nixpkgs.follows = "nixpkgs";
     rust-overlay.url = "github:oxalica/rust-overlay";
     rust-overlay.inputs.nixpkgs.follows = "nixpkgs";
-    rust-flake = {
-      url = "github:juspay/rust-flake";
-      inputs.nixpkgs.follows = "nixpkgs";
-      inputs.rust-overlay.follows = "rust-overlay";
-    };
+    crane.url = "github:ipetkov/crane";
   };
 
   outputs =
@@ -21,22 +17,47 @@
       imports = [
         inputs.treefmt-nix.flakeModule
         inputs.git-hooks.flakeModule
-        inputs.rust-flake.flakeModules.default
-        inputs.rust-flake.flakeModules.nixpkgs
       ];
 
       perSystem =
         {
-          self',
-          pkgs,
           config,
           lib,
+          system,
           ...
         }:
         let
+          pkgs = import inputs.nixpkgs {
+            inherit system;
+            overlays = [ inputs.rust-overlay.overlays.default ];
+          };
+
+          rustToolchain = pkgs.rust-bin.fromRustupToolchainFile ./rust-toolchain.toml;
+          craneLib = (inputs.crane.mkLib pkgs).overrideToolchain rustToolchain;
+
+          src = craneLib.cleanCargoSource ./.;
+          commonArgs = {
+            inherit src;
+            pname = "koe-workspace";
+            strictDeps = true;
+          };
+          cargoArtifacts = craneLib.buildDepsOnly commonArgs;
+
+          workspaceCargoToml = builtins.fromTOML (builtins.readFile ./Cargo.toml);
+          crates = workspaceCargoToml.workspace.members;
+
+          crateArgs =
+            name:
+            commonArgs
+            // {
+              inherit cargoArtifacts;
+              pname = name;
+              cargoExtraArgs = "-p ${name}";
+            };
+
           koeFfiBindings = import ./nix/koe-ffi-bindings.nix {
-            inherit lib pkgs;
-            inherit (config) rust-project;
+            inherit lib pkgs craneLib;
+            args = crateArgs "koe-ffi";
           };
         in
         {
@@ -50,10 +71,12 @@
           devShells.default = pkgs.mkShellNoCC {
             inputsFrom = [
               config.pre-commit.devShell
-              self'.devShells.rust
             ];
 
-            packages = lib.optionals pkgs.stdenv.isDarwin [
+            packages = [
+              rustToolchain
+            ]
+            ++ lib.optionals pkgs.stdenv.isDarwin [
               pkgs.swift
             ];
 
@@ -63,20 +86,9 @@
           inherit (koeFfiBindings) packages;
 
           checks =
-            lib.mapAttrs' (
-              name: crate:
-              let
-                crane-lib = config.rust-project.crane-lib;
-                args = crate.crane.args // {
-                  src = config.rust-project.src;
-                  pname = name;
-                  cargoExtraArgs = "-p ${name}";
-                  strictDeps = true;
-                };
-                cargoArtifacts = crane-lib.buildDepsOnly args;
-              in
-              lib.nameValuePair "${name}-test" (crane-lib.cargoTest (args // { inherit cargoArtifacts; }))
-            ) config.rust-project.crates
+            builtins.listToAttrs (
+              map (name: lib.nameValuePair "${name}-test" (craneLib.cargoTest (crateArgs name))) crates
+            )
             // koeFfiBindings.checks;
 
           pre-commit.settings = {
@@ -93,10 +105,6 @@
             package = pkgs.prek;
           };
 
-          rust-project = {
-            toolchain = pkgs.rust-bin.fromRustupToolchainFile ./rust-toolchain.toml;
-          };
-
           treefmt = {
             projectRootFile = "flake.nix";
             settings.global.excludes = [
@@ -105,7 +113,7 @@
             programs = {
               nixfmt.enable = true;
               rustfmt.enable = true;
-              rustfmt.package = config.rust-project.toolchain;
+              rustfmt.package = rustToolchain;
               swift-format.enable = true;
               taplo.enable = true;
               yamlfmt.enable = true;
