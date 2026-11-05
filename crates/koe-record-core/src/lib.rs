@@ -1,9 +1,10 @@
-//! Platform-independent audio mixing and Ogg Opus framing.
+//! Platform-independent audio mixing, Ogg Opus framing, and RIFF/WAVE framing.
 //!
 //! The crate is `no_std` with `alloc`. It has no platform code and no system
-//! library, so the facade crate owns the file system and the codec. Here live
-//! the recording spec, the mixer that folds microphone and system audio into
-//! one interleaved block, and the Ogg page framing around Opus packets.
+//! library, so the facade crate owns the file system and the Opus codec. Here
+//! live the recording spec, the mixer that folds microphone and system audio
+//! into one interleaved block, the Ogg page framing around Opus packets, and
+//! the RIFF/WAVE framing around 16-bit PCM samples.
 //!
 //! ```
 //! use koe_record_core::{Channels, Input, Mixer, RecordingSpec};
@@ -32,11 +33,15 @@ extern crate alloc;
 mod error;
 mod mixer;
 mod ogg;
+mod sink;
 mod spec;
+mod wav;
 
 pub use error::Error;
 pub use mixer::{Input, MAX_GAIN, MixReport, Mixer};
-pub use ogg::{OggOpusConfig, OggOpusWriter, Sink};
+pub use ogg::{OggOpusConfig, OggOpusWriter};
+pub use sink::{PatchSink, Sink};
 pub use spec::{Channels, MAX_SAMPLE_RATE, MIN_SAMPLE_RATE, RecordingSpec};
+pub use wav::WavWriter;
 
 pub use koe_capture_core::Source;

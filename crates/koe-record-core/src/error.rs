@@ -52,6 +52,13 @@ pub enum Error {
         /// Requested sample rate in hertz.
         rate: u32,
     },
+    /// The sample data outgrew what the container's size field can describe.
+    RecordingTooLarge {
+        /// Bytes the data chunk would hold.
+        bytes: u64,
+        /// Most bytes the size field can describe.
+        max: u64,
+    },
     /// A source delivers a channel layout the recording cannot mix.
     UnsupportedChannels {
         /// Source that delivers the layout.
@@ -124,6 +131,10 @@ impl fmt::Display for Error {
             Self::UnsupportedRate { rate } => {
                 write!(formatter, "the recording format cannot carry {rate} Hz")
             }
+            Self::RecordingTooLarge { bytes, max } => write!(
+                formatter,
+                "the recording needs {bytes} bytes of sample data; the container holds at most {max}"
+            ),
             Self::UnsupportedChannels { source, channels } => write!(
                 formatter,
                 "{source} delivers {channels} channels; only mono and stereo can be mixed"
@@ -211,6 +222,13 @@ mod tests {
             (
                 Error::UnsupportedRate { rate: 44_100 },
                 "the recording format cannot carry 44100 Hz",
+            ),
+            (
+                Error::RecordingTooLarge {
+                    bytes: 4_294_967_260,
+                    max: 4_294_967_259,
+                },
+                "the recording needs 4294967260 bytes of sample data; the container holds at most 4294967259",
             ),
             (
                 Error::UnsupportedChannels {

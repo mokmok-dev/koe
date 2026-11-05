@@ -1,5 +1,5 @@
 [package]
-description = "Platform-independent audio mixing and Ogg Opus framing"
+description = "Platform-independent audio mixing, Ogg Opus framing, and RIFF/WAVE framing"
 edition.workspace = true
 license.workspace = true
 name = "koe-record-core"
