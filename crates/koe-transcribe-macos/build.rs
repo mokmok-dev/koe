@@ -65,6 +65,8 @@ fn main() {
     // Weak frameworks keep binaries loadable on macOS versions below 26.
     println!("cargo:rustc-link-arg=-Wl,-weak_framework,Speech");
     println!("cargo:rustc-link-arg=-Wl,-weak_framework,AVFAudio");
+    // The archive references the system Swift runtime through `@rpath`.
+    println!("cargo:rustc-link-arg=-Wl,-rpath,/usr/lib/swift");
 }
 
 /// Swift's target spelling for the configured Cargo target architecture.
