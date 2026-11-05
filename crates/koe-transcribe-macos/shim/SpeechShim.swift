@@ -12,12 +12,14 @@ import Foundation
 import Speech
 
 /// Result of the asynchronous engine setup.
+@available(macOS 26.0, *)
 private struct SetupOutcome {
     let status: Int32
     let engine: SpeechEngine?
 }
 
 /// Slot the synchronous `create` hands the setup task's result to.
+@available(macOS 26.0, *)
 private final class SetupBox: @unchecked Sendable {
     private let lock = NSLock()
     private var outcome: SetupOutcome?
@@ -94,7 +96,8 @@ private final class SpeechEngine: @unchecked Sendable {
         guard let normalized = await SpeechTranscriber.supportedLocale(equivalentTo: requested) else {
             return SetupOutcome(status: -2, engine: nil)
         }
-        guard SpeechTranscriber.installedLocales.contains(normalized) else {
+        let installed = await SpeechTranscriber.installedLocales
+        guard installed.contains(normalized) else {
             return SetupOutcome(status: -3, engine: nil)
         }
         let transcriber = SpeechTranscriber(locale: normalized, preset: .transcription)
@@ -347,7 +350,7 @@ private final class SpeechEngine: @unchecked Sendable {
     }
 
     private func enqueue(_ buffer: AVAudioPCMBuffer) -> Int32 {
-        if continuation.yield(AnalyzerInput(buffer: buffer)).isTerminated {
+        if case .terminated = continuation.yield(AnalyzerInput(buffer: buffer)) {
             record(-4)
             return -4
         }
@@ -459,7 +462,7 @@ private final class SpeechEngine: @unchecked Sendable {
 @_cdecl("koe_stt_engine_create")
 func koeSpeechEngineCreate(
     locale: UnsafePointer<CChar>?,
-    out: UnsafeMutablePointer<UnsafeMutablePointer<koe_stt_engine>?>?
+    out: UnsafeMutablePointer<UnsafeMutableRawPointer?>??
 ) -> Int32 {
     guard let out else {
         return -5
@@ -482,13 +485,12 @@ func koeSpeechEngineCreate(
     }
     engine.spawnTasks()
     out.pointee = Unmanaged.passRetained(engine).toOpaque()
-        .assumingMemoryBound(to: koe_stt_engine.self)
     return 0
 }
 
 @_cdecl("koe_stt_engine_feed")
 func koeSpeechEngineFeed(
-    engine: UnsafeMutablePointer<koe_stt_engine>?,
+    engine: UnsafeMutableRawPointer?,
     pcm: UnsafePointer<Float>?,
     frames: UInt32
 ) -> Int32 {
@@ -505,7 +507,7 @@ func koeSpeechEngineFeed(
 
 @_cdecl("koe_stt_engine_take_committed")
 func koeSpeechEngineTakeCommitted(
-    engine: UnsafeMutablePointer<koe_stt_engine>?,
+    engine: UnsafeMutableRawPointer?,
     text: UnsafeMutablePointer<koe_stt_string>?,
     startMs: UnsafeMutablePointer<Int64>?,
     endMs: UnsafeMutablePointer<Int64>?
@@ -523,7 +525,7 @@ func koeSpeechEngineTakeCommitted(
 
 @_cdecl("koe_stt_engine_take_volatile")
 func koeSpeechEngineTakeVolatile(
-    engine: UnsafeMutablePointer<koe_stt_engine>?,
+    engine: UnsafeMutableRawPointer?,
     text: UnsafeMutablePointer<koe_stt_string>?,
     revision: UnsafeMutablePointer<UInt32>?
 ) -> Int32 {
@@ -539,7 +541,7 @@ func koeSpeechEngineTakeVolatile(
 }
 
 @_cdecl("koe_stt_engine_finish")
-func koeSpeechEngineFinish(engine: UnsafeMutablePointer<koe_stt_engine>?) -> Int32 {
+func koeSpeechEngineFinish(engine: UnsafeMutableRawPointer?) -> Int32 {
     guard #available(macOS 26.0, *) else {
         return -1
     }
@@ -550,7 +552,7 @@ func koeSpeechEngineFinish(engine: UnsafeMutablePointer<koe_stt_engine>?) -> Int
 }
 
 @_cdecl("koe_stt_engine_destroy")
-func koeSpeechEngineDestroy(engine: UnsafeMutablePointer<koe_stt_engine>?) {
+func koeSpeechEngineDestroy(engine: UnsafeMutableRawPointer?) {
     guard #available(macOS 26.0, *), let engine else {
         return
     }
