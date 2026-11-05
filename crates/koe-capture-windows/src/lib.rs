@@ -13,10 +13,15 @@
 use std::ffi::c_void;
 use std::marker::PhantomData;
 use std::ptr::{from_ref, null, null_mut};
+use std::time::{Duration, Instant};
 
-use koe_capture_core::{DeviceId, DeviceInfo, Error, RawStream, Source, StreamSpec};
+use koe_capture_core::{
+    DeviceId, DeviceInfo, Error, RawStream, SampleFormat, Source, StreamSpec, decode,
+};
 
 const COINIT_MULTITHREADED: u32 = 0;
+/// `CoInitializeEx` answer on a thread that already runs in an STA.
+const RPC_E_CHANGED_MODE: i32 = 0x8001_0106_u32.cast_signed();
 const CLSCTX_ALL: u32 = 0x17;
 const STGM_READ: u32 = 0;
 const DEVICE_STATE_ACTIVE: u32 = 0x1;
@@ -27,22 +32,21 @@ const ROLE_CONSOLE: u32 = 0;
 const AUDCLNT_SHAREMODE_SHARED: u32 = 0;
 const AUDCLNT_STREAMFLAGS_LOOPBACK: u32 = 0x0002_0000;
 const AUDCLNT_STREAMFLAGS_EVENTCALLBACK: u32 = 0x0004_0000;
-const AUDCLNT_STREAMFLAGS_SRC_DEFAULT_QUALITY: u32 = 0x0800_0000;
-const AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM: u32 = 0x8000_0000;
 const AUDCLNT_BUFFERFLAGS_SILENT: u32 = 0x2;
 
+const WAVE_FORMAT_PCM: u16 = 1;
+const WAVE_FORMAT_IEEE_FLOAT: u16 = 3;
 const WAVE_FORMAT_EXTENSIBLE: u16 = 0xFFFE;
-const BITS_PER_SAMPLE: u16 = 32;
 const EXTENSIBLE_EXTRA_SIZE: u16 = 22;
 const VT_LPWSTR: u16 = 31;
 
 /// Buffer duration the client asks for, in 100 ns units.
 const BUFFER_DURATION: i64 = 10_000_000;
-const WAIT_MILLISECONDS: u32 = 2_000;
 const WAIT_OBJECT_0: u32 = 0;
 const WAIT_TIMEOUT: u32 = 258;
 
 #[repr(C)]
+#[derive(PartialEq, Eq)]
 struct Guid {
     data1: u32,
     data2: u16,
@@ -84,6 +88,12 @@ const IID_IAUDIO_CAPTURE_CLIENT: Guid = Guid::new(
     0xE71E,
     0x48A0,
     [0xA4, 0xDE, 0x18, 0x5C, 0x39, 0x5C, 0xD3, 0x17],
+);
+const KSDATAFORMAT_SUBTYPE_PCM: Guid = Guid::new(
+    0x0000_0001,
+    0x0000,
+    0x0010,
+    [0x80, 0x00, 0x00, 0xAA, 0x00, 0x38, 0x9B, 0x71],
 );
 const KSDATAFORMAT_SUBTYPE_IEEE_FLOAT: Guid = Guid::new(
     0x0000_0003,
@@ -136,29 +146,12 @@ struct WaveFormatExtensible {
     sub_format: Guid,
 }
 
-impl WaveFormatExtensible {
-    fn new(spec: StreamSpec) -> Self {
-        let channels = spec.channels();
-        let channel_mask = match channels {
-            1 => 0x4,
-            2 => 0x3,
-            _ => 0,
-        };
-        Self {
-            format: WaveFormatEx {
-                format_tag: WAVE_FORMAT_EXTENSIBLE,
-                channels,
-                samples_per_sec: spec.sample_rate(),
-                avg_bytes_per_sec: spec.sample_rate() * u32::from(channels) * 4,
-                block_align: channels * 4,
-                bits_per_sample: BITS_PER_SAMPLE,
-                extra_size: EXTENSIBLE_EXTRA_SIZE,
-            },
-            valid_bits_per_sample: BITS_PER_SAMPLE,
-            channel_mask,
-            sub_format: KSDATAFORMAT_SUBTYPE_IEEE_FLOAT,
-        }
-    }
+/// The endpoint format a stream is opened with and decodes packets from.
+#[derive(Clone, Copy)]
+struct MixFormat {
+    sample_rate: u32,
+    channels: u16,
+    sample: Option<SampleFormat>,
 }
 
 #[link(name = "ole32")]
@@ -323,19 +316,29 @@ unsafe fn wide_string(pointer: *const u16) -> Option<String> {
 }
 
 /// Holds the apartment alive for as long as it exists.
-struct Com;
+///
+/// A thread that already runs in an STA answers `CoInitializeEx` with
+/// `RPC_E_CHANGED_MODE` and gains no reference to release, so that status is
+/// success without ownership.
+struct Com {
+    owned: bool,
+}
 
 impl Com {
     fn initialize() -> Result<Self, Error> {
         let status = unsafe { CoInitializeEx(null_mut(), COINIT_MULTITHREADED) };
-        check("CoInitializeEx", status)?;
-        Ok(Self)
+        if status < 0 && status != RPC_E_CHANGED_MODE {
+            return Err(failed("CoInitializeEx", status));
+        }
+        Ok(Self { owned: status >= 0 })
     }
 }
 
 impl Drop for Com {
     fn drop(&mut self) {
-        unsafe { CoUninitialize() };
+        if self.owned {
+            unsafe { CoUninitialize() };
+        }
     }
 }
 
@@ -546,26 +549,77 @@ impl Owned<DeviceVtable> {
         from_com("IMMDevice::Activate", status, object)
     }
 
-    unsafe fn mix_format(&self) -> Result<(u32, u16), Error> {
+    unsafe fn mix_format(&self) -> Result<MixFormat, Error> {
         let client = unsafe { self.audio_client() }?;
-        let mut pointer: *mut WaveFormatEx = null_mut();
-        let vtable = unsafe { client.vtable() };
-        let status = unsafe { (vtable.get_mix_format)(client.as_ptr(), &raw mut pointer) };
-        check("IAudioClient::GetMixFormat", status)?;
-        if pointer.is_null() {
-            return Err(invariant("IAudioClient::GetMixFormat"));
+        let (memory, native) = unsafe { mix_format(&client) }?;
+        drop(memory);
+        Ok(native)
+    }
+}
+
+/// Asks the client for its native format and keeps the block that owns it.
+///
+/// `GetMixFormat` reports the device's own layout, which is the only format a
+/// shared-mode stream accepts without conversion.
+unsafe fn mix_format(
+    client: &Owned<AudioClientVtable>,
+) -> Result<(CoTaskMem<WaveFormatEx>, MixFormat), Error> {
+    let operation = "IAudioClient::GetMixFormat";
+    let mut pointer: *mut WaveFormatEx = null_mut();
+    let vtable = unsafe { client.vtable() };
+    let status = unsafe { (vtable.get_mix_format)(client.as_ptr(), &raw mut pointer) };
+    check(operation, status)?;
+    if pointer.is_null() {
+        return Err(invariant(operation));
+    }
+    let memory = CoTaskMem(pointer);
+    let base = unsafe { memory.as_ptr().read() };
+    if base.channels == 0 {
+        return Err(invariant(operation));
+    }
+    let sample = unsafe { sample_format(memory.as_ptr(), &base) };
+    Ok((
+        memory,
+        MixFormat {
+            sample_rate: base.samples_per_sec,
+            channels: base.channels,
+            sample,
+        },
+    ))
+}
+
+/// Maps the reported layout to the sample type the packet bytes carry.
+unsafe fn sample_format(pointer: *const WaveFormatEx, base: &WaveFormatEx) -> Option<SampleFormat> {
+    let bits = base.bits_per_sample;
+    match base.format_tag {
+        WAVE_FORMAT_IEEE_FLOAT if bits == 32 => Some(SampleFormat::F32),
+        WAVE_FORMAT_PCM => pcm_sample(bits),
+        WAVE_FORMAT_EXTENSIBLE if base.extra_size >= EXTENSIBLE_EXTRA_SIZE => {
+            let format = unsafe { pointer.cast::<WaveFormatExtensible>().read() };
+            let sub_format = format.sub_format;
+            if sub_format == KSDATAFORMAT_SUBTYPE_IEEE_FLOAT && bits == 32 {
+                Some(SampleFormat::F32)
+            } else if sub_format == KSDATAFORMAT_SUBTYPE_PCM {
+                pcm_sample(bits)
+            } else {
+                None
+            }
         }
-        let format = CoTaskMem(pointer);
-        let format = unsafe { format.as_ptr().read() };
-        if format.channels == 0 {
-            return Err(invariant("IAudioClient::GetMixFormat"));
-        }
-        Ok((format.samples_per_sec, format.channels))
+        _ => None,
+    }
+}
+
+const fn pcm_sample(bits: u16) -> Option<SampleFormat> {
+    match bits {
+        16 => Some(SampleFormat::I16),
+        24 => Some(SampleFormat::I24),
+        32 => Some(SampleFormat::I32),
+        _ => None,
     }
 }
 
 impl Owned<AudioClientVtable> {
-    unsafe fn initialize(&self, format: &WaveFormatExtensible, flags: u32) -> Result<(), Error> {
+    unsafe fn initialize(&self, format: *const WaveFormatEx, flags: u32) -> Result<(), Error> {
         let vtable = unsafe { self.vtable() };
         let status = unsafe {
             (vtable.initialize)(
@@ -574,7 +628,7 @@ impl Owned<AudioClientVtable> {
                 flags,
                 BUFFER_DURATION,
                 0,
-                from_ref(format).cast(),
+                format,
                 null(),
             )
         };
@@ -620,7 +674,7 @@ unsafe fn describe(
     let raw = unsafe { device.id() }?;
     let is_default = default == Some(raw.as_str());
     let name = unsafe { device.friendly_name() }.unwrap_or_else(|| raw.clone());
-    let Ok((sample_rate, channels)) = (unsafe { device.mix_format() }) else {
+    let Ok(native) = (unsafe { device.mix_format() }) else {
         return Ok(None);
     };
     let Ok(id) = DeviceId::new(raw) else {
@@ -631,8 +685,8 @@ unsafe fn describe(
         name,
         source,
         is_default,
-        sample_rate,
-        channels,
+        native.sample_rate,
+        native.channels,
     )))
 }
 
@@ -656,12 +710,20 @@ pub fn devices() -> Result<Vec<DeviceInfo>, Error> {
             let Ok(device) = (unsafe { collection.item(index) }) else {
                 continue;
             };
-            if let Some(info) = unsafe { describe(&device, source, default.as_deref()) }? {
-                devices.push(info);
-            }
+            let Ok(Some(info)) = (unsafe { describe(&device, source, default.as_deref()) }) else {
+                continue;
+            };
+            devices.push(info);
         }
     }
     Ok(devices)
+}
+
+/// Milliseconds the frames occupy, floored at one so a wait always waits.
+fn timeout_milliseconds(frames: usize, rate: u32) -> u32 {
+    let frames = u64::try_from(frames).unwrap_or(u64::MAX);
+    let milliseconds = frames.saturating_mul(1_000) / u64::from(rate.max(1));
+    u32::try_from(milliseconds).unwrap_or(u32::MAX).max(1)
 }
 
 struct WasapiStream {
@@ -672,6 +734,8 @@ struct WasapiStream {
     pending: Vec<f32>,
     front: usize,
     channels: usize,
+    format: SampleFormat,
+    rate: u32,
 }
 
 impl WasapiStream {
@@ -679,7 +743,8 @@ impl WasapiStream {
     ///
     /// A loopback endpoint delivers nothing while the machine is silent, so a
     /// timeout is silence rather than a failure.
-    fn wait_for_packet(&self) -> Result<bool, Error> {
+    fn wait_for_packet(&self, milliseconds: u32) -> Result<bool, Error> {
+        let deadline = Instant::now() + Duration::from_millis(u64::from(milliseconds));
         loop {
             let mut frames = 0;
             let vtable = unsafe { self.capture.vtable() };
@@ -689,7 +754,9 @@ impl WasapiStream {
             if frames > 0 {
                 return Ok(true);
             }
-            match unsafe { WaitForSingleObject(self.event.as_handle(), WAIT_MILLISECONDS) } {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            let wait = u32::try_from(remaining.as_millis()).unwrap_or(u32::MAX);
+            match unsafe { WaitForSingleObject(self.event.as_handle(), wait) } {
                 WAIT_OBJECT_0 => {}
                 WAIT_TIMEOUT => return Ok(false),
                 code => return Err(failed("WaitForSingleObject", code.cast_signed())),
@@ -697,12 +764,16 @@ impl WasapiStream {
         }
     }
 
-    #[allow(clippy::cast_ptr_alignment)]
     fn store(&mut self, samples: *const u8, frames: u32, flags: u32) -> Result<(), Error> {
+        if frames == 0 {
+            return Ok(());
+        }
         let count = usize::try_from(frames)
             .ok()
             .and_then(|frames| frames.checked_mul(self.channels))
             .ok_or_else(|| invariant("IAudioCaptureClient::GetBuffer"))?;
+        // A silent packet carries a null data pointer, so the flag decides
+        // before the pointer is checked.
         if flags & AUDCLNT_BUFFERFLAGS_SILENT != 0 {
             self.pending.resize(self.pending.len() + count, 0.0);
             return Ok(());
@@ -710,14 +781,23 @@ impl WasapiStream {
         if samples.is_null() {
             return Err(invariant("IAudioCaptureClient::GetBuffer"));
         }
-        // The packet is aligned for the sample type the client was opened with.
-        let values = unsafe { std::slice::from_raw_parts(samples.cast::<f32>(), count) };
-        self.pending.extend_from_slice(values);
-        Ok(())
+        let bytes = count
+            .checked_mul(self.format.bytes_per_sample())
+            .ok_or_else(|| invariant("IAudioCaptureClient::GetBuffer"))?;
+        let packet = unsafe { std::slice::from_raw_parts(samples, bytes) };
+        let start = self.pending.len();
+        self.pending.resize(start + count, 0.0);
+        match decode(packet, self.format, &mut self.pending[start..]) {
+            Ok(decoded) if decoded == count => Ok(()),
+            _ => {
+                self.pending.truncate(start);
+                Err(invariant("IAudioCaptureClient::GetBuffer"))
+            }
+        }
     }
 
-    fn receive(&mut self) -> Result<bool, Error> {
-        if !self.wait_for_packet()? {
+    fn receive(&mut self, milliseconds: u32) -> Result<bool, Error> {
+        if !self.wait_for_packet(milliseconds)? {
             return Ok(false);
         }
         let mut samples: *mut u8 = null_mut();
@@ -738,8 +818,10 @@ impl WasapiStream {
         };
         check("IAudioCaptureClient::GetBuffer", status)?;
         let stored = self.store(samples, frames, flags);
-        let status = unsafe { (vtable.release_buffer)(self.capture.as_ptr(), frames) };
-        check("IAudioCaptureClient::ReleaseBuffer", status)?;
+        if frames != 0 {
+            let status = unsafe { (vtable.release_buffer)(self.capture.as_ptr(), frames) };
+            check("IAudioCaptureClient::ReleaseBuffer", status)?;
+        }
         stored.map(|()| true)
     }
 
@@ -764,10 +846,11 @@ impl RawStream for WasapiStream {
         if !out.len().is_multiple_of(self.channels) {
             return Err(invariant("read"));
         }
+        let timeout = timeout_milliseconds(out.len() / self.channels, self.rate);
         let mut filled = 0;
         while filled < out.len() {
             filled += self.drain(&mut out[filled..]);
-            if filled < out.len() && !self.receive()? {
+            if filled < out.len() && !self.receive(timeout)? {
                 out[filled..].fill(0.0);
                 filled = out.len();
             }
@@ -794,15 +877,22 @@ pub fn open(device: &DeviceInfo, spec: StreamSpec) -> Result<Box<dyn RawStream>,
     id.push(0);
     let endpoint = unsafe { enumerator.device(id.as_ptr()) }?;
     let client = unsafe { endpoint.audio_client() }?;
+    let (format, native) = unsafe { mix_format(&client) }?;
+    if spec.sample_rate() != native.sample_rate || spec.channels() != native.channels {
+        return Err(Error::DeviceFormat {
+            sample_rate: spec.sample_rate(),
+            channels: spec.channels(),
+        });
+    }
+    let Some(sample) = native.sample else {
+        return Err(Error::UnsupportedSample);
+    };
 
-    let mut flags = AUDCLNT_STREAMFLAGS_EVENTCALLBACK
-        | AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM
-        | AUDCLNT_STREAMFLAGS_SRC_DEFAULT_QUALITY;
+    let mut flags = AUDCLNT_STREAMFLAGS_EVENTCALLBACK;
     if spec.source() == Source::SystemAudio {
         flags |= AUDCLNT_STREAMFLAGS_LOOPBACK;
     }
-    let format = WaveFormatExtensible::new(spec);
-    unsafe { client.initialize(&format, flags)? };
+    unsafe { client.initialize(format.as_ptr(), flags)? };
 
     let event = EventHandle::create()?;
     unsafe { client.set_event(event.as_handle())? };
@@ -816,6 +906,8 @@ pub fn open(device: &DeviceInfo, spec: StreamSpec) -> Result<Box<dyn RawStream>,
         _com: com,
         pending: Vec::new(),
         front: 0,
-        channels: usize::from(spec.channels()),
+        channels: usize::from(native.channels),
+        format: sample,
+        rate: native.sample_rate,
     }))
 }
