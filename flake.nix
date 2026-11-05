@@ -67,7 +67,21 @@
 
           checks =
             let
-              src = pkgs.lib.cleanSourceWith { src = ./.; };
+              src = pkgs.lib.cleanSourceWith {
+                src = ./.;
+                filter =
+                  path: _type:
+                  let
+                    name = baseNameOf path;
+                  in
+                  !(builtins.elem name [
+                    "target"
+                    "mutants.out"
+                    "mutants.out.old"
+                    ".direnv"
+                  ])
+                  && !(pkgs.lib.hasPrefix "result" name);
+              };
 
               cargoCommonArgs = {
                 inherit src;
@@ -77,6 +91,22 @@
                 LD_LIBRARY_PATH = pkgs.lib.makeLibraryPath [ pkgs.libpulseaudio ];
               };
               cargoArtifacts = craneLib.buildDepsOnly cargoCommonArgs;
+
+              crossCheck =
+                target: feature:
+                craneLib.mkCargoDerivation {
+                  inherit src;
+                  pname = "koe-check-${target}";
+                  cargoArtifacts = null;
+                  doCheck = false;
+                  buildPhaseCargoCommand = "";
+                  buildPhase = ''
+                    runHook preBuild
+                    cargo check --package koe-capture --target ${target} --features ${feature}
+                    runHook postBuild
+                  '';
+                  installPhase = "mkdir -p $out";
+                };
             in
             {
               cargoClippy = craneLib.cargoClippy (
@@ -99,6 +129,29 @@
                   cargoTestExtraArgs = "--all-features";
                 }
               );
+              mutation = craneLib.mkCargoDerivation {
+                inherit
+                  src
+                  cargoArtifacts
+                  ;
+                pname = "koe-mutants";
+                nativeBuildInputs = [ pkgs.cargo-mutants ];
+                doCheck = false;
+                buildPhaseCargoCommand = "";
+                buildPhase = ''
+                  runHook preBuild
+                  cargo mutants \
+                    --package koe-capture \
+                    --no-default-features \
+                    --jobs 8
+                  test ! -s mutants.out/missed.txt
+                  test ! -s mutants.out/timeout.txt
+                  runHook postBuild
+                '';
+                installPhase = "mkdir -p $out";
+              };
+              crossMacos = crossCheck "aarch64-apple-darwin" "macos";
+              crossWindows = crossCheck "x86_64-pc-windows-gnu" "windows";
             };
 
           devShells.default = pkgs.mkShellNoCC {

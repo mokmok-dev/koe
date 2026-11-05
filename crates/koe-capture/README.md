@@ -59,8 +59,11 @@ cargo test -p koe-capture
 # Linux backend: enumerate and capture from the running server.
 cargo test -p koe-capture --features linux
 
-# Mutation gate: 0 missed, 0 timed out.
-scripts/mutation-gate.sh
+# Every gate: clippy, tests, mutation score, macOS check, Windows check.
+nix flake check
+
+# Only the mutation gate.
+nix build .#checks.x86_64-linux.mutation
 ```
 
 The OS adapters live under `src/sys/` and are excluded from mutation testing:
