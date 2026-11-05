@@ -102,7 +102,7 @@ impl Converter {
         self.total_in += u64::try_from(count).unwrap_or(u64::MAX);
 
         let target = self.total_in * u64::from(ENGINE_RATE) / u64::from(self.sample_rate);
-        while self.emitted < target {
+        for _ in 0..target.saturating_sub(self.emitted) {
             let Some(sample) = self.interpolate(self.emitted) else {
                 break;
             };
@@ -126,6 +126,11 @@ impl Converter {
             sample += value * tap;
         }
         Some(sample)
+    }
+
+    #[cfg(test)]
+    const fn buffered(&self) -> usize {
+        self.buffer.len()
     }
 
     /// Drops input no future window can reach.
@@ -313,6 +318,74 @@ mod tests {
         assert!(
             (actual - expected).abs() / expected < 0.01,
             "expected {expected}, got {actual}"
+        );
+    }
+
+    /// Magnitude of one kernel row at `frequency`, over the input rate.
+    fn response(kernel: &[f32; TAPS], frequency: f64, rate: u32) -> f64 {
+        let (mut real, mut imaginary) = (0.0, 0.0);
+        for (tap, weight) in kernel.iter().enumerate() {
+            let angle = 2.0 * std::f64::consts::PI * frequency * tap as f64 / f64::from(rate);
+            real = f64::mul_add(f64::from(*weight), angle.cos(), real);
+            imaginary = f64::mul_add(f64::from(*weight), -angle.sin(), imaginary);
+        }
+        real.hypot(imaginary)
+    }
+
+    #[test]
+    fn frames_counts_whole_channel_groups() {
+        assert_eq!(frames(10, 3), 3);
+        assert_eq!(frames(9, 3), 3);
+        assert_eq!(frames(48_002, 2), 24_001);
+    }
+
+    #[test]
+    fn every_kernel_phase_holds_the_speech_band_and_rejects_aliases() {
+        for rate in [48_000u32, 44_100] {
+            let converter = Converter::new(spec(rate, 1));
+            for phase in [0usize, 64, 128, 192, 255] {
+                let row = &converter.kernel[phase];
+                for pass in [300.0, 1_000.0, 3_000.0] {
+                    let gain = response(row, pass, rate);
+                    assert!(
+                        (gain - 1.0).abs() < 0.02,
+                        "{rate} Hz, phase {phase}, {pass} Hz: {gain}"
+                    );
+                }
+                for stop in [10_000.0, 12_000.0] {
+                    let gain = response(row, stop, rate);
+                    assert!(gain < 0.01, "{rate} Hz, phase {phase}, {stop} Hz: {gain}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn an_out_of_band_tone_is_removed_before_decimation() {
+        let source = tone(48_000, 11_000.0, 48_000);
+        let mut converter = Converter::new(spec(48_000, 1));
+        let mut out = Vec::new();
+        converter.push(&source, &mut out);
+
+        let input_level = amplitude(&source[24_000..], 5_500);
+        let aliased = amplitude(&out[8_000..], 2_500);
+        assert!(
+            aliased / input_level < 0.01,
+            "alias level {aliased} against source {input_level}"
+        );
+    }
+
+    #[test]
+    fn the_input_history_stays_bounded() {
+        let mut converter = Converter::new(spec(48_000, 1));
+        let mut out = Vec::new();
+        for _ in 0..2_400 {
+            converter.push(&[0.1], &mut out);
+        }
+        assert!(
+            converter.buffered() < 512,
+            "history grew to {} samples",
+            converter.buffered()
         );
     }
 

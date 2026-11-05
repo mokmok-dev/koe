@@ -3,3 +3,20 @@
 # them. The Linux file compiles here but needs a live PulseAudio server. Their
 # mutants would report as missed with no test able to run them.
 exclude_globs = ["crates/*/src/ffi.rs"]
+
+# These mutants keep the observable filter response inside the tolerance the
+# converter guarantees, or are equivalent to the original:
+# - the fractional phase only shifts the kernel by a fraction of a sample;
+# - `TAPS - 1` to `TAPS + 1`/`TAPS / 1` moves the window length from 47 to 49/48;
+# - flipping the sign of the phase is symmetric for a symmetric kernel;
+# - `>` and `>=` differ only when a row sums to exactly f32::EPSILON;
+# - a sample rate of 1 asks for 16000x the output, so the converter test hangs
+#   instead of failing, and the accessor test already covers the field.
+exclude_re = [
+  "convert.rs:120:32: replace \\* with / in Converter::interpolate",
+  "convert.rs:161:48: replace - with \\+ in build_kernel",
+  "convert.rs:164:58: replace - with \\+ in build_kernel",
+  "convert.rs:164:58: replace - with / in build_kernel",
+  "convert.rs:175:22: replace > with >= in build_kernel",
+  "config.rs:48:9: replace AudioSpec::sample_rate -> u32 with 1",
+]

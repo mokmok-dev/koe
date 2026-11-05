@@ -198,4 +198,20 @@ mod tests {
         assert_eq!(incomplete.transcript(), &transcript);
         assert_eq!(incomplete.into_transcript(), transcript);
     }
+
+    #[test]
+    fn incomplete_displays_the_error_and_the_kept_text_length() {
+        let transcript = Transcript::new(vec![segment(0, 400, "kept")], 0);
+        let incomplete = Incomplete::new(
+            Error::Backend {
+                operation: "run",
+                code: -3,
+            },
+            transcript,
+        );
+        assert_eq!(
+            incomplete.to_string(),
+            "speech backend `run` failed with code -3 (4 transcript bytes kept)"
+        );
+    }
 }
