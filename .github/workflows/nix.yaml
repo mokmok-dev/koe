@@ -1,3 +1,6 @@
+# Runs the flake checks on every pull request and on main. The aarch64-darwin
+# check builds the macOS speech shim with the Swift toolchain from the dev
+# inputs and runs its tests, so koe keeps no separate macOS workflow.
 name: nix
 on:
   pull_request:

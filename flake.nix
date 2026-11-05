@@ -90,7 +90,12 @@
                 inherit src;
                 pname = "koe";
                 strictDeps = true;
-                nativeBuildInputs = [ pkgs.cmake ];
+                # The Darwin stdenv has no swiftc, and the macOS speech shim
+                # cannot be built without it.
+                nativeBuildInputs = [
+                  pkgs.cmake
+                ]
+                ++ pkgs.lib.optional pkgs.stdenv.hostPlatform.isDarwin pkgs.swift;
               }
               // pkgs.lib.optionalAttrs pkgs.stdenv.hostPlatform.isLinux {
                 buildInputs = [ pkgs.libpulseaudio ];
@@ -156,10 +161,6 @@
               transcribeCoreTest = craneLib.cargoTest transcribeCoreArgs;
               transcribeFacadeClippy = craneLib.cargoClippy transcribeFacadeArgs;
               transcribeBackendClippy = craneLib.cargoClippy transcribeBackendArgs;
-            }
-            # The macOS shim needs a Swift toolchain at link time; nix only
-            # cross-checks its Rust side, so its tests run on a macOS runner.
-            // pkgs.lib.optionalAttrs pkgs.stdenv.hostPlatform.isLinux {
               transcribeFacadeTest = craneLib.cargoTest transcribeFacadeArgs;
               transcribeBackendTest = craneLib.cargoTest transcribeBackendArgs;
             }
@@ -215,7 +216,8 @@
                 rustToolchain
                 sccache
               ]
-              ++ pkgs.lib.optional pkgs.stdenv.hostPlatform.isLinux libpulseaudio;
+              ++ pkgs.lib.optional pkgs.stdenv.hostPlatform.isLinux libpulseaudio
+              ++ pkgs.lib.optional pkgs.stdenv.hostPlatform.isDarwin swift;
 
             shellHook = ''
               export RUSTC_WRAPPER="${pkgs.sccache}/bin/sccache"
