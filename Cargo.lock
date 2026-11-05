@@ -336,6 +336,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "koe-session-store"
+version = "2026.11.1"
+dependencies = [
+ "koe-session",
+]
+
+[[package]]
 name = "koe-transcribe"
 version = "2026.11.1"
 dependencies = [

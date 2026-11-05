@@ -8,6 +8,7 @@ members = [
   "crates/koe-record",
   "crates/koe-record-core",
   "crates/koe-session",
+  "crates/koe-session-store",
   "crates/koe-transcribe",
   "crates/koe-transcribe-core",
   "crates/koe-transcribe-ggml",
@@ -23,6 +24,7 @@ koe-capture-windows = { path = "crates/koe-capture-windows" }
 koe-record = { path = "crates/koe-record" }
 koe-record-core = { path = "crates/koe-record-core" }
 koe-session = { path = "crates/koe-session" }
+koe-session-store = { path = "crates/koe-session-store" }
 koe-transcribe = { path = "crates/koe-transcribe" }
 koe-transcribe-core = { path = "crates/koe-transcribe-core" }
 koe-transcribe-ggml = { path = "crates/koe-transcribe-ggml" }

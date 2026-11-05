@@ -128,6 +128,11 @@
                 cargoClippyExtraArgs = "--package koe-session --all-targets -- --deny warnings";
                 cargoTestExtraArgs = "--package koe-session";
               };
+              storeArgs = cargoCommonArgs // {
+                inherit cargoArtifacts;
+                cargoClippyExtraArgs = "--package koe-session-store --all-targets -- --deny warnings";
+                cargoTestExtraArgs = "--package koe-session-store";
+              };
               recordCoreArgs = cargoCommonArgs // {
                 inherit cargoArtifacts;
                 cargoClippyExtraArgs = "--package koe-record-core --all-targets -- --deny warnings";
@@ -176,6 +181,8 @@
               transcribeCoreTest = craneLib.cargoTest transcribeCoreArgs;
               sessionClippy = craneLib.cargoClippy sessionArgs;
               sessionTest = craneLib.cargoTest sessionArgs;
+              storeClippy = craneLib.cargoClippy storeArgs;
+              storeTest = craneLib.cargoTest storeArgs;
               recordCoreClippy = craneLib.cargoClippy recordCoreArgs;
               recordCoreTest = craneLib.cargoTest recordCoreArgs;
               recordClippy = craneLib.cargoClippy recordArgs;

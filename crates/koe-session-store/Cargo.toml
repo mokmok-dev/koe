@@ -1,0 +1,12 @@
+[package]
+description = "Durable session state for koe meetings"
+edition.workspace = true
+license.workspace = true
+name = "koe-session-store"
+version.workspace = true
+
+[dependencies]
+koe-session.workspace = true
+
+[lints]
+workspace = true
