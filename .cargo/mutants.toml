@@ -4,6 +4,12 @@
 # mutants would report as missed with no test able to run them.
 exclude_globs = ["crates/*/src/ffi.rs"]
 
-# Equivalent mutant: the comparison differs only when a kernel row sums to
-# exactly f32::EPSILON, which no input can produce.
-exclude_re = ["convert.rs:180:22: replace > with >= in build_kernel"]
+exclude_re = [
+  # Equivalent mutant: the comparison differs only when a kernel row sums to
+  # exactly f32::EPSILON, which no input can produce.
+  "convert.rs:180:22: replace > with >= in build_kernel",
+
+  # Equivalent mutant: the microphone and system audio bits are disjoint, so
+  # the meeting set is the same under `|` and `^`.
+  "koe-session/src/sources.rs:32:51: replace \\| with \\^",
+]
