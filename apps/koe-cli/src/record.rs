@@ -2,12 +2,12 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
 use koe_capture::{Source, StreamSpec};
-use koe_record::{Format, MAX_GAIN, RecordingSpec, Summary};
+use koe_record::{Error as RecordError, Format, MAX_GAIN, RecordingSpec, Summary};
 use koe_transcribe::{AudioSpec, Event, Model, Options};
 
 use crate::cli::RecordArgs;
@@ -171,6 +171,9 @@ pub fn execute(
             transcription.transcript.display()
         ));
     }
+    for warning in &outcome.warnings {
+        io.warning(format_args!("{warning}"));
+    }
     if outcome.summary.clipped_samples > 0 {
         io.warning(format_args!(
             "{} samples clipped",
@@ -201,6 +204,7 @@ fn live_sessions(
 struct RecordOutcome {
     summary: Summary,
     failure: Option<AppError>,
+    warnings: Vec<String>,
 }
 
 struct Pump<'a> {
@@ -209,6 +213,8 @@ struct Pump<'a> {
     failure: &'a Mutex<Option<AppError>>,
     stop: &'a Stop,
     writer: Option<&'a Mutex<TranscriptWriter>>,
+    ended: [AtomicBool; 2],
+    warnings: &'a Mutex<Vec<String>>,
 }
 
 fn pump(
@@ -233,6 +239,7 @@ fn pump(
     }
     let sink = Mutex::new(sink);
     let failure: Mutex<Option<AppError>> = Mutex::new(None);
+    let warnings = Mutex::new(Vec::new());
     let mut live: HashMap<Source, Box<dyn LiveRecognizer>> =
         live.unwrap_or_default().into_iter().collect();
     let context = Pump {
@@ -241,6 +248,8 @@ fn pump(
         failure: &failure,
         stop,
         writer: writer.as_ref(),
+        ended: [AtomicBool::new(false), AtomicBool::new(false)],
+        warnings: &warnings,
     };
     std::thread::scope(|scope| {
         for (source, spec) in &plan.sources {
@@ -258,12 +267,19 @@ fn pump(
         })
         .transpose();
     let failure = failure.into_inner().unwrap_or_else(PoisonError::into_inner);
+    let warnings = warnings
+        .into_inner()
+        .unwrap_or_else(PoisonError::into_inner);
     let summary = match finished {
         Ok(summary) => summary,
         Err(error) => return Err(failure.unwrap_or(error)),
     };
     writer_finished?;
-    Ok(RecordOutcome { summary, failure })
+    Ok(RecordOutcome {
+        summary,
+        failure,
+        warnings,
+    })
 }
 
 fn pump_source(
@@ -286,7 +302,11 @@ fn pump_source(
             if context.stop.requested() {
                 break;
             }
-            match stream.read(&mut buffer) {
+            let read = stream.read(&mut buffer);
+            if context.ended[source_index(source)].load(Ordering::Acquire) {
+                break;
+            }
+            match read {
                 Ok(0) => break,
                 Ok(frames) => {
                     let samples = &buffer[..frames * channels];
@@ -304,9 +324,17 @@ fn pump_source(
                     }
                     let mut sink = context.sink.lock().unwrap_or_else(PoisonError::into_inner);
                     if let Err(error) = sink.write(source, samples) {
-                        drop(sink);
-                        fail(context.failure, context.stop, error);
-                        break;
+                        if let Err(error) = recover_overflow(sink.as_mut(), context, source, error)
+                        {
+                            drop(sink);
+                            fail(context.failure, context.stop, error);
+                            break;
+                        }
+                        if let Err(error) = sink.write(source, samples) {
+                            drop(sink);
+                            fail(context.failure, context.stop, error);
+                            break;
+                        }
                     }
                 }
                 Err(error) => {
@@ -338,6 +366,46 @@ fn pump_source(
         if let Err(error) = writer.finish_source(source, transcript) {
             fail(context.failure, context.stop, error);
         }
+    }
+}
+
+fn recover_overflow(
+    sink: &mut dyn TrackSink,
+    context: &Pump<'_>,
+    source: Source,
+    error: AppError,
+) -> Result<(), AppError> {
+    match error {
+        AppError::Record(RecordError::InputOverflow(_)) => {
+            let other = other_source(source);
+            sink.end(other)?;
+            context.ended[source_index(other)].store(true, Ordering::Release);
+            context
+                .warnings
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .push(format!(
+                    "{other} delivered no audio; the recording continues without it"
+                ));
+            // The pair is gone, so this source can drain its backlog alone.
+            sink.write(source, &[])?;
+            Ok(())
+        }
+        other => Err(other),
+    }
+}
+
+const fn source_index(source: Source) -> usize {
+    match source {
+        Source::Microphone => 0,
+        Source::SystemAudio => 1,
+    }
+}
+
+const fn other_source(source: Source) -> Source {
+    match source {
+        Source::Microphone => Source::SystemAudio,
+        Source::SystemAudio => Source::Microphone,
     }
 }
 
@@ -811,6 +879,134 @@ mod tests {
             "recorded 0 frames over 0.000 s to take.wav\n"
         );
         assert!(err.is_empty());
+    }
+
+    #[test]
+    fn an_overflow_ends_the_silent_pair_and_keeps_recording() {
+        let host = FakeHost::default().with_sink().with_stream(
+            Source::Microphone,
+            FakeStream::new(1, vec![Ok(vec![0.25; 960]), Ok(Vec::new())]),
+        );
+        host.sink.lock().unwrap().overflow_write = true;
+        let (result, _) = run(&args("take.wav"), &host);
+        let outcome = result.unwrap();
+        assert!(outcome.failure.is_none());
+        assert_eq!(
+            outcome.warnings,
+            vec!["system audio delivered no audio; the recording continues without it".to_owned()]
+        );
+        let state = host.sink.lock().unwrap();
+        assert!(state.ended.contains(&Source::SystemAudio));
+        assert!(state.ended.contains(&Source::Microphone));
+        assert!(
+            state
+                .writes
+                .iter()
+                .any(|(source, samples)| { *source == Source::Microphone && samples.len() == 960 })
+        );
+        assert!(state.finished);
+    }
+
+    #[test]
+    fn an_ended_source_stops_without_failing_the_recording() {
+        let mut args = args("take.wav");
+        args.source = SourceChoice::Both;
+        args.channels = ChannelChoice::Stereo;
+        let host = FakeHost::default()
+            .with_sink()
+            .with_stream(
+                Source::Microphone,
+                FakeStream::new(1, vec![Ok(vec![0.25; 960]), Ok(Vec::new())]),
+            )
+            .with_stream(
+                Source::SystemAudio,
+                FakeStream::new(2, vec![Ok(vec![0.5; 960]), Ok(Vec::new())])
+                    .with_delay(Duration::from_millis(100)),
+            );
+        host.sink.lock().unwrap().overflow_write = true;
+        let (result, _) = run(&args, &host);
+        let outcome = result.unwrap();
+        assert!(outcome.failure.is_none());
+        let state = host.sink.lock().unwrap();
+        assert!(state.ended.contains(&Source::SystemAudio));
+        assert!(
+            !state
+                .writes
+                .iter()
+                .any(|(source, _)| *source == Source::SystemAudio)
+        );
+        assert!(
+            state
+                .writes
+                .iter()
+                .any(|(source, samples)| { *source == Source::Microphone && samples.len() == 960 })
+        );
+    }
+
+    #[test]
+    fn an_overflow_end_failure_is_returned() {
+        let host = FakeHost::default().with_sink().with_stream(
+            Source::Microphone,
+            FakeStream::new(1, vec![Ok(vec![0.25; 960]), Ok(Vec::new())]),
+        );
+        {
+            let mut state = host.sink.lock().unwrap();
+            state.overflow_write = true;
+            state.fail_end = true;
+        }
+        let (result, _) = run(&args("take.wav"), &host);
+        match failure(result) {
+            AppError::Usage(message) => assert_eq!(message, "end failed"),
+            other => panic!("expected the end failure, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn an_overflow_drain_failure_is_returned() {
+        let host = FakeHost::default().with_sink().with_stream(
+            Source::Microphone,
+            FakeStream::new(1, vec![Ok(vec![0.25; 960]), Ok(Vec::new())]),
+        );
+        {
+            let mut state = host.sink.lock().unwrap();
+            state.overflow_write = true;
+            state.fail_write = true;
+        }
+        let (result, _) = run(&args("take.wav"), &host);
+        match failure(result) {
+            AppError::Usage(message) => assert_eq!(message, "write failed"),
+            other => panic!("expected the write failure, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn execute_prints_the_overflow_warning() {
+        let host = FakeHost::default().with_sink().with_stream(
+            Source::Microphone,
+            FakeStream::new(1, vec![Ok(vec![0.25; 960]), Ok(Vec::new())]),
+        );
+        host.sink.lock().unwrap().overflow_write = true;
+        let interrupt = interrupt();
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        let mut io = Io {
+            out: &mut out,
+            err: &mut err,
+        };
+        execute(&args("take.wav"), &host, &interrupt, &mut io).unwrap();
+        assert!(
+            String::from_utf8(err)
+                .unwrap()
+                .contains("system audio delivered no audio")
+        );
+    }
+
+    #[test]
+    fn source_pairs_name_the_other_source() {
+        assert_eq!(source_index(Source::Microphone), 0);
+        assert_eq!(source_index(Source::SystemAudio), 1);
+        assert_eq!(other_source(Source::Microphone), Source::SystemAudio);
+        assert_eq!(other_source(Source::SystemAudio), Source::Microphone);
     }
 
     #[test]

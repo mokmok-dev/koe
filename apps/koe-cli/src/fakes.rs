@@ -7,7 +7,7 @@ use std::path::Path;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use koe_capture::{DeviceInfo, Source, StreamSpec};
-use koe_record::{RecordingSpec, Summary};
+use koe_record::{Error as RecordError, RecordingSpec, Summary};
 use koe_transcribe::{AudioSpec, Event, Incomplete, Model, Options, Transcript};
 
 use crate::error::AppError;
@@ -174,6 +174,7 @@ impl Host for FakeHost {
 pub struct FakeStream {
     script: Mutex<VecDeque<Result<Vec<f32>, AppError>>>,
     channels: usize,
+    delay: Option<std::time::Duration>,
     /// The buffer length of every read the pump made.
     pub reads: Arc<Mutex<Vec<usize>>>,
 }
@@ -185,13 +186,23 @@ impl FakeStream {
         Self {
             script: Mutex::new(script.into()),
             channels,
+            delay: None,
             reads: Arc::new(Mutex::new(Vec::new())),
         }
+    }
+
+    /// Sleeps for `delay` before the first read.
+    pub fn with_delay(mut self, delay: std::time::Duration) -> Self {
+        self.delay = Some(delay);
+        self
     }
 }
 
 impl BlockStream for FakeStream {
     fn read(&mut self, out: &mut [f32]) -> Result<usize, AppError> {
+        if let Some(delay) = self.delay.take() {
+            std::thread::sleep(delay);
+        }
         self.reads.lock().unwrap().push(out.len());
         let next = self
             .script
@@ -223,6 +234,8 @@ pub struct SinkState {
     pub finished: bool,
     /// Whether writes fail.
     pub fail_write: bool,
+    /// Whether the next write reports an input overflow.
+    pub overflow_write: bool,
     /// Whether ends fail.
     pub fail_end: bool,
     /// Whether finishing fails.
@@ -240,6 +253,7 @@ impl Default for SinkState {
             ended: Vec::new(),
             finished: false,
             fail_write: false,
+            overflow_write: false,
             fail_end: false,
             fail_finish: false,
             summary: Summary {
@@ -276,6 +290,13 @@ impl TrackSink for FakeSink {
 
     fn write(&mut self, source: Source, samples: &[f32]) -> Result<(), AppError> {
         let mut state = self.state();
+        if state.ended.contains(&source) {
+            return Err(AppError::Record(RecordError::SourceEnded(source)));
+        }
+        if state.overflow_write {
+            state.overflow_write = false;
+            return Err(AppError::Record(RecordError::InputOverflow(source)));
+        }
         if state.fail_write {
             return Err(AppError::usage("write failed"));
         }
