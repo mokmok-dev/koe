@@ -1,6 +1,8 @@
 //! The application's error type.
 
 use std::fmt;
+use std::io;
+use std::path::PathBuf;
 
 use koe_capture::Error as CaptureError;
 use koe_record::Error as RecordError;
@@ -23,6 +25,15 @@ pub enum AppError {
     Wav(wav::Error),
     /// The recorder was finished before this operation ran.
     RecorderFinished,
+    /// A transcript or other file operation failed.
+    Io {
+        /// The operation that failed.
+        operation: &'static str,
+        /// The path the operation used.
+        path: PathBuf,
+        /// The underlying failure.
+        source: io::Error,
+    },
 }
 
 impl AppError {
@@ -56,6 +67,11 @@ impl fmt::Display for AppError {
             Self::Transcribe(error) => write!(formatter, "transcription failed: {error}"),
             Self::Wav(error) => write!(formatter, "audio file: {error}"),
             Self::RecorderFinished => formatter.write_str("the recorder was already finished"),
+            Self::Io {
+                operation,
+                path,
+                source,
+            } => write!(formatter, "{operation} `{}`: {source}", path.display()),
         }
     }
 }
@@ -87,6 +103,8 @@ impl From<wav::Error> for AppError {
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used)]
+
+    use std::io;
 
     use super::*;
 
@@ -142,6 +160,14 @@ mod tests {
             (
                 AppError::RecorderFinished,
                 "the recorder was already finished".to_owned(),
+            ),
+            (
+                AppError::Io {
+                    operation: "write transcript",
+                    path: PathBuf::from("/tmp/take.txt"),
+                    source: io::Error::from(io::ErrorKind::NotFound),
+                },
+                "write transcript `/tmp/take.txt`: entity not found".to_owned(),
             ),
         ];
         for (error, expected) in cases {

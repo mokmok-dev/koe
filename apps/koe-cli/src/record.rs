@@ -1,5 +1,6 @@
 //! The `record` command.
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex, PoisonError};
@@ -7,14 +8,19 @@ use std::time::{Duration, Instant};
 
 use koe_capture::{Source, StreamSpec};
 use koe_record::{Format, MAX_GAIN, RecordingSpec, Summary};
+use koe_transcribe::{AudioSpec, Event, Model, Options};
 
 use crate::cli::RecordArgs;
 use crate::error::AppError;
-use crate::host::{Host, TrackSink};
+use crate::host::{Host, LiveRecognizer, TrackSink};
 use crate::io::Io;
+use crate::model::{model_from_path, options};
+use crate::transcript::TranscriptWriter;
 
 /// Frames each capture thread hands the recorder per read.
 const BLOCK_FRAMES: usize = 960;
+
+type LiveSessions = Vec<(Source, Box<dyn LiveRecognizer>)>;
 
 /// A validated recording request.
 #[derive(Debug)]
@@ -23,6 +29,16 @@ pub struct RecordPlan {
     spec: RecordingSpec,
     sources: Vec<(Source, StreamSpec)>,
     gain: f32,
+    transcription: Option<TranscriptionPlan>,
+}
+
+/// The transcription request that runs beside the recorder.
+#[derive(Debug)]
+struct TranscriptionPlan {
+    model: Model,
+    transcript: PathBuf,
+    options: Options,
+    timestamps: bool,
 }
 
 impl RecordPlan {
@@ -51,8 +67,34 @@ impl RecordPlan {
             spec,
             sources,
             gain,
+            transcription: transcription_plan(args)?,
         })
     }
+}
+
+fn transcription_plan(args: &RecordArgs) -> Result<Option<TranscriptionPlan>, AppError> {
+    if args.no_transcribe {
+        return Ok(None);
+    }
+    let model = match &args.model {
+        Some(path) => model_from_path(path)?,
+        None => Model::system_speech(),
+    };
+    let transcript = args
+        .transcript
+        .clone()
+        .unwrap_or_else(|| args.output.with_extension("txt"));
+    if transcript == args.output {
+        return Err(AppError::usage(
+            "the transcript path must differ from the output path",
+        ));
+    }
+    Ok(Some(TranscriptionPlan {
+        model,
+        transcript,
+        options: options(args.language.as_deref()),
+        timestamps: args.timestamps,
+    }))
 }
 
 /// Converts a decibel gain to the linear factor the mixer takes.
@@ -103,7 +145,7 @@ impl Stop {
     }
 }
 
-/// Records `args` into its output file.
+/// Records `args` into its output file and transcript.
 pub fn execute(
     args: &RecordArgs,
     host: &dyn Host,
@@ -112,20 +154,76 @@ pub fn execute(
 ) -> Result<(), AppError> {
     let plan = RecordPlan::new(args)?;
     let stop = Stop::new(interrupt, args.duration);
-    let summary = pump(&plan, host, &stop)?;
+    let live = match &plan.transcription {
+        Some(transcription) => Some(live_sessions(&plan, transcription, host)?),
+        None => None,
+    };
+    let outcome = pump(&plan, host, &stop, live)?;
     io.line(format_args!(
         "recorded {} frames over {:.3} s to {}",
-        summary.frames,
-        summary.duration.as_secs_f64(),
+        outcome.summary.frames,
+        outcome.summary.duration.as_secs_f64(),
         plan.output.display()
     ));
-    if summary.clipped_samples > 0 {
-        io.warning(format_args!("{} samples clipped", summary.clipped_samples));
+    if let Some(transcription) = &plan.transcription {
+        io.line(format_args!(
+            "transcript: {}",
+            transcription.transcript.display()
+        ));
+    }
+    if outcome.summary.clipped_samples > 0 {
+        io.warning(format_args!(
+            "{} samples clipped",
+            outcome.summary.clipped_samples
+        ));
+    }
+    if let Some(error) = outcome.failure {
+        return Err(error);
     }
     Ok(())
 }
 
-fn pump(plan: &RecordPlan, host: &dyn Host, stop: &Stop) -> Result<Summary, AppError> {
+fn live_sessions(
+    plan: &RecordPlan,
+    transcription: &TranscriptionPlan,
+    host: &dyn Host,
+) -> Result<LiveSessions, AppError> {
+    let transcriber = host.live_transcriber(&transcription.model, &transcription.options)?;
+    let mut sessions = Vec::with_capacity(plan.sources.len());
+    for (source, spec) in &plan.sources {
+        let audio =
+            AudioSpec::new(spec.sample_rate(), spec.channels()).map_err(AppError::Transcribe)?;
+        sessions.push((*source, transcriber.live(audio)?));
+    }
+    Ok(sessions)
+}
+
+struct RecordOutcome {
+    summary: Summary,
+    failure: Option<AppError>,
+}
+
+struct Pump<'a> {
+    host: &'a dyn Host,
+    sink: &'a Mutex<Box<dyn TrackSink>>,
+    failure: &'a Mutex<Option<AppError>>,
+    stop: &'a Stop,
+    writer: Option<&'a Mutex<TranscriptWriter>>,
+}
+
+fn pump(
+    plan: &RecordPlan,
+    host: &dyn Host,
+    stop: &Stop,
+    live: Option<LiveSessions>,
+) -> Result<RecordOutcome, AppError> {
+    let writer = match &plan.transcription {
+        Some(transcription) => Some(Mutex::new(TranscriptWriter::create(
+            &transcription.transcript,
+            transcription.timestamps,
+        )?)),
+        None => None,
+    };
     let mut sink = host.create_recorder(&plan.output, plan.spec)?;
     for (source, spec) in &plan.sources {
         sink.add_source(*source, *spec)?;
@@ -135,33 +233,49 @@ fn pump(plan: &RecordPlan, host: &dyn Host, stop: &Stop) -> Result<Summary, AppE
     }
     let sink = Mutex::new(sink);
     let failure: Mutex<Option<AppError>> = Mutex::new(None);
+    let mut live: HashMap<Source, Box<dyn LiveRecognizer>> =
+        live.unwrap_or_default().into_iter().collect();
+    let context = Pump {
+        host,
+        sink: &sink,
+        failure: &failure,
+        stop,
+        writer: writer.as_ref(),
+    };
     std::thread::scope(|scope| {
         for (source, spec) in &plan.sources {
-            let sink = &sink;
-            let failure = &failure;
-            scope.spawn(move || pump_source(host, sink, failure, stop, *source, *spec));
+            let context = &context;
+            let live = live.remove(source);
+            scope.spawn(move || pump_source(context, *source, *spec, live));
         }
     });
     let mut sink = sink.into_inner().unwrap_or_else(PoisonError::into_inner);
     let finished = sink.finish();
-    if let Some(error) = failure.into_inner().unwrap_or_else(PoisonError::into_inner) {
-        return Err(error);
-    }
-    finished
+    let writer_finished = writer
+        .map(|writer| {
+            let writer = writer.into_inner().unwrap_or_else(PoisonError::into_inner);
+            writer.finish()
+        })
+        .transpose();
+    let failure = failure.into_inner().unwrap_or_else(PoisonError::into_inner);
+    let summary = match finished {
+        Ok(summary) => summary,
+        Err(error) => return Err(failure.unwrap_or(error)),
+    };
+    writer_finished?;
+    Ok(RecordOutcome { summary, failure })
 }
 
 fn pump_source(
-    host: &dyn Host,
-    sink: &Mutex<Box<dyn TrackSink>>,
-    failure: &Mutex<Option<AppError>>,
-    stop: &Stop,
+    context: &Pump<'_>,
     source: Source,
     spec: StreamSpec,
+    mut live: Option<Box<dyn LiveRecognizer>>,
 ) {
-    let mut stream = match host.open_capture(spec) {
+    let mut stream = match context.host.open_capture(spec) {
         Ok(stream) => Some(stream),
         Err(error) => {
-            fail(failure, stop, error);
+            fail(context.failure, context.stop, error);
             None
         }
     };
@@ -169,31 +283,81 @@ fn pump_source(
         let channels = usize::from(spec.channels());
         let mut buffer = vec![0.0_f32; channels * BLOCK_FRAMES];
         loop {
-            if stop.requested() {
+            if context.stop.requested() {
                 break;
             }
             match stream.read(&mut buffer) {
                 Ok(0) => break,
                 Ok(frames) => {
                     let samples = &buffer[..frames * channels];
-                    let mut sink = sink.lock().unwrap_or_else(PoisonError::into_inner);
+                    if let Some(session) = live.as_ref() {
+                        if let Err(error) = session.feed(samples) {
+                            fail(context.failure, context.stop, error);
+                            break;
+                        }
+                        if let Some(writer) = context.writer
+                            && let Err(error) = drain_events(session.as_ref(), writer, source)
+                        {
+                            fail(context.failure, context.stop, error);
+                            break;
+                        }
+                    }
+                    let mut sink = context.sink.lock().unwrap_or_else(PoisonError::into_inner);
                     if let Err(error) = sink.write(source, samples) {
                         drop(sink);
-                        fail(failure, stop, error);
+                        fail(context.failure, context.stop, error);
                         break;
                     }
                 }
                 Err(error) => {
-                    fail(failure, stop, error);
+                    fail(context.failure, context.stop, error);
                     break;
                 }
             }
         }
     }
-    let mut sink = sink.lock().unwrap_or_else(PoisonError::into_inner);
-    if let Err(error) = sink.end(source) {
-        fail(failure, stop, error);
+    {
+        let mut sink = context.sink.lock().unwrap_or_else(PoisonError::into_inner);
+        if let Err(error) = sink.end(source) {
+            fail(context.failure, context.stop, error);
+        }
     }
+    let transcript = live.take().map(|session| match session.finish() {
+        Ok(transcript) => transcript,
+        Err(incomplete) => {
+            fail(
+                context.failure,
+                context.stop,
+                AppError::Transcribe(incomplete.error().clone()),
+            );
+            incomplete.into_transcript()
+        }
+    });
+    if let (Some(writer), Some(transcript)) = (context.writer, transcript.as_ref()) {
+        let mut writer = writer.lock().unwrap_or_else(PoisonError::into_inner);
+        if let Err(error) = writer.finish_source(source, transcript) {
+            fail(context.failure, context.stop, error);
+        }
+    }
+}
+
+fn drain_events(
+    live: &dyn LiveRecognizer,
+    writer: &Mutex<TranscriptWriter>,
+    source: Source,
+) -> Result<(), AppError> {
+    while let Some(event) = live.poll()? {
+        if let Event::Committed {
+            text,
+            start_ms,
+            end_ms,
+        } = event
+        {
+            let mut writer = writer.lock().unwrap_or_else(PoisonError::into_inner);
+            writer.write_committed(source, start_ms, end_ms, text.as_ref())?;
+        }
+    }
+    Ok(())
 }
 
 fn fail(failure: &Mutex<Option<AppError>>, stop: &Stop, error: AppError) {
@@ -214,10 +378,11 @@ mod tests {
 
     use koe_capture::Error as CaptureError;
     use koe_record::{Channels, Error as RecordError, Summary};
+    use koe_transcribe::{Error as TranscribeError, Incomplete, Segment, Transcript};
 
     use super::*;
     use crate::cli::{ChannelChoice, SourceChoice};
-    use crate::fakes::{FakeHost, FakeStream};
+    use crate::fakes::{FakeHost, FakeLiveRecognizer, FakeLiveTranscriber, FakeStream};
 
     static NOW_MS: AtomicU64 = AtomicU64::new(0);
     static CLOCK: Mutex<()> = Mutex::new(());
@@ -235,7 +400,20 @@ mod tests {
             rate: 48_000,
             channels: ChannelChoice::Mono,
             gain: 0.0,
+            model: None,
+            transcript: None,
+            language: None,
+            timestamps: false,
+            no_transcribe: true,
         }
+    }
+
+    fn transcribing_args(output: &str, transcript: PathBuf) -> RecordArgs {
+        let mut args = args(output);
+        args.no_transcribe = false;
+        args.model = Some(PathBuf::from("tiny.gguf"));
+        args.transcript = Some(transcript);
+        args
     }
 
     fn interrupt() -> Arc<AtomicBool> {
@@ -245,12 +423,23 @@ mod tests {
     fn run(
         plan_args: &RecordArgs,
         host: &FakeHost,
-    ) -> (Result<Summary, AppError>, Arc<AtomicBool>) {
+    ) -> (Result<RecordOutcome, AppError>, Arc<AtomicBool>) {
         let interrupt = interrupt();
         let plan = RecordPlan::new(plan_args).unwrap();
         let stop = Stop::new(&interrupt, plan_args.duration);
-        let result = pump(&plan, host, &stop);
+        let live = plan
+            .transcription
+            .as_ref()
+            .map(|transcription| live_sessions(&plan, transcription, host).unwrap());
+        let result = pump(&plan, host, &stop, live);
         (result, interrupt)
+    }
+
+    fn failure(result: Result<RecordOutcome, AppError>) -> AppError {
+        match result {
+            Ok(outcome) => outcome.failure.expect("the pump records a source failure"),
+            Err(error) => error,
+        }
     }
 
     #[test]
@@ -269,6 +458,7 @@ mod tests {
         assert_eq!(plan.sources[0].1.channels(), 1);
         assert_eq!(plan.sources[1].0, Source::SystemAudio);
         assert_eq!(plan.sources[1].1.channels(), 2);
+        assert!(plan.transcription.is_none());
     }
 
     #[test]
@@ -387,7 +577,7 @@ mod tests {
             Source::Microphone,
             FakeStream::new(1, vec![Ok(vec![0.25; 960])]),
         );
-        let result = pump(&plan, &host, &stop);
+        let result = pump(&plan, &host, &stop, None);
         assert!(result.is_ok());
         let state = host.sink.lock().unwrap();
         assert!(state.writes.is_empty());
@@ -406,7 +596,7 @@ mod tests {
             Source::Microphone,
             FakeStream::new(1, vec![Ok(vec![0.25; 960])]),
         );
-        let result = pump(&plan, &host, &stop);
+        let result = pump(&plan, &host, &stop, None);
         assert!(result.is_ok());
         assert!(host.sink.lock().unwrap().writes.is_empty());
     }
@@ -454,9 +644,10 @@ mod tests {
             AppError::Capture(CaptureError::Unsupported),
         );
         let (result, interrupt) = run(&args("take.wav"), &host);
+        let error = failure(result);
         assert!(matches!(
-            result,
-            Err(AppError::Capture(CaptureError::Unsupported))
+            error,
+            AppError::Capture(CaptureError::Unsupported)
         ));
         assert!(interrupt.load(Ordering::Acquire));
         let state = host.sink.lock().unwrap();
@@ -474,12 +665,13 @@ mod tests {
             .with_sink()
             .with_stream(Source::Microphone, FakeStream::new(1, vec![Err(error)]));
         let (result, _) = run(&args("take.wav"), &host);
+        let error = failure(result);
         assert!(matches!(
-            result,
-            Err(AppError::Capture(CaptureError::Backend {
+            error,
+            AppError::Capture(CaptureError::Backend {
                 operation: "read",
                 code: 5
-            }))
+            })
         ));
         assert_eq!(host.sink.lock().unwrap().ended, [Source::Microphone]);
     }
@@ -492,8 +684,8 @@ mod tests {
         );
         host.sink.lock().unwrap().fail_write = true;
         let (result, _) = run(&args("take.wav"), &host);
-        match result {
-            Err(AppError::Usage(message)) => assert_eq!(message, "write failed"),
+        match failure(result) {
+            AppError::Usage(message) => assert_eq!(message, "write failed"),
             other => panic!("expected the write failure, got {other:?}"),
         }
         let state = host.sink.lock().unwrap();
@@ -508,8 +700,8 @@ mod tests {
             .with_stream(Source::Microphone, FakeStream::new(1, vec![Ok(Vec::new())]));
         host.sink.lock().unwrap().fail_end = true;
         let (result, _) = run(&args("take.wav"), &host);
-        match result {
-            Err(AppError::Usage(message)) => assert_eq!(message, "end failed"),
+        match failure(result) {
+            AppError::Usage(message) => assert_eq!(message, "end failed"),
             other => panic!("expected the end failure, got {other:?}"),
         }
         assert!(host.sink.lock().unwrap().finished);
@@ -522,8 +714,8 @@ mod tests {
             .with_stream(Source::Microphone, FakeStream::new(1, vec![Ok(Vec::new())]));
         host.sink.lock().unwrap().fail_finish = true;
         let (result, _) = run(&args("take.wav"), &host);
-        match result {
-            Err(AppError::Usage(message)) => assert_eq!(message, "finish failed"),
+        match failure(result) {
+            AppError::Usage(message) => assert_eq!(message, "finish failed"),
             other => panic!("expected the finish failure, got {other:?}"),
         }
     }
@@ -539,8 +731,8 @@ mod tests {
             state.fail_finish = true;
         }
         let (result, _) = run(&args("take.wav"), &host);
-        match result {
-            Err(AppError::Usage(message)) => assert_eq!(message, "end failed"),
+        match failure(result) {
+            AppError::Usage(message) => assert_eq!(message, "end failed"),
             other => panic!("expected the end failure, got {other:?}"),
         }
     }
@@ -555,10 +747,8 @@ mod tests {
         args.rate = 44_100;
         let (result, _) = run(&args, &host);
         assert!(matches!(
-            result,
-            Err(AppError::Record(RecordError::UnsupportedRate {
-                rate: 44_100
-            }))
+            failure(result),
+            AppError::Record(RecordError::UnsupportedRate { rate: 44_100 })
         ));
         assert!(host.opens_seen.lock().unwrap().is_empty());
     }
@@ -621,5 +811,231 @@ mod tests {
             "recorded 0 frames over 0.000 s to take.wav\n"
         );
         assert!(err.is_empty());
+    }
+
+    #[test]
+    fn the_default_transcription_plan_uses_the_system_model_and_a_sibling_txt() {
+        let mut args = args("take.wav");
+        args.no_transcribe = false;
+        let plan = RecordPlan::new(&args).unwrap();
+        let transcription = plan.transcription.as_ref().unwrap();
+        assert_eq!(transcription.model, Model::system_speech());
+        assert_eq!(transcription.transcript, PathBuf::from("take.txt"));
+        assert_eq!(transcription.options.language_tag(), None);
+        assert!(!transcription.timestamps);
+    }
+
+    #[test]
+    fn an_explicit_transcription_plan_keeps_its_options() {
+        let mut args = args("take.ogg");
+        args.no_transcribe = false;
+        args.model = Some(PathBuf::from("tiny.gguf"));
+        args.transcript = Some(PathBuf::from("notes.txt"));
+        args.language = Some("ja".to_owned());
+        args.timestamps = true;
+        let plan = RecordPlan::new(&args).unwrap();
+        let transcription = plan.transcription.as_ref().unwrap();
+        assert_eq!(transcription.model, Model::gguf("tiny.gguf"));
+        assert_eq!(transcription.transcript, PathBuf::from("notes.txt"));
+        assert_eq!(transcription.options.language_tag(), Some("ja"));
+        assert!(transcription.timestamps);
+    }
+
+    #[test]
+    fn a_transcript_path_equal_to_the_output_is_a_usage_error() {
+        let mut args = args("take.ogg");
+        args.no_transcribe = false;
+        args.transcript = Some(PathBuf::from("take.ogg"));
+        let error = RecordPlan::new(&args).unwrap_err();
+        assert!(matches!(&error, AppError::Usage(_)));
+        assert_eq!(error.exit_code(), 2);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_non_utf8_model_path_is_a_usage_error() {
+        use std::ffi::OsString;
+        use std::os::unix::ffi::OsStringExt;
+
+        let mut args = args("take.wav");
+        args.no_transcribe = false;
+        args.model = Some(PathBuf::from(OsString::from_vec(vec![0xFF])));
+        let error = RecordPlan::new(&args).unwrap_err();
+        assert!(matches!(&error, AppError::Usage(_)));
+        assert_eq!(error.exit_code(), 2);
+    }
+
+    fn live_host(transcript: PathBuf, session: FakeLiveRecognizer) -> (RecordArgs, FakeHost) {
+        let host = FakeHost::default()
+            .with_sink()
+            .with_stream(
+                Source::Microphone,
+                FakeStream::new(1, vec![Ok(vec![0.25; 960]), Ok(Vec::new())]),
+            )
+            .with_live_transcriber(Box::new(FakeLiveTranscriber::new(vec![session])));
+        (transcribing_args("take.wav", transcript), host)
+    }
+
+    fn recorded_transcript() -> Transcript {
+        Transcript::new(
+            vec![
+                Segment::new(0, 100, "hello"),
+                Segment::new(100, 200, "world"),
+            ],
+            0,
+        )
+    }
+
+    #[test]
+    fn a_block_is_fed_to_the_live_session_and_the_transcript_is_written() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("take.txt");
+        let event = Event::Committed {
+            text: "hello".into(),
+            start_ms: 0,
+            end_ms: 100,
+        };
+        let session = FakeLiveRecognizer::new(Ok(recorded_transcript())).with_events(vec![event]);
+        let feeds = Arc::clone(&session.feeds);
+        let (mut args, host) = live_host(path.clone(), session);
+        args.language = Some("ja".to_owned());
+        let (result, _) = run(&args, &host);
+        assert!(result.is_ok());
+        assert_eq!(host.sink.lock().unwrap().writes.len(), 1);
+        assert_eq!(feeds.lock().unwrap().len(), 1);
+        assert_eq!(feeds.lock().unwrap()[0], vec![0.25; 960]);
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "microphone: hello\nmicrophone: world\n"
+        );
+        assert_eq!(
+            host.live_models_seen.lock().unwrap().as_slice(),
+            [Model::gguf("tiny.gguf")]
+        );
+        assert_eq!(
+            host.live_options_seen.lock().unwrap()[0].language_tag(),
+            Some("ja")
+        );
+    }
+
+    #[test]
+    fn a_live_feed_failure_is_returned_and_the_final_text_is_written() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("take.txt");
+        let mut session = FakeLiveRecognizer::new(Ok(recorded_transcript()));
+        session.fail_feed = true;
+        let (args, host) = live_host(path.clone(), session);
+        let (result, _) = run(&args, &host);
+        match failure(result) {
+            AppError::Usage(message) => assert_eq!(message, "feed failed"),
+            other => panic!("expected the feed failure, got {other:?}"),
+        }
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "microphone: hello\nmicrophone: world\n"
+        );
+    }
+
+    #[test]
+    fn a_live_poll_failure_is_returned_and_the_final_text_is_written() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("take.txt");
+        let mut session = FakeLiveRecognizer::new(Ok(recorded_transcript()));
+        session.fail_poll = true;
+        let (args, host) = live_host(path.clone(), session);
+        let (result, _) = run(&args, &host);
+        match failure(result) {
+            AppError::Usage(message) => assert_eq!(message, "poll failed"),
+            other => panic!("expected the poll failure, got {other:?}"),
+        }
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "microphone: hello\nmicrophone: world\n"
+        );
+    }
+
+    #[test]
+    fn a_live_finish_failure_is_returned_and_the_committed_text_is_written() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("take.txt");
+        let incomplete = Incomplete::new(TranscribeError::Unsupported, recorded_transcript());
+        let session = FakeLiveRecognizer::new(Err(incomplete));
+        let (args, host) = live_host(path.clone(), session);
+        let (result, _) = run(&args, &host);
+        assert!(matches!(
+            failure(result),
+            AppError::Transcribe(TranscribeError::Unsupported)
+        ));
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "microphone: hello\nmicrophone: world\n"
+        );
+    }
+
+    #[test]
+    fn a_transcript_create_failure_is_returned_before_the_recorder() {
+        let session = FakeLiveRecognizer::new(Ok(recorded_transcript()));
+        let (args, host) = live_host(PathBuf::from("/nonexistent/koe/take.txt"), session);
+        let (result, _) = run(&args, &host);
+        assert!(matches!(
+            failure(result),
+            AppError::Io {
+                operation: "create transcript",
+                ..
+            }
+        ));
+        assert!(host.sink.lock().unwrap().added.is_empty());
+    }
+
+    #[test]
+    fn execute_returns_a_live_setup_error_before_the_audio_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let output = dir.path().join("take.wav");
+        let host =
+            FakeHost::default().with_live_error(AppError::Transcribe(TranscribeError::Unsupported));
+        let args = transcribing_args(output.to_str().unwrap(), dir.path().join("take.txt"));
+        let interrupt = interrupt();
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        let mut io = Io {
+            out: &mut out,
+            err: &mut err,
+        };
+        let error = execute(&args, &host, &interrupt, &mut io).unwrap_err();
+        assert!(matches!(
+            error,
+            AppError::Transcribe(TranscribeError::Unsupported)
+        ));
+        assert!(out.is_empty());
+        assert!(err.is_empty());
+        assert!(!output.exists());
+    }
+
+    #[test]
+    fn execute_reports_the_transcript_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let output = dir.path().join("take.wav");
+        let transcript = dir.path().join("take.txt");
+        let session = FakeLiveRecognizer::new(Ok(Transcript::default()));
+        let host = FakeHost::default()
+            .with_sink()
+            .with_stream(
+                Source::Microphone,
+                FakeStream::new(1, vec![Ok(vec![0.25; 960]), Ok(Vec::new())]),
+            )
+            .with_live_transcriber(Box::new(FakeLiveTranscriber::new(vec![session])));
+        let args = transcribing_args(output.to_str().unwrap(), transcript.clone());
+        let interrupt = interrupt();
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        let mut io = Io {
+            out: &mut out,
+            err: &mut err,
+        };
+        execute(&args, &host, &interrupt, &mut io).unwrap();
+        let text = String::from_utf8(out).unwrap();
+        assert!(text.contains("transcript: "));
+        assert!(text.contains(transcript.to_str().unwrap()));
+        assert!(transcript.exists());
     }
 }

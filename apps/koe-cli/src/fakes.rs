@@ -8,10 +8,10 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use koe_capture::{DeviceInfo, Source, StreamSpec};
 use koe_record::{RecordingSpec, Summary};
-use koe_transcribe::{AudioSpec, Incomplete, Model, Options, Transcript};
+use koe_transcribe::{AudioSpec, Event, Incomplete, Model, Options, Transcript};
 
 use crate::error::AppError;
-use crate::host::{BlockStream, Host, Recognizer, TrackSink};
+use crate::host::{BlockStream, Host, LiveRecognizer, LiveTranscriber, Recognizer, TrackSink};
 
 /// A host whose every reply is scripted by the test.
 #[derive(Default)]
@@ -20,12 +20,17 @@ pub struct FakeHost {
     opens: Mutex<HashMap<Source, VecDeque<Result<FakeStream, AppError>>>>,
     recorder: Mutex<Option<Result<FakeSink, AppError>>>,
     recognizer: Mutex<Option<Result<Box<dyn Recognizer>, AppError>>>,
+    live: Mutex<Option<Result<Box<dyn LiveTranscriber>, AppError>>>,
     /// The sink state the scripted recorder shares with the test.
     pub sink: Arc<Mutex<SinkState>>,
     /// Every stream spec the pump asked to open.
     pub opens_seen: Mutex<Vec<StreamSpec>>,
     /// Every model the transcribe command asked for.
     pub models_seen: Mutex<Vec<Model>>,
+    /// Every model the record command asked to stream.
+    pub live_models_seen: Mutex<Vec<Model>>,
+    /// Every option set the record command asked to stream.
+    pub live_options_seen: Mutex<Vec<Options>>,
 }
 
 impl FakeHost {
@@ -91,6 +96,18 @@ impl FakeHost {
         *self.recognizer.lock().unwrap() = Some(Err(error));
         self
     }
+
+    /// Scripts a streaming transcriber.
+    pub fn with_live_transcriber(self, transcriber: Box<dyn LiveTranscriber>) -> Self {
+        *self.live.lock().unwrap() = Some(Ok(transcriber));
+        self
+    }
+
+    /// Scripts a streaming transcriber creation failure.
+    pub fn with_live_error(self, error: AppError) -> Self {
+        *self.live.lock().unwrap() = Some(Err(error));
+        self
+    }
 }
 
 impl Host for FakeHost {
@@ -135,6 +152,20 @@ impl Host for FakeHost {
             Some(Ok(recognizer)) => Ok(recognizer),
             Some(Err(error)) => Err(error),
             None => Err(AppError::usage("no scripted recognizer")),
+        }
+    }
+
+    fn live_transcriber(
+        &self,
+        model: &Model,
+        options: &Options,
+    ) -> Result<Box<dyn LiveTranscriber>, AppError> {
+        self.live_models_seen.lock().unwrap().push(model.clone());
+        self.live_options_seen.lock().unwrap().push(options.clone());
+        match self.live.lock().unwrap().take() {
+            Some(Ok(transcriber)) => Ok(transcriber),
+            Some(Err(error)) => Err(error),
+            None => Err(AppError::usage("no scripted live transcriber")),
         }
     }
 }
@@ -310,6 +341,86 @@ impl Recognizer for FakeRecognizer {
             spec,
             language: options.language_tag().map(str::to_owned),
         });
+        self.result
+            .lock()
+            .unwrap()
+            .take()
+            .unwrap_or_else(|| Ok(Transcript::default()))
+    }
+}
+
+/// A streaming transcriber that returns its scripted sessions in order.
+pub struct FakeLiveTranscriber {
+    sessions: Mutex<VecDeque<FakeLiveRecognizer>>,
+}
+
+impl FakeLiveTranscriber {
+    /// A transcriber that opens `sessions` in order.
+    pub fn new(sessions: Vec<FakeLiveRecognizer>) -> Self {
+        Self {
+            sessions: Mutex::new(sessions.into()),
+        }
+    }
+}
+
+impl LiveTranscriber for FakeLiveTranscriber {
+    fn live(&self, _spec: AudioSpec) -> Result<Box<dyn LiveRecognizer>, AppError> {
+        self.sessions.lock().unwrap().pop_front().map_or_else(
+            || Err(AppError::usage("no scripted live session")),
+            |session| Ok(Box::new(session) as Box<dyn LiveRecognizer>),
+        )
+    }
+}
+
+/// A streaming recognizer that records feeds and returns scripted events.
+pub struct FakeLiveRecognizer {
+    /// Every block fed to the session.
+    pub feeds: Arc<Mutex<Vec<Vec<f32>>>>,
+    events: Mutex<VecDeque<Event>>,
+    result: Mutex<Option<Result<Transcript, Incomplete>>>,
+    /// Whether `feed` fails.
+    pub fail_feed: bool,
+    /// Whether `poll` fails.
+    pub fail_poll: bool,
+}
+
+impl FakeLiveRecognizer {
+    /// A session that returns `result` from `finish`.
+    pub fn new(result: Result<Transcript, Incomplete>) -> Self {
+        Self {
+            feeds: Arc::new(Mutex::new(Vec::new())),
+            events: Mutex::new(VecDeque::new()),
+            result: Mutex::new(Some(result)),
+            fail_feed: false,
+            fail_poll: false,
+        }
+    }
+
+    /// Scripts the events `poll` returns, in order.
+    pub fn with_events(self, events: Vec<Event>) -> Self {
+        self.events.lock().unwrap().extend(events);
+        self
+    }
+}
+
+impl LiveRecognizer for FakeLiveRecognizer {
+    fn feed(&self, samples: &[f32]) -> Result<(), AppError> {
+        self.feeds.lock().unwrap().push(samples.to_vec());
+        if self.fail_feed {
+            Err(AppError::usage("feed failed"))
+        } else {
+            Ok(())
+        }
+    }
+
+    fn poll(&self) -> Result<Option<Event>, AppError> {
+        if self.fail_poll {
+            return Err(AppError::usage("poll failed"));
+        }
+        Ok(self.events.lock().unwrap().pop_front())
+    }
+
+    fn finish(self: Box<Self>) -> Result<Transcript, Incomplete> {
         self.result
             .lock()
             .unwrap()

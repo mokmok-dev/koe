@@ -137,6 +137,7 @@ fn a_record_without_a_backend_still_leaves_a_readable_file() {
             "microphone",
             "--duration",
             "0.1",
+            "--no-transcribe",
         ])
         .stdin(Stdio::null())
         .output()
@@ -144,6 +145,28 @@ fn a_record_without_a_backend_still_leaves_a_readable_file() {
     assert_failure(&output, 1);
     assert!(stderr(&output).contains("no audio capture backend is enabled"));
     assert_riff(&path);
+}
+
+#[cfg(not(any(feature = "linux", feature = "macos", feature = "windows")))]
+#[test]
+fn a_record_without_a_transcription_backend_fails_before_the_audio_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("take.wav");
+    let output = Command::new(env!("CARGO_BIN_EXE_koe"))
+        .args([
+            "record",
+            path.to_str().unwrap(),
+            "--source",
+            "microphone",
+            "--duration",
+            "0.1",
+        ])
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    assert_failure(&output, 1);
+    assert!(stderr(&output).contains("no speech-to-text backend is enabled"));
+    assert!(!path.exists());
 }
 
 #[cfg(not(any(feature = "linux", feature = "macos", feature = "windows")))]

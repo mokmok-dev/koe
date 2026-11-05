@@ -50,6 +50,21 @@ pub struct RecordArgs {
     /// Gain in decibels applied to each source.
     #[arg(long, default_value_t = 0.0, allow_negative_numbers = true)]
     pub gain: f32,
+    /// GGUF speech model. Omit to use the platform's system model.
+    #[arg(long, conflicts_with = "no_transcribe")]
+    pub model: Option<PathBuf>,
+    /// Transcript file. Defaults to the output path with a `.txt` extension.
+    #[arg(long, conflicts_with = "no_transcribe")]
+    pub transcript: Option<PathBuf>,
+    /// BCP 47 language tag for transcription.
+    #[arg(long, conflicts_with = "no_transcribe")]
+    pub language: Option<String>,
+    /// Print time ranges in the transcript file.
+    #[arg(long, conflicts_with = "no_transcribe")]
+    pub timestamps: bool,
+    /// Record without transcription.
+    #[arg(long)]
+    pub no_transcribe: bool,
 }
 
 /// Arguments for `koe transcribe`.
@@ -174,6 +189,11 @@ mod tests {
         assert_eq!(args.rate, 48_000);
         assert_eq!(args.channels, ChannelChoice::Stereo);
         assert_eq!(args.gain, 0.0);
+        assert_eq!(args.model, None);
+        assert_eq!(args.transcript, None);
+        assert_eq!(args.language, None);
+        assert!(!args.timestamps);
+        assert!(!args.no_transcribe);
     }
 
     #[test]
@@ -190,12 +210,30 @@ mod tests {
             "mono",
             "--gain",
             "-3",
+            "--model",
+            "tiny.gguf",
+            "--transcript",
+            "take.txt",
+            "--language",
+            "ja",
+            "--timestamps",
         ]);
         assert_eq!(args.source, SourceChoice::Microphone);
         assert_eq!(args.duration, Some(Duration::from_millis(2_500)));
         assert_eq!(args.rate, 16_000);
         assert_eq!(args.channels, ChannelChoice::Mono);
         assert_eq!(args.gain, -3.0);
+        assert_eq!(args.model, Some(PathBuf::from("tiny.gguf")));
+        assert_eq!(args.transcript, Some(PathBuf::from("take.txt")));
+        assert_eq!(args.language.as_deref(), Some("ja"));
+        assert!(args.timestamps);
+        assert!(!args.no_transcribe);
+    }
+
+    #[test]
+    fn record_without_transcription_parses() {
+        let args = record(&["take.wav", "--no-transcribe"]);
+        assert!(args.no_transcribe);
     }
 
     #[test]
@@ -272,6 +310,7 @@ mod tests {
             vec!["record", "take.ogg", "--duration", "0"],
             vec!["record", "take.ogg", "--rate", "fast"],
             vec!["record", "take.ogg", "--gain", "loud"],
+            vec!["record", "take.ogg", "--no-transcribe", "--model", "m.gguf"],
             vec!["transcribe"],
         ] {
             assert!(parse(&args).is_err(), "{args:?} must be rejected");

@@ -20,12 +20,16 @@ host:
 
 ```console
 cargo run -p koe-cli --features linux -- devices
-cargo run -p koe-cli --features linux -- record take.ogg --source both
+cargo run -p koe-cli --features linux -- record take.ogg --source both --model model.gguf
 cargo run -p koe-cli --features linux -- transcribe take.wav --model model.gguf --language ja
 ```
 
 Use `--features macos` or `--features windows` on those platforms. `record`
 writes Ogg Opus (`.ogg`, `.oga`, `.opus`) or WAV (`.wav`) and stops after
-`--duration` or on Ctrl-C. `transcribe` reads 16-bit PCM WAV and prints
-committed text, keeping the text it received when the engine fails partway.
-On macOS, omit `--model` to use the system speech model.
+`--duration` or on Ctrl-C. It also writes a transcript beside the audio, by
+default next to the output with a `.txt` extension. The transcript file is
+created when recording starts and completed when it stops. Pass `--model` for
+GGUF transcription, `--transcript` to choose the path, `--timestamps` to add
+time ranges, or `--no-transcribe` to record only. `transcribe` reads 16-bit
+PCM WAV and prints committed text, keeping the text it received when the
+engine fails partway. On macOS, omit `--model` to use the system speech model.

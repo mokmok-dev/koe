@@ -34,6 +34,7 @@ mod io;
 mod model;
 mod record;
 mod transcribe;
+mod transcript;
 mod wav;
 
 #[cfg(test)]
