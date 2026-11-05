@@ -6,7 +6,12 @@ name = "koe-session-store"
 version.workspace = true
 
 [dependencies]
+koe-capture-core.workspace = true
 koe-session.workspace = true
+koe-transcribe-core.workspace = true
+
+[dev-dependencies]
+proptest.workspace = true
 
 [lints]
 workspace = true

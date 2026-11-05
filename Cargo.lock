@@ -339,7 +339,10 @@ dependencies = [
 name = "koe-session-store"
 version = "2026.11.1"
 dependencies = [
+ "koe-capture-core",
  "koe-session",
+ "koe-transcribe-core",
+ "proptest",
 ]
 
 [[package]]
