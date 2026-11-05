@@ -125,8 +125,8 @@
               };
               transcribeBackendArgs = cargoCommonArgs // {
                 inherit cargoArtifacts;
-                cargoClippyExtraArgs = "--package koe-transcribe-ggml --all-targets -- --deny warnings";
-                cargoTestExtraArgs = "--package koe-transcribe-ggml";
+                cargoClippyExtraArgs = "--package koe-transcribe-ggml --package koe-transcribe-macos --all-targets -- --deny warnings";
+                cargoTestExtraArgs = "--package koe-transcribe-ggml --package koe-transcribe-macos";
               };
 
               crossCheck =
@@ -157,6 +157,8 @@
               transcribeFacadeClippy = craneLib.cargoClippy transcribeFacadeArgs;
               transcribeBackendClippy = craneLib.cargoClippy transcribeBackendArgs;
             }
+            # The macOS shim needs a Swift toolchain at link time; nix only
+            # cross-checks its Rust side, so its tests run on a macOS runner.
             // pkgs.lib.optionalAttrs pkgs.stdenv.hostPlatform.isLinux {
               transcribeFacadeTest = craneLib.cargoTest transcribeFacadeArgs;
               transcribeBackendTest = craneLib.cargoTest transcribeBackendArgs;

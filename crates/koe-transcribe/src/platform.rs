@@ -19,8 +19,11 @@ compile_error!("the windows feature requires a Windows target");
 #[cfg(any(feature = "linux", feature = "windows"))]
 pub use koe_transcribe_ggml::engine;
 
-#[cfg(not(any(feature = "linux", feature = "windows")))]
+#[cfg(feature = "macos")]
+pub use koe_transcribe_macos::engine;
+
+#[cfg(not(any(feature = "linux", feature = "macos", feature = "windows")))]
 mod unsupported;
 
-#[cfg(not(any(feature = "linux", feature = "windows")))]
+#[cfg(not(any(feature = "linux", feature = "macos", feature = "windows")))]
 pub use unsupported::engine;

@@ -8,11 +8,12 @@ version.workspace = true
 [dependencies]
 koe-transcribe-core.workspace = true
 koe-transcribe-ggml = { workspace = true, optional = true }
+koe-transcribe-macos = { workspace = true, optional = true }
 
 [features]
 default = []
 linux = ["dep:koe-transcribe-ggml"]
-macos = []
+macos = ["dep:koe-transcribe-macos"]
 windows = ["dep:koe-transcribe-ggml"]
 
 [lints]

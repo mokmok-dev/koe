@@ -234,6 +234,7 @@ version = "2026.11.1"
 dependencies = [
  "koe-transcribe-core",
  "koe-transcribe-ggml",
+ "koe-transcribe-macos",
 ]
 
 [[package]]
@@ -250,6 +251,13 @@ version = "2026.11.1"
 dependencies = [
  "koe-transcribe-core",
  "transcribe-cpp",
+]
+
+[[package]]
+name = "koe-transcribe-macos"
+version = "2026.11.1"
+dependencies = [
+ "koe-transcribe-core",
 ]
 
 [[package]]

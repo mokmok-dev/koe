@@ -8,6 +8,7 @@ members = [
   "crates/koe-transcribe",
   "crates/koe-transcribe-core",
   "crates/koe-transcribe-ggml",
+  "crates/koe-transcribe-macos",
 ]
 resolver = "3"
 
@@ -19,6 +20,7 @@ koe-capture-windows = { path = "crates/koe-capture-windows" }
 koe-transcribe = { path = "crates/koe-transcribe" }
 koe-transcribe-core = { path = "crates/koe-transcribe-core" }
 koe-transcribe-ggml = { path = "crates/koe-transcribe-ggml" }
+koe-transcribe-macos = { path = "crates/koe-transcribe-macos" }
 libm = "0.2"
 proptest = "1.12.0"
 transcribe-cpp = "0.4.1"
