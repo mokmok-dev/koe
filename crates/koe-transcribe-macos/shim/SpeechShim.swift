@@ -462,7 +462,7 @@ private final class SpeechEngine: @unchecked Sendable {
 @_cdecl("koe_stt_engine_create")
 func koeSpeechEngineCreate(
     locale: UnsafePointer<CChar>?,
-    out: UnsafeMutablePointer<UnsafeMutableRawPointer?>??
+    out: UnsafeMutablePointer<UnsafeMutableRawPointer?>?
 ) -> Int32 {
     guard let out else {
         return -5
