@@ -103,55 +103,13 @@
               };
               cargoArtifacts = craneLib.buildDepsOnly cargoCommonArgs;
 
-              coreArgs = cargoCommonArgs // {
+              # The facades reject `--all-features` and accept exactly one
+              # platform feature, so the host feature is named per package.
+              hostFeatures = "koe-capture/${platformFeature},koe-transcribe/${platformFeature}";
+              hostArgs = cargoCommonArgs // {
                 inherit cargoArtifacts;
-                cargoClippyExtraArgs = "--package koe-capture-core --all-targets -- --deny warnings";
-                cargoTestExtraArgs = "--package koe-capture-core";
-              };
-              facadeArgs = cargoCommonArgs // {
-                inherit cargoArtifacts;
-                cargoClippyExtraArgs = "--package koe-capture --all-targets --features ${platformFeature} -- --deny warnings";
-                cargoTestExtraArgs = "--package koe-capture --features ${platformFeature}";
-              };
-              backendArgs = cargoCommonArgs // {
-                inherit cargoArtifacts;
-                cargoClippyExtraArgs = "--package koe-capture-linux --package koe-capture-macos --package koe-capture-windows --all-targets -- --deny warnings";
-                cargoTestExtraArgs = "--package koe-capture-linux --package koe-capture-macos --package koe-capture-windows";
-              };
-              transcribeCoreArgs = cargoCommonArgs // {
-                inherit cargoArtifacts;
-                cargoClippyExtraArgs = "--package koe-transcribe-core --all-targets -- --deny warnings";
-                cargoTestExtraArgs = "--package koe-transcribe-core";
-              };
-              sessionArgs = cargoCommonArgs // {
-                inherit cargoArtifacts;
-                cargoClippyExtraArgs = "--package koe-session --all-targets -- --deny warnings";
-                cargoTestExtraArgs = "--package koe-session";
-              };
-              storeArgs = cargoCommonArgs // {
-                inherit cargoArtifacts;
-                cargoClippyExtraArgs = "--package koe-session-store --all-targets -- --deny warnings";
-                cargoTestExtraArgs = "--package koe-session-store";
-              };
-              recordCoreArgs = cargoCommonArgs // {
-                inherit cargoArtifacts;
-                cargoClippyExtraArgs = "--package koe-record-core --all-targets -- --deny warnings";
-                cargoTestExtraArgs = "--package koe-record-core";
-              };
-              recordArgs = cargoCommonArgs // {
-                inherit cargoArtifacts;
-                cargoClippyExtraArgs = "--package koe-record --all-targets -- --deny warnings";
-                cargoTestExtraArgs = "--package koe-record";
-              };
-              transcribeFacadeArgs = cargoCommonArgs // {
-                inherit cargoArtifacts;
-                cargoClippyExtraArgs = "--package koe-transcribe --all-targets --features ${platformFeature} -- --deny warnings";
-                cargoTestExtraArgs = "--package koe-transcribe --features ${platformFeature}";
-              };
-              transcribeBackendArgs = cargoCommonArgs // {
-                inherit cargoArtifacts;
-                cargoClippyExtraArgs = "--package koe-transcribe-ggml --package koe-transcribe-macos --all-targets -- --deny warnings";
-                cargoTestExtraArgs = "--package koe-transcribe-ggml --package koe-transcribe-macos";
+                cargoClippyExtraArgs = "--workspace --all-targets --features ${hostFeatures} -- --deny warnings";
+                cargoTestExtraArgs = "--workspace --features ${hostFeatures}";
               };
 
               crossCheck =
@@ -171,26 +129,8 @@
                 };
             in
             {
-              coreClippy = craneLib.cargoClippy coreArgs;
-              facadeClippy = craneLib.cargoClippy facadeArgs;
-              coreTest = craneLib.cargoTest coreArgs;
-              facadeTest = craneLib.cargoTest facadeArgs;
-              backendClippy = craneLib.cargoClippy backendArgs;
-              backendTest = craneLib.cargoTest backendArgs;
-              transcribeCoreClippy = craneLib.cargoClippy transcribeCoreArgs;
-              transcribeCoreTest = craneLib.cargoTest transcribeCoreArgs;
-              sessionClippy = craneLib.cargoClippy sessionArgs;
-              sessionTest = craneLib.cargoTest sessionArgs;
-              storeClippy = craneLib.cargoClippy storeArgs;
-              storeTest = craneLib.cargoTest storeArgs;
-              recordCoreClippy = craneLib.cargoClippy recordCoreArgs;
-              recordCoreTest = craneLib.cargoTest recordCoreArgs;
-              recordClippy = craneLib.cargoClippy recordArgs;
-              recordTest = craneLib.cargoTest recordArgs;
-              transcribeFacadeClippy = craneLib.cargoClippy transcribeFacadeArgs;
-              transcribeBackendClippy = craneLib.cargoClippy transcribeBackendArgs;
-              transcribeFacadeTest = craneLib.cargoTest transcribeFacadeArgs;
-              transcribeBackendTest = craneLib.cargoTest transcribeBackendArgs;
+              clippy = craneLib.cargoClippy hostArgs;
+              test = craneLib.cargoTest hostArgs;
             }
             // pkgs.lib.optionalAttrs (system == "x86_64-linux") {
               mutation = craneLib.mkCargoDerivation (
