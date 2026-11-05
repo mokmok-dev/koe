@@ -149,6 +149,11 @@ mod tests {
         End { cancelled: bool },
     }
 
+    /// A wait loop that ignores its deadline must fail the test instead of
+    /// hanging it, because a hang is reported as a timeout rather than a
+    /// caught mutant.
+    const POLL_LIMIT: usize = 12_000;
+
     struct Fake {
         clock: Instant,
         context: i32,
@@ -158,6 +163,8 @@ mod tests {
         calls: Vec<Call>,
         defaults: Option<Result<ServerDefaults, Error>>,
         sources: Option<Result<Vec<SourceRecord>, Error>>,
+        iterations: usize,
+        readies_after: usize,
     }
 
     impl Fake {
@@ -171,6 +178,8 @@ mod tests {
                 calls: Vec::new(),
                 defaults: None,
                 sources: None,
+                iterations: 0,
+                readies_after: usize::MAX,
             }
         }
 
@@ -189,6 +198,7 @@ mod tests {
     impl Session for Fake {
         fn iterate(&mut self) -> Result<(), Error> {
             self.calls.push(Call::Iterate);
+            self.iterations += 1;
             self.iteration_error.take().map_or(Ok(()), Err)
         }
 
@@ -197,7 +207,11 @@ mod tests {
         }
 
         fn context_state(&mut self) -> i32 {
-            self.context
+            if self.iterations >= self.readies_after {
+                PA_CONTEXT_READY
+            } else {
+                self.context
+            }
         }
 
         fn operation_state(&mut self, _operation: Operation) -> i32 {
@@ -237,6 +251,10 @@ mod tests {
         }
 
         fn rest(&mut self) {
+            assert!(
+                self.calls.len() < POLL_LIMIT,
+                "the wait loop ignored its deadline"
+            );
             self.clock += POLL;
         }
     }
@@ -322,6 +340,14 @@ mod tests {
         );
         assert_ne!(fake.calls(), []);
         assert!(fake.calls().iter().all(|call| *call == Call::Iterate));
+    }
+
+    #[test]
+    fn a_context_that_becomes_ready_inside_the_window_succeeds() {
+        let mut fake = Fake::new();
+        fake.readies_after = 3;
+        assert_eq!(wait_ready(&mut fake), Ok(()));
+        assert_eq!(fake.iterations, 3);
     }
 
     #[test]
