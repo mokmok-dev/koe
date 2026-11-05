@@ -2,7 +2,7 @@
 
 use crate::config::StreamSpec;
 use crate::device::DeviceInfo;
-use crate::error::{Error, Result};
+use crate::error::Error;
 use crate::queue::FrameQueue;
 
 /// Frames each backend read may deliver in one call.
@@ -13,7 +13,7 @@ pub trait RawStream {
     /// Blocking read of at most `out.len() / channels` frames.
     ///
     /// Returns the number of frames written, or zero once the stream ends.
-    fn read(&mut self, out: &mut [f32]) -> Result<usize>;
+    fn read(&mut self, out: &mut [f32]) -> Result<usize, Error>;
 }
 
 /// An open capture stream.
@@ -63,7 +63,7 @@ impl CaptureStream {
     /// channel count, [`Error::BufferTooSmall`] when it holds no frame,
     /// [`Error::StreamClosed`] when the backend ends before any frame arrives,
     /// and the backend's own error when a read fails.
-    pub fn read(&mut self, out: &mut [f32]) -> Result<usize> {
+    pub fn read(&mut self, out: &mut [f32]) -> Result<usize, Error> {
         let channels = usize::from(self.spec.channels());
         if out.is_empty() {
             return Err(Error::BufferTooSmall { frames: 0 });
@@ -150,7 +150,7 @@ mod tests {
     }
 
     impl RawStream for ScriptedStream {
-        fn read(&mut self, out: &mut [f32]) -> Result<usize> {
+        fn read(&mut self, out: &mut [f32]) -> Result<usize, Error> {
             match self.steps.pop_front() {
                 Some(Step::Frames(samples)) => {
                     out[..samples.len()].copy_from_slice(&samples);

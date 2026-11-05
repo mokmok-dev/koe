@@ -6,7 +6,7 @@
 
 #![allow(dead_code)]
 
-use crate::error::{Error, Result};
+use crate::error::Error;
 
 /// Sample layouts a platform backend can hand back.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -39,7 +39,7 @@ impl SampleFormat {
 /// Returns [`Error::MisalignedBuffer`] when `bytes` does not contain whole
 /// samples for `format`.
 #[allow(clippy::cast_precision_loss)]
-pub fn decode(bytes: &[u8], format: SampleFormat, out: &mut [f32]) -> Result<usize> {
+pub fn decode(bytes: &[u8], format: SampleFormat, out: &mut [f32]) -> Result<usize, Error> {
     let sample_size = format.bytes_per_sample();
     if !bytes.len().is_multiple_of(sample_size) {
         return Err(Error::MisalignedBuffer {

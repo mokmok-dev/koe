@@ -1,9 +1,9 @@
 //! Capture sources, device identifiers, and device selection.
 
-use core::fmt;
-use core::str::FromStr;
+use std::fmt;
+use std::str::FromStr;
 
-use crate::error::{Error, Result};
+use crate::error::Error;
 
 /// What a capture stream records.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -44,7 +44,7 @@ impl DeviceId {
     /// # Errors
     ///
     /// Returns [`Error::InvalidId`] when `value` is empty.
-    pub fn new(value: impl Into<Box<str>>) -> Result<Self> {
+    pub fn new(value: impl Into<Box<str>>) -> Result<Self, Error> {
         let value = value.into();
         if value.is_empty() {
             Err(Error::InvalidId)
@@ -69,7 +69,7 @@ impl fmt::Display for DeviceId {
 impl FromStr for DeviceId {
     type Err = Error;
 
-    fn from_str(value: &str) -> Result<Self> {
+    fn from_str(value: &str) -> Result<Self, Error> {
         Self::new(value)
     }
 }
@@ -152,7 +152,7 @@ pub fn select<'a>(
     devices: &'a [DeviceInfo],
     source: Source,
     requested: Option<&DeviceId>,
-) -> Result<&'a DeviceInfo> {
+) -> Result<&'a DeviceInfo, Error> {
     let Some(requested) = requested else {
         return devices
             .iter()

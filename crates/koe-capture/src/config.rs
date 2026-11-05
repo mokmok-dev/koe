@@ -1,7 +1,7 @@
 //! Stream format validation.
 
 use crate::Source;
-use crate::error::{Error, Result};
+use crate::error::Error;
 
 /// Lowest sample rate the crate accepts.
 pub const MIN_SAMPLE_RATE: u32 = 8_000;
@@ -28,7 +28,7 @@ impl StreamSpec {
     /// Returns [`Error::InvalidSpec`] when the rate is outside
     /// [`MIN_SAMPLE_RATE`]..=[`MAX_SAMPLE_RATE`] or the channel count is zero
     /// or above [`MAX_CHANNELS`].
-    pub fn new(source: Source, sample_rate: u32, channels: u16) -> Result<Self> {
+    pub fn new(source: Source, sample_rate: u32, channels: u16) -> Result<Self, Error> {
         if (MIN_SAMPLE_RATE..=MAX_SAMPLE_RATE).contains(&sample_rate)
             && (1..=MAX_CHANNELS).contains(&channels)
         {

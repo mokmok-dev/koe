@@ -26,7 +26,7 @@ The features are additive. Modules are also gated on `target_os`, so
 ```rust
 use koe_capture::{Source, StreamSpec};
 
-# fn main() -> koe_capture::Result<()> {
+# fn main() -> Result<(), koe_capture::Error> {
 let spec = StreamSpec::new(Source::SystemAudio, 48_000, 2)?;
 for device in koe_capture::devices()? {
     println!("{}: {} ({:?})", device.id(), device.name(), device.source());

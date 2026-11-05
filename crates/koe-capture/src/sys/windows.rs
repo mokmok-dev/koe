@@ -8,14 +8,14 @@
 // operating system owns how much of them this backend names.
 #![allow(dead_code)]
 
-use core::ffi::c_void;
-use core::marker::PhantomData;
-use core::ptr::{from_ref, null, null_mut};
+use std::ffi::c_void;
+use std::marker::PhantomData;
+use std::ptr::{from_ref, null, null_mut};
 
 use crate::Source;
 use crate::config::StreamSpec;
 use crate::device::{DeviceId, DeviceInfo};
-use crate::error::{Error, Result};
+use crate::error::Error;
 use crate::stream::RawStream;
 
 const COINIT_MULTITHREADED: u32 = 0;
@@ -299,7 +299,7 @@ const fn invariant(operation: &'static str) -> Error {
     Error::BackendInvariant { operation }
 }
 
-const fn check(operation: &'static str, status: i32) -> Result<()> {
+const fn check(operation: &'static str, status: i32) -> Result<(), Error> {
     if status < 0 {
         Err(failed(operation, status))
     } else {
@@ -320,7 +320,7 @@ unsafe fn wide_string(pointer: *const u16) -> Option<String> {
     while unsafe { *pointer.add(length) } != 0 {
         length += 1;
     }
-    let units = unsafe { core::slice::from_raw_parts(pointer, length) };
+    let units = unsafe { std::slice::from_raw_parts(pointer, length) };
     Some(String::from_utf16_lossy(units))
 }
 
@@ -328,7 +328,7 @@ unsafe fn wide_string(pointer: *const u16) -> Option<String> {
 struct Com;
 
 impl Com {
-    fn initialize() -> Result<Self> {
+    fn initialize() -> Result<Self, Error> {
         let status = unsafe { CoInitializeEx(null_mut(), COINIT_MULTITHREADED) };
         check("CoInitializeEx", status)?;
         Ok(Self)
@@ -359,7 +359,7 @@ impl<T> Drop for CoTaskMem<T> {
 struct EventHandle(*mut c_void);
 
 impl EventHandle {
-    fn create() -> Result<Self> {
+    fn create() -> Result<Self, Error> {
         let handle = unsafe { CreateEventW(null_mut(), 0, 0, null()) };
         if handle.is_null() {
             return Err(failed("CreateEventW", 0));
@@ -384,7 +384,7 @@ struct Variant(PropVariant);
 impl Variant {
     const fn empty() -> Self {
         // `PropVariantInit` is a zero fill, which is `VT_EMPTY`.
-        Self(unsafe { core::mem::zeroed() })
+        Self(unsafe { std::mem::zeroed() })
     }
 
     const fn value(&self) -> &PropVariant {
@@ -422,7 +422,11 @@ impl<T> Drop for Owned<T> {
     }
 }
 
-fn from_com<T>(operation: &'static str, status: i32, object: *mut c_void) -> Result<Owned<T>> {
+fn from_com<T>(
+    operation: &'static str,
+    status: i32,
+    object: *mut c_void,
+) -> Result<Owned<T>, Error> {
     check(operation, status)?;
     if object.is_null() {
         return Err(invariant(operation));
@@ -431,7 +435,7 @@ fn from_com<T>(operation: &'static str, status: i32, object: *mut c_void) -> Res
 }
 
 impl Owned<EnumeratorVtable> {
-    fn create() -> Result<Self> {
+    fn create() -> Result<Self, Error> {
         let mut object: *mut c_void = null_mut();
         let status = unsafe {
             CoCreateInstance(
@@ -445,7 +449,7 @@ impl Owned<EnumeratorVtable> {
         from_com("CoCreateInstance", status, object)
     }
 
-    unsafe fn endpoints(&self, flow: u32) -> Result<Owned<CollectionVtable>> {
+    unsafe fn endpoints(&self, flow: u32) -> Result<Owned<CollectionVtable>, Error> {
         let mut object: *mut c_void = null_mut();
         let vtable = unsafe { self.vtable() };
         let status = unsafe {
@@ -469,7 +473,7 @@ impl Owned<EnumeratorVtable> {
         unsafe { device.id() }.ok()
     }
 
-    unsafe fn device(&self, id: *const u16) -> Result<Owned<DeviceVtable>> {
+    unsafe fn device(&self, id: *const u16) -> Result<Owned<DeviceVtable>, Error> {
         let mut object: *mut c_void = null_mut();
         let vtable = unsafe { self.vtable() };
         let status = unsafe { (vtable.get_device)(self.as_ptr(), id, &raw mut object) };
@@ -478,7 +482,7 @@ impl Owned<EnumeratorVtable> {
 }
 
 impl Owned<CollectionVtable> {
-    unsafe fn count(&self) -> Result<u32> {
+    unsafe fn count(&self) -> Result<u32, Error> {
         let mut count = 0;
         let vtable = unsafe { self.vtable() };
         let status = unsafe { (vtable.get_count)(self.as_ptr(), &raw mut count) };
@@ -486,7 +490,7 @@ impl Owned<CollectionVtable> {
         Ok(count)
     }
 
-    unsafe fn item(&self, index: u32) -> Result<Owned<DeviceVtable>> {
+    unsafe fn item(&self, index: u32) -> Result<Owned<DeviceVtable>, Error> {
         let mut object: *mut c_void = null_mut();
         let vtable = unsafe { self.vtable() };
         let status = unsafe { (vtable.item)(self.as_ptr(), index, &raw mut object) };
@@ -495,7 +499,7 @@ impl Owned<CollectionVtable> {
 }
 
 impl Owned<DeviceVtable> {
-    unsafe fn id(&self) -> Result<String> {
+    unsafe fn id(&self) -> Result<String, Error> {
         let mut pointer: *mut u16 = null_mut();
         let vtable = unsafe { self.vtable() };
         let status = unsafe { (vtable.get_id)(self.as_ptr(), &raw mut pointer) };
@@ -529,7 +533,7 @@ impl Owned<DeviceVtable> {
         unsafe { wide_string(variant.value().data[0].cast::<u16>()) }
     }
 
-    unsafe fn audio_client(&self) -> Result<Owned<AudioClientVtable>> {
+    unsafe fn audio_client(&self) -> Result<Owned<AudioClientVtable>, Error> {
         let mut object: *mut c_void = null_mut();
         let vtable = unsafe { self.vtable() };
         let status = unsafe {
@@ -544,7 +548,7 @@ impl Owned<DeviceVtable> {
         from_com("IMMDevice::Activate", status, object)
     }
 
-    unsafe fn mix_format(&self) -> Result<(u32, u16)> {
+    unsafe fn mix_format(&self) -> Result<(u32, u16), Error> {
         let client = unsafe { self.audio_client() }?;
         let mut pointer: *mut WaveFormatEx = null_mut();
         let vtable = unsafe { client.vtable() };
@@ -563,7 +567,7 @@ impl Owned<DeviceVtable> {
 }
 
 impl Owned<AudioClientVtable> {
-    unsafe fn initialize(&self, format: &WaveFormatExtensible, flags: u32) -> Result<()> {
+    unsafe fn initialize(&self, format: &WaveFormatExtensible, flags: u32) -> Result<(), Error> {
         let vtable = unsafe { self.vtable() };
         let status = unsafe {
             (vtable.initialize)(
@@ -579,13 +583,13 @@ impl Owned<AudioClientVtable> {
         check("IAudioClient::Initialize", status)
     }
 
-    unsafe fn set_event(&self, event: *mut c_void) -> Result<()> {
+    unsafe fn set_event(&self, event: *mut c_void) -> Result<(), Error> {
         let vtable = unsafe { self.vtable() };
         let status = unsafe { (vtable.set_event_handle)(self.as_ptr(), event) };
         check("IAudioClient::SetEventHandle", status)
     }
 
-    unsafe fn capture_client(&self) -> Result<Owned<CaptureClientVtable>> {
+    unsafe fn capture_client(&self) -> Result<Owned<CaptureClientVtable>, Error> {
         let mut object: *mut c_void = null_mut();
         let vtable = unsafe { self.vtable() };
         let status = unsafe {
@@ -598,7 +602,7 @@ impl Owned<AudioClientVtable> {
         from_com("IAudioClient::GetService", status, object)
     }
 
-    unsafe fn start(&self) -> Result<()> {
+    unsafe fn start(&self) -> Result<(), Error> {
         let vtable = unsafe { self.vtable() };
         let status = unsafe { (vtable.start)(self.as_ptr()) };
         check("IAudioClient::Start", status)
@@ -614,7 +618,7 @@ unsafe fn describe(
     device: &Owned<DeviceVtable>,
     source: Source,
     default: Option<&str>,
-) -> Result<Option<DeviceInfo>> {
+) -> Result<Option<DeviceInfo>, Error> {
     let raw = unsafe { device.id() }?;
     let is_default = default == Some(raw.as_str());
     let name = unsafe { device.friendly_name() }.unwrap_or_else(|| raw.clone());
@@ -634,7 +638,7 @@ unsafe fn describe(
     )))
 }
 
-pub fn devices() -> Result<Vec<DeviceInfo>> {
+pub fn devices() -> Result<Vec<DeviceInfo>, Error> {
     let _com = Com::initialize()?;
     let enumerator = Owned::<EnumeratorVtable>::create()?;
     let mut devices = Vec::new();
@@ -672,7 +676,7 @@ impl WasapiStream {
     ///
     /// A loopback endpoint delivers nothing while the machine is silent, so a
     /// timeout is silence rather than a failure.
-    fn wait_for_packet(&self) -> Result<bool> {
+    fn wait_for_packet(&self) -> Result<bool, Error> {
         loop {
             let mut frames = 0;
             let vtable = unsafe { self.capture.vtable() };
@@ -691,7 +695,7 @@ impl WasapiStream {
     }
 
     #[allow(clippy::cast_ptr_alignment)]
-    fn store(&mut self, samples: *const u8, frames: u32, flags: u32) -> Result<()> {
+    fn store(&mut self, samples: *const u8, frames: u32, flags: u32) -> Result<(), Error> {
         let count = usize::try_from(frames)
             .ok()
             .and_then(|frames| frames.checked_mul(self.channels))
@@ -704,12 +708,12 @@ impl WasapiStream {
             return Err(invariant("IAudioCaptureClient::GetBuffer"));
         }
         // The packet is aligned for the sample type the client was opened with.
-        let values = unsafe { core::slice::from_raw_parts(samples.cast::<f32>(), count) };
+        let values = unsafe { std::slice::from_raw_parts(samples.cast::<f32>(), count) };
         self.pending.extend_from_slice(values);
         Ok(())
     }
 
-    fn receive(&mut self) -> Result<bool> {
+    fn receive(&mut self) -> Result<bool, Error> {
         if !self.wait_for_packet()? {
             return Ok(false);
         }
@@ -750,7 +754,7 @@ impl WasapiStream {
 }
 
 impl RawStream for WasapiStream {
-    fn read(&mut self, out: &mut [f32]) -> Result<usize> {
+    fn read(&mut self, out: &mut [f32]) -> Result<usize, Error> {
         if out.is_empty() {
             return Err(Error::BufferTooSmall { frames: 0 });
         }
@@ -775,7 +779,7 @@ impl Drop for WasapiStream {
     }
 }
 
-pub fn open(device: &DeviceInfo, spec: StreamSpec) -> Result<Box<dyn RawStream>> {
+pub fn open(device: &DeviceInfo, spec: StreamSpec) -> Result<Box<dyn RawStream>, Error> {
     let com = Com::initialize()?;
     let enumerator = Owned::<EnumeratorVtable>::create()?;
     let mut id: Vec<u16> = device.id().as_str().encode_utf16().collect();

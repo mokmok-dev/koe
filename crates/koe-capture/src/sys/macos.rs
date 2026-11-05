@@ -5,26 +5,21 @@
 //! audio taps the output mix with a `CATapDescription` and runs the same unit
 //! against a private aggregate device.
 
-use crate::Source::{Microphone, SystemAudio};
+use crate::Source;
 use crate::config::StreamSpec;
 use crate::device::{DeviceId, DeviceInfo};
-use crate::error::{Error, Result};
+use crate::error::Error;
 use crate::queue::FrameQueue;
 use crate::stream::RawStream;
 
-use core::ffi::{CStr, c_char, c_void};
-use core::mem::size_of;
-use core::ptr::{addr_of, from_ref, null, null_mut};
-use core::sync::atomic::{AtomicPtr, Ordering};
 use std::ffi::CString;
+use std::ffi::{CStr, c_char, c_void};
+use std::mem::size_of;
+use std::ptr::{addr_of, from_ref, null, null_mut};
+use std::sync::atomic::{AtomicPtr, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::thread;
 use std::time::{Duration, Instant};
-
-type Ptr = *const c_void;
-type MutPtr = *mut c_void;
-type Str = *const c_void;
-type Data = *mut AudioBufferList;
 
 const SYSTEM_OBJECT: u32 = 1;
 const ELEMENT_MAIN: u32 = 0;
@@ -131,48 +126,74 @@ unsafe extern "C" {
         object: u32,
         address: *const Address,
         qualifier_size: u32,
-        qualifier: Ptr,
+        qualifier: *const c_void,
         size: *mut u32,
     ) -> i32;
     fn AudioObjectGetPropertyData(
         object: u32,
         address: *const Address,
         qualifier_size: u32,
-        qualifier: Ptr,
+        qualifier: *const c_void,
         size: *mut u32,
-        data: MutPtr,
+        data: *mut c_void,
     ) -> i32;
-    fn AudioHardwareCreateProcessTap(description: MutPtr, tap: *mut u32) -> i32;
+    fn AudioHardwareCreateProcessTap(description: *mut c_void, tap: *mut u32) -> i32;
     fn AudioHardwareDestroyProcessTap(tap: u32) -> i32;
-    fn AudioHardwareCreateAggregateDevice(description: Ptr, device: *mut u32) -> i32;
+    fn AudioHardwareCreateAggregateDevice(description: *const c_void, device: *mut u32) -> i32;
     fn AudioHardwareDestroyAggregateDevice(device: u32) -> i32;
 }
 
 #[link(name = "AudioToolbox", kind = "framework")]
 unsafe extern "C" {
-    fn AudioComponentFindNext(component: MutPtr, d: *const AudioComponentDescription) -> MutPtr;
-    fn AudioComponentInstanceNew(component: MutPtr, instance: *mut MutPtr) -> i32;
-    fn AudioComponentInstanceDispose(instance: MutPtr) -> i32;
-    fn AudioUnitSetProperty(unit: MutPtr, p: u32, s: u32, e: u32, d: Ptr, n: u32) -> i32;
-    fn AudioUnitInitialize(unit: MutPtr) -> i32;
-    fn AudioUnitUninitialize(unit: MutPtr) -> i32;
-    fn AudioUnitRender(unit: MutPtr, f: *mut u32, t: Ptr, b: u32, n: u32, d: Data) -> i32;
-    fn AudioOutputUnitStart(unit: MutPtr) -> i32;
-    fn AudioOutputUnitStop(unit: MutPtr) -> i32;
+    fn AudioComponentFindNext(
+        component: *mut c_void,
+        d: *const AudioComponentDescription,
+    ) -> *mut c_void;
+    fn AudioComponentInstanceNew(component: *mut c_void, instance: *mut *mut c_void) -> i32;
+    fn AudioComponentInstanceDispose(instance: *mut c_void) -> i32;
+    fn AudioUnitSetProperty(
+        unit: *mut c_void,
+        p: u32,
+        s: u32,
+        e: u32,
+        d: *const c_void,
+        n: u32,
+    ) -> i32;
+    fn AudioUnitInitialize(unit: *mut c_void) -> i32;
+    fn AudioUnitUninitialize(unit: *mut c_void) -> i32;
+    fn AudioUnitRender(
+        unit: *mut c_void,
+        f: *mut u32,
+        t: *const c_void,
+        b: u32,
+        n: u32,
+        d: *mut AudioBufferList,
+    ) -> i32;
+    fn AudioOutputUnitStart(unit: *mut c_void) -> i32;
+    fn AudioOutputUnitStop(unit: *mut c_void) -> i32;
 }
 
 #[link(name = "CoreFoundation", kind = "framework")]
 unsafe extern "C" {
-    fn CFStringCreateWithCString(a: Ptr, t: *const c_char, e: u32) -> Str;
-    fn CFStringGetLength(text: Str) -> isize;
+    fn CFStringCreateWithCString(a: *const c_void, t: *const c_char, e: u32) -> *const c_void;
+    fn CFStringGetLength(text: *const c_void) -> isize;
     fn CFStringGetMaximumSizeForEncoding(length: isize, encoding: u32) -> isize;
-    fn CFStringGetCString(t: Str, b: *mut c_char, n: isize, e: u32) -> u8;
-    fn CFDictionaryCreateMutable(a: Ptr, n: isize, k: *const Callbacks, v: *const Callbacks)
-    -> Str;
-    fn CFDictionarySetValue(dictionary: Ptr, key: Ptr, value: Ptr);
-    fn CFArrayCreate(a: Ptr, v: *const Str, n: isize, c: *const Callbacks) -> Str;
-    fn CFRelease(value: Ptr);
-    static kCFBooleanTrue: Ptr;
+    fn CFStringGetCString(t: *const c_void, b: *mut c_char, n: isize, e: u32) -> u8;
+    fn CFDictionaryCreateMutable(
+        a: *const c_void,
+        n: isize,
+        k: *const Callbacks,
+        v: *const Callbacks,
+    ) -> *const c_void;
+    fn CFDictionarySetValue(dictionary: *const c_void, key: *const c_void, value: *const c_void);
+    fn CFArrayCreate(
+        a: *const c_void,
+        v: *const *const c_void,
+        n: isize,
+        c: *const Callbacks,
+    ) -> *const c_void;
+    fn CFRelease(value: *const c_void);
+    static kCFBooleanTrue: *const c_void;
     static kCFTypeDictionaryKeyCallBacks: Callbacks;
     static kCFTypeDictionaryValueCallBacks: Callbacks;
     static kCFTypeArrayCallBacks: Callbacks;
@@ -180,11 +201,11 @@ unsafe extern "C" {
 
 #[link(name = "objc")]
 unsafe extern "C" {
-    fn objc_getClass(name: *const c_char) -> MutPtr;
-    fn sel_registerName(name: *const c_char) -> MutPtr;
+    fn objc_getClass(name: *const c_char) -> *mut c_void;
+    fn sel_registerName(name: *const c_char) -> *mut c_void;
     fn objc_msgSend();
-    fn objc_autoreleasePoolPush() -> MutPtr;
-    fn objc_autoreleasePoolPop(pool: MutPtr);
+    fn objc_autoreleasePoolPush() -> *mut c_void;
+    fn objc_autoreleasePoolPop(pool: *mut c_void);
 }
 const fn backend(operation: &'static str, code: i32) -> Error {
     Error::Backend { operation, code }
@@ -200,7 +221,7 @@ const fn main(selector: u32, scope: u32) -> Address {
     }
 }
 /// Reads a property into word-aligned storage, returning the size it reports.
-fn property(object: u32, address: &Address) -> Result<(u32, Vec<u64>)> {
+fn property(object: u32, address: &Address) -> Result<(u32, Vec<u64>), Error> {
     let mut size = 0;
     let status =
         unsafe { AudioObjectGetPropertyDataSize(object, address, 0, null(), &raw mut size) };
@@ -220,14 +241,14 @@ fn property(object: u32, address: &Address) -> Result<(u32, Vec<u64>)> {
         Err(backend("AudioObjectGetPropertyData", status))
     }
 }
-fn value<T: Copy>(object: u32, address: &Address) -> Result<T> {
+fn value<T: Copy>(object: u32, address: &Address) -> Result<T, Error> {
     let (_, storage) = property(object, address)?;
     Ok(unsafe { storage.as_ptr().cast::<T>().read() })
 }
 
 struct Cf(*const c_void);
 impl Cf {
-    const fn new(value: *const c_void, operation: &'static str) -> Result<Self> {
+    const fn new(value: *const c_void, operation: &'static str) -> Result<Self, Error> {
         if value.is_null() {
             Err(backend(operation, PARAMETER_ERROR))
         } else {
@@ -264,7 +285,7 @@ fn cf_read(text: *const c_void) -> Option<String> {
     let text = unsafe { CStr::from_ptr(buffer.as_ptr().cast()) };
     Some(text.to_string_lossy().into_owned())
 }
-fn cf_make(text: &str) -> Result<Cf> {
+fn cf_make(text: &str) -> Result<Cf, Error> {
     let text =
         CString::new(text).map_err(|_| backend("CFStringCreateWithCString", PARAMETER_ERROR))?;
     Cf::new(
@@ -273,7 +294,7 @@ fn cf_make(text: &str) -> Result<Cf> {
     )
 }
 fn text_property(object: u32, selector: u32) -> Option<String> {
-    let pointer: Ptr = value(object, &main(selector, SCOPE_GLOBAL)).ok()?;
+    let pointer: *const c_void = value(object, &main(selector, SCOPE_GLOBAL)).ok()?;
     cf_read(Cf::new(pointer, "AudioObjectGetPropertyData").ok()?.raw())
 }
 fn channel_count(object: u32, scope: u32) -> u32 {
@@ -291,7 +312,7 @@ fn channel_count(object: u32, scope: u32) -> u32 {
     }
     channels
 }
-fn objects() -> Result<Vec<u32>> {
+fn objects() -> Result<Vec<u32>, Error> {
     let (size, storage) = property(SYSTEM_OBJECT, &main(DEVICE_LIST, SCOPE_GLOBAL))?;
     let count = size as usize / size_of::<u32>();
     let mut objects = Vec::with_capacity(count);
@@ -300,7 +321,7 @@ fn objects() -> Result<Vec<u32>> {
     }
     Ok(objects)
 }
-fn object_for(uid: &str, device: &DeviceInfo) -> Result<u32> {
+fn object_for(uid: &str, device: &DeviceInfo) -> Result<u32, Error> {
     for object in objects()? {
         if text_property(object, DEVICE_UID).as_deref() == Some(uid) {
             return Ok(object);
@@ -326,7 +347,7 @@ fn describe(object: u32, default_input: u32, default_output: u32) -> Vec<DeviceI
     {
         let default = object == default_input;
         let count = u16::try_from(inputs).unwrap_or(u16::MAX);
-        let entry = DeviceInfo::new(id, name.clone(), Microphone, default, rate, count);
+        let entry = DeviceInfo::new(id, name.clone(), Source::Microphone, default, rate, count);
         devices.push(entry);
     }
     if outputs > 0
@@ -334,14 +355,14 @@ fn describe(object: u32, default_input: u32, default_output: u32) -> Vec<DeviceI
     {
         let default = object == default_output;
         let count = u16::try_from(outputs).unwrap_or(u16::MAX);
-        let entry = DeviceInfo::new(id, name, SystemAudio, default, rate, count);
+        let entry = DeviceInfo::new(id, name, Source::SystemAudio, default, rate, count);
         devices.push(entry);
     }
     devices
 }
 
 /// Lists the capture devices `CoreAudio` reports.
-pub fn devices() -> Result<Vec<DeviceInfo>> {
+pub fn devices() -> Result<Vec<DeviceInfo>, Error> {
     let default_input = value(SYSTEM_OBJECT, &main(DEFAULT_INPUT, SCOPE_GLOBAL)).unwrap_or(0);
     let default_output = value(SYSTEM_OBJECT, &main(DEFAULT_OUTPUT, SCOPE_GLOBAL)).unwrap_or(0);
     let mut devices = Vec::new();
@@ -350,21 +371,21 @@ pub fn devices() -> Result<Vec<DeviceInfo>> {
     }
     Ok(devices)
 }
-fn selector(name: &CStr) -> MutPtr {
+fn selector(name: &CStr) -> *mut c_void {
     unsafe { sel_registerName(name.as_ptr()) }
 }
-fn objc_class(name: &CStr) -> MutPtr {
+fn objc_class(name: &CStr) -> *mut c_void {
     unsafe { objc_getClass(name.as_ptr()) }
 }
-type MessageSend = unsafe extern "C" fn(MutPtr, MutPtr, MutPtr) -> MutPtr;
+type MessageSend = unsafe extern "C" fn(*mut c_void, *mut c_void, *mut c_void) -> *mut c_void;
 /// Sends one message. `objc_msgSend` is variadic, so this is the only prototype
 /// in use; every shape passes an argument slot, which the callee ignores when
 /// the selector takes none.
-fn send(receiver: MutPtr, selector: MutPtr, argument: MutPtr) -> MutPtr {
+fn send(receiver: *mut c_void, selector: *mut c_void, argument: *mut c_void) -> *mut c_void {
     if receiver.is_null() {
         return null_mut();
     }
-    let send = unsafe { core::mem::transmute::<unsafe extern "C" fn(), MessageSend>(objc_msgSend) };
+    let send = unsafe { std::mem::transmute::<unsafe extern "C" fn(), MessageSend>(objc_msgSend) };
     unsafe { send(receiver, selector, argument) }
 }
 
@@ -380,13 +401,13 @@ impl Drop for AggregateDevice {
         unsafe { AudioHardwareDestroyAggregateDevice(self.0) };
     }
 }
-fn create_tap(name: &str) -> Result<(ProcessTap, String)> {
+fn create_tap(name: &str) -> Result<(ProcessTap, String), Error> {
     let pool = unsafe { objc_autoreleasePoolPush() };
     let created = tap_object(name);
     unsafe { objc_autoreleasePoolPop(pool) };
     created
 }
-fn tap_object(name: &str) -> Result<(ProcessTap, String)> {
+fn tap_object(name: &str) -> Result<(ProcessTap, String), Error> {
     let description = send(
         send(
             objc_class(c"CATapDescription"),
@@ -424,7 +445,7 @@ fn tap_object(name: &str) -> Result<(ProcessTap, String)> {
     }
 }
 
-fn dictionary() -> Result<Cf> {
+fn dictionary() -> Result<Cf, Error> {
     let keys = addr_of!(kCFTypeDictionaryKeyCallBacks);
     let values = addr_of!(kCFTypeDictionaryValueCallBacks);
     Cf::new(
@@ -432,12 +453,12 @@ fn dictionary() -> Result<Cf> {
         "CFDictionaryCreateMutable",
     )
 }
-fn put(dictionary: &Cf, key: &str, value: Ptr) -> Result<()> {
+fn put(dictionary: &Cf, key: &str, value: *const c_void) -> Result<(), Error> {
     let key = cf_make(key)?;
     unsafe { CFDictionarySetValue(dictionary.raw(), key.raw(), value) };
     Ok(())
 }
-fn create_aggregate(tap_uid: &str, name: &str) -> Result<AggregateDevice> {
+fn create_aggregate(tap_uid: &str, name: &str) -> Result<AggregateDevice, Error> {
     let entry = dictionary()?;
     let tap_name = cf_make(tap_uid)?;
     put(&entry, SUB_TAP_UID_KEY, tap_name.raw())?;
@@ -496,7 +517,14 @@ impl Shared {
     }
 }
 
-extern "C" fn render(ctx: MutPtr, flags: *mut u32, stamp: Ptr, b: u32, n: u32, _data: Data) -> i32 {
+extern "C" fn render(
+    ctx: *mut c_void,
+    flags: *mut u32,
+    stamp: *const c_void,
+    b: u32,
+    n: u32,
+    _data: *mut AudioBufferList,
+) -> i32 {
     let Some(shared) = (unsafe { ctx.cast::<Shared>().as_ref() }) else {
         return PARAMETER_ERROR;
     };
@@ -534,7 +562,7 @@ extern "C" fn render(ctx: MutPtr, flags: *mut u32, stamp: Ptr, b: u32, n: u32, _
     let received = &scratch[..delivered];
     let mut queue = lock(&shared.queue);
     let mut pending = lock(&shared.pending);
-    let mut carry = core::mem::take(&mut *pending);
+    let mut carry = std::mem::take(&mut *pending);
     if !carry.is_empty() {
         let accepted = queue.push(&carry) * channels;
         carry.drain(..accepted);
@@ -551,7 +579,7 @@ extern "C" fn render(ctx: MutPtr, flags: *mut u32, stamp: Ptr, b: u32, n: u32, _
 
 struct Unit(*mut c_void);
 impl Unit {
-    fn new_hal() -> Result<Self> {
+    fn new_hal() -> Result<Self, Error> {
         let description = AudioComponentDescription {
             kind: UNIT_TYPE_OUTPUT,
             sub_type: UNIT_SUBTYPE_HAL_OUTPUT,
@@ -571,7 +599,7 @@ impl Unit {
             Err(backend("AudioComponentInstanceNew", status))
         }
     }
-    fn set<T>(&self, property: u32, scope: u32, element: u32, data: &T) -> Result<()> {
+    fn set<T>(&self, property: u32, scope: u32, element: u32, data: &T) -> Result<(), Error> {
         let size = u32::try_from(size_of::<T>())
             .map_err(|_| backend("AudioUnitSetProperty", PARAMETER_ERROR))?;
         let data = from_ref(data).cast();
@@ -602,7 +630,7 @@ struct AudioStream {
     shared: Arc<Shared>,
 }
 impl RawStream for AudioStream {
-    fn read(&mut self, out: &mut [f32]) -> Result<usize> {
+    fn read(&mut self, out: &mut [f32]) -> Result<usize, Error> {
         let channels = self.shared.channels;
         let wanted = out.len() / channels;
         let deadline = Instant::now() + READ_TIMEOUT;
@@ -624,12 +652,12 @@ impl RawStream for AudioStream {
 }
 
 /// Opens a capture stream on `device`.
-pub fn open(device: &DeviceInfo, spec: StreamSpec) -> Result<Box<dyn RawStream>> {
+pub fn open(device: &DeviceInfo, spec: StreamSpec) -> Result<Box<dyn RawStream>, Error> {
     let channels = usize::from(spec.channels());
     let width = u32::try_from(channels).unwrap_or(1);
     let (object, aggregate, tap) = match device.source() {
-        Microphone => (object_for(device.id().as_str(), device)?, None, None),
-        SystemAudio => {
+        Source::Microphone => (object_for(device.id().as_str(), device)?, None, None),
+        Source::SystemAudio => {
             let uid = device
                 .id()
                 .as_str()

@@ -4,17 +4,17 @@
 //! main loop. Capture uses `libpulse-simple`, which blocks in `read` and keeps
 //! the rest of the crate free of callback plumbing.
 
-use core::ffi::{CStr, c_char, c_int, c_void};
-use core::mem::size_of;
-use core::ptr::{null, null_mut};
 use std::ffi::CString;
+use std::ffi::{CStr, c_char, c_int, c_void};
+use std::mem::size_of;
+use std::ptr::{null, null_mut};
 use std::thread;
 use std::time::{Duration, Instant};
 
 use crate::Source;
 use crate::config::StreamSpec;
 use crate::device::{DeviceId, DeviceInfo};
-use crate::error::{Error, Result};
+use crate::error::Error;
 use crate::stream::RawStream;
 
 #[cfg(target_endian = "little")]
@@ -156,7 +156,7 @@ fn text(pointer: *const c_char) -> Option<String> {
 struct Mainloop(*mut c_void);
 
 impl Mainloop {
-    fn new() -> Result<Self> {
+    fn new() -> Result<Self, Error> {
         let mainloop = unsafe { pa_mainloop_new() };
         if mainloop.is_null() {
             Err(Error::Backend {
@@ -168,7 +168,7 @@ impl Mainloop {
         }
     }
 
-    fn api(&self) -> Result<*mut c_void> {
+    fn api(&self) -> Result<*mut c_void, Error> {
         let api = unsafe { pa_mainloop_get_api(self.0) };
         if api.is_null() {
             Err(Error::Backend {
@@ -180,7 +180,7 @@ impl Mainloop {
         }
     }
 
-    fn iterate(&self) -> Result<()> {
+    fn iterate(&self) -> Result<(), Error> {
         let status = unsafe { pa_mainloop_iterate(self.0, 0, null_mut()) };
         if status < 0 {
             Err(backend("pa_mainloop_iterate", status))
@@ -199,7 +199,7 @@ impl Drop for Mainloop {
 struct Context(*mut c_void);
 
 impl Context {
-    fn new(api: *mut c_void) -> Result<Self> {
+    fn new(api: *mut c_void) -> Result<Self, Error> {
         let name = c"koe-capture";
         let context = unsafe { pa_context_new(api, name.as_ptr()) };
         if context.is_null() {
@@ -212,7 +212,7 @@ impl Context {
         }
     }
 
-    fn connect(&self) -> Result<()> {
+    fn connect(&self) -> Result<(), Error> {
         let status = unsafe { pa_context_connect(self.0, null(), 0, null()) };
         if status < 0 {
             Err(backend("pa_context_connect", self.errno()))
@@ -229,7 +229,7 @@ impl Context {
         unsafe { pa_context_get_state(self.0) }
     }
 
-    fn wait_ready(&self, mainloop: &Mainloop) -> Result<()> {
+    fn wait_ready(&self, mainloop: &Mainloop) -> Result<(), Error> {
         let deadline = Instant::now() + CONNECT_TIMEOUT;
         loop {
             match self.state() {
@@ -249,23 +249,23 @@ impl Context {
         }
     }
 
-    fn query_server(&self, mainloop: &Mainloop, collector: &mut Collector) -> Result<()> {
+    fn query_server(&self, mainloop: &Mainloop, collector: &mut Collector) -> Result<(), Error> {
         let operation = unsafe {
             pa_context_get_server_info(
                 self.0,
                 Some(collect_server),
-                core::ptr::from_mut(collector).cast(),
+                std::ptr::from_mut(collector).cast(),
             )
         };
         self.wait_operation(mainloop, operation, "pa_context_get_server_info")
     }
 
-    fn query_sources(&self, mainloop: &Mainloop, collector: &mut Collector) -> Result<()> {
+    fn query_sources(&self, mainloop: &Mainloop, collector: &mut Collector) -> Result<(), Error> {
         let operation = unsafe {
             pa_context_get_source_info_list(
                 self.0,
                 Some(collect_source),
-                core::ptr::from_mut(collector).cast(),
+                std::ptr::from_mut(collector).cast(),
             )
         };
         self.wait_operation(mainloop, operation, "pa_context_get_source_info_list")
@@ -276,7 +276,7 @@ impl Context {
         mainloop: &Mainloop,
         operation: *mut c_void,
         name: &'static str,
-    ) -> Result<()> {
+    ) -> Result<(), Error> {
         if operation.is_null() {
             return Err(backend(name, self.errno()));
         }
@@ -378,7 +378,7 @@ extern "C" fn collect_source(
     ));
 }
 
-pub fn devices() -> Result<Vec<DeviceInfo>> {
+pub fn devices() -> Result<Vec<DeviceInfo>, Error> {
     let mainloop = Mainloop::new()?;
     let api = mainloop.api()?;
     let context = Context::new(api)?;
@@ -397,7 +397,7 @@ struct PulseStream {
 }
 
 impl RawStream for PulseStream {
-    fn read(&mut self, out: &mut [f32]) -> Result<usize> {
+    fn read(&mut self, out: &mut [f32]) -> Result<usize, Error> {
         let Some(bytes) = out.len().checked_mul(size_of::<f32>()) else {
             return Err(Error::BackendInvariant { operation: "read" });
         };
@@ -407,7 +407,7 @@ impl RawStream for PulseStream {
                 self.simple,
                 out.as_mut_ptr().cast(),
                 bytes,
-                core::ptr::from_mut(&mut error),
+                std::ptr::from_mut(&mut error),
             )
         };
         if status < 0 {
@@ -423,7 +423,7 @@ impl Drop for PulseStream {
     }
 }
 
-pub fn open(device: &DeviceInfo, spec: StreamSpec) -> Result<Box<dyn RawStream>> {
+pub fn open(device: &DeviceInfo, spec: StreamSpec) -> Result<Box<dyn RawStream>, Error> {
     let device_name = CString::new(device.id().as_str()).map_err(|_| Error::InvalidId)?;
     let app = c"koe-capture";
     let stream_name = c"capture";
@@ -444,10 +444,10 @@ pub fn open(device: &DeviceInfo, spec: StreamSpec) -> Result<Box<dyn RawStream>>
             PA_STREAM_RECORD,
             device_name.as_ptr(),
             stream_name.as_ptr(),
-            core::ptr::from_ref(&sample_spec),
+            std::ptr::from_ref(&sample_spec),
             null(),
             null(),
-            core::ptr::from_mut(&mut error),
+            std::ptr::from_mut(&mut error),
         )
     };
     if simple.is_null() {

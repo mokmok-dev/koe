@@ -2,13 +2,13 @@
 
 use crate::config::StreamSpec;
 use crate::device::DeviceInfo;
-use crate::error::{Error, Result};
+use crate::error::Error;
 use crate::stream::RawStream;
 
-pub const fn devices() -> Result<Vec<DeviceInfo>> {
+pub const fn devices() -> Result<Vec<DeviceInfo>, Error> {
     Err(Error::Unsupported)
 }
 
-pub fn open(_device: &DeviceInfo, _spec: StreamSpec) -> Result<Box<dyn RawStream>> {
+pub fn open(_device: &DeviceInfo, _spec: StreamSpec) -> Result<Box<dyn RawStream>, Error> {
     Err(Error::Unsupported)
 }

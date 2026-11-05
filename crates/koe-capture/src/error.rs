@@ -1,12 +1,8 @@
 //! Errors crossing the capture boundary.
 
-use core::fmt;
-use std::error::Error as StdError;
+use std::fmt;
 
 use crate::Source;
-
-/// Result alias used across the crate.
-pub type Result<T> = core::result::Result<T, Error>;
 
 /// Something that prevented a capture operation from completing.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -125,7 +121,7 @@ impl fmt::Display for Error {
     }
 }
 
-impl StdError for Error {}
+impl std::error::Error for Error {}
 
 #[cfg(test)]
 mod tests {

@@ -34,7 +34,7 @@ mod sys;
 
 pub use config::{MAX_CHANNELS, MAX_SAMPLE_RATE, MIN_SAMPLE_RATE, StreamSpec};
 pub use device::{DeviceId, DeviceInfo, Source};
-pub use error::{Error, Result};
+pub use error::Error;
 pub use stream::CaptureStream;
 
 /// Lists the capture devices the platform reports.
@@ -44,7 +44,7 @@ pub use stream::CaptureStream;
 /// Returns [`Error::Unsupported`] when no platform feature matches the target,
 /// or the backend's error when the audio server cannot be reached.
 #[allow(clippy::missing_const_for_fn)]
-pub fn devices() -> Result<Vec<DeviceInfo>> {
+pub fn devices() -> Result<Vec<DeviceInfo>, Error> {
     sys::devices()
 }
 
@@ -54,7 +54,7 @@ pub fn devices() -> Result<Vec<DeviceInfo>> {
 ///
 /// Returns [`Error::NoDevice`] when the platform reports no device for the
 /// source, and the same errors as [`devices`].
-pub fn default_device(source: Source) -> Result<DeviceInfo> {
+pub fn default_device(source: Source) -> Result<DeviceInfo, Error> {
     let devices = sys::devices()?;
     device::select(&devices, source, None).cloned()
 }
@@ -64,7 +64,7 @@ pub fn default_device(source: Source) -> Result<DeviceInfo> {
 /// # Errors
 ///
 /// Returns the same errors as [`default_device`] and [`open_device`].
-pub fn open(spec: &StreamSpec) -> Result<CaptureStream> {
+pub fn open(spec: &StreamSpec) -> Result<CaptureStream, Error> {
     let devices = sys::devices()?;
     let device = device::select(&devices, spec.source(), None)?.clone();
     open_device(&device, spec)
@@ -76,7 +76,7 @@ pub fn open(spec: &StreamSpec) -> Result<CaptureStream> {
 ///
 /// Returns [`Error::WrongSource`] when `device` captures a different source
 /// than `spec`, and the backend's error when the stream cannot start.
-pub fn open_device(device: &DeviceInfo, spec: &StreamSpec) -> Result<CaptureStream> {
+pub fn open_device(device: &DeviceInfo, spec: &StreamSpec) -> Result<CaptureStream, Error> {
     if device.source() != spec.source() {
         return Err(Error::WrongSource {
             expected: spec.source(),
