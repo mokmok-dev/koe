@@ -423,7 +423,7 @@ pub fn sync_directory(directory: &Path) {
 }
 
 #[cfg(not(unix))]
-pub fn sync_directory(_directory: &Path) {}
+pub const fn sync_directory(_directory: &Path) {}
 
 #[cfg(test)]
 mod tests {
