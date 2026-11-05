@@ -76,6 +76,7 @@
 
 extern crate alloc;
 
+mod checkpoint;
 mod input;
 #[cfg(test)]
 mod model;
@@ -86,6 +87,7 @@ mod transcript;
 
 pub use koe_capture_core::Source;
 
+pub use checkpoint::{CHECKPOINT_LEN, Checkpoint, DecodeError};
 pub use input::{Effect, Input};
 pub use permission::{Permission, Permissions};
 pub use sources::SourceSet;

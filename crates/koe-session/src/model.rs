@@ -9,11 +9,12 @@ use stateright::{Model, Property};
 
 use koe_capture_core::Source;
 
+use crate::checkpoint::Checkpoint;
 use crate::input::{Effect, Input};
 use crate::permission::{Permission, Permissions};
 use crate::sources::SourceSet;
 use crate::state::{
-    Closing, Confirmed, Next, Phase, Progress, Recording, Reviewing, Session, Stage,
+    Closing, Confirmed, Next, Origin, Paused, Phase, Progress, Recording, Reviewing, Session, Stage,
 };
 use crate::transcript::{Outcome, SegmentOutcome, SegmentResult, Transcript};
 
@@ -188,6 +189,67 @@ fn no_volatile_after_close(state: &ModelState) -> bool {
         .is_some_and(Transcript::any_volatile)
 }
 
+/// The session a checkpoint must restore to, written from the mapping table
+/// rather than from [`Checkpoint::of`] so the two cannot agree by sharing a
+/// mistake.
+fn expected_settled(session: &Session) -> Option<Session> {
+    let permissions = session.permissions();
+    let (stage, sources, progress) = match session.phase {
+        Phase::Idle => return None,
+        Phase::Preparing(preparing) => match preparing.origin {
+            Origin::Fresh => return None,
+            Origin::Resume(progress) => (Stage::Paused, preparing.sources, progress),
+        },
+        Phase::Recording(recording) => (Stage::Paused, recording.sources, recording.progress),
+        Phase::Paused(paused) => (Stage::Paused, paused.sources, paused.progress),
+        Phase::Closing(closing) => {
+            let stage = match closing.next {
+                Next::Pause => Stage::Paused,
+                Next::Stop => Stage::Reviewing,
+            };
+            (stage, closing.sources, closing.progress)
+        }
+        Phase::Reviewing(reviewing) => (Stage::Reviewing, reviewing.sources, reviewing.progress),
+        Phase::Confirmed(confirmed) => (Stage::Confirmed, confirmed.sources, confirmed.progress),
+    };
+    let progress = Progress {
+        transcript: committed_only(progress.transcript),
+        outcome: progress.outcome,
+    };
+    let phase = match stage {
+        Stage::Paused => Phase::Paused(Paused { sources, progress }),
+        Stage::Reviewing => Phase::Reviewing(Reviewing { sources, progress }),
+        _ => Phase::Confirmed(Confirmed { sources, progress }),
+    };
+    Some(Session { permissions, phase })
+}
+
+fn committed_only(transcript: Transcript) -> Transcript {
+    let mut settled = Transcript::default();
+    for source in SOURCES {
+        settled.set_committed(source, transcript.committed(source));
+    }
+    settled
+}
+
+fn checkpoint_restores(state: &ModelState) -> bool {
+    let session = state.session;
+    let restored = Checkpoint::of(&session).map(|checkpoint| {
+        Checkpoint::from_bytes(&checkpoint.to_bytes())
+            .map(|decoded| Session::restore(decoded, session.permissions()))
+    });
+    match (expected_settled(&session), restored) {
+        (None, None) => true,
+        (Some(expected), Some(Ok(restored))) => {
+            restored == expected
+                && restored.open_sources().is_empty()
+                && restored.pending_sources().is_empty()
+                && restored.finishing_sources().is_empty()
+        }
+        _ => false,
+    }
+}
+
 fn review_has_progress(state: &ModelState) -> bool {
     if !matches!(state.session.stage(), Stage::Reviewing | Stage::Confirmed) {
         return true;
@@ -328,6 +390,7 @@ impl Model for SessionModel {
             Property::always("no_volatile_after_close", |_, state| {
                 no_volatile_after_close(state)
             }),
+            Property::always("checkpoint_restores", |_, state| checkpoint_restores(state)),
             Property::always("review_has_progress", |_, state| review_has_progress(state)),
             Property::sometimes("confirmed_complete", |_, state| confirmed_complete(state)),
             Property::sometimes("confirmed_incomplete", |_, state| {
