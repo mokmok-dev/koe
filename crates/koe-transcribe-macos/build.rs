@@ -62,11 +62,44 @@ fn main() {
     }
     println!("cargo:rustc-link-search=native={out_dir}");
     println!("cargo:rustc-link-lib=static=koe_speech_shim");
+    // The archive auto-links the Swift runtime, which lives beside the
+    // compiler rather than in the default search path.
+    for path in runtime_library_paths(&swiftc) {
+        println!("cargo:rustc-link-search=native={path}");
+    }
     // Weak frameworks keep binaries loadable on macOS versions below 26.
     println!("cargo:rustc-link-arg=-Wl,-weak_framework,Speech");
     println!("cargo:rustc-link-arg=-Wl,-weak_framework,AVFAudio");
     // The archive references the system Swift runtime through `@rpath`.
     println!("cargo:rustc-link-arg=-Wl,-rpath,/usr/lib/swift");
+}
+
+/// Directories holding the Swift runtime libraries, as the compiler reports
+/// them.
+fn runtime_library_paths(swiftc: &str) -> Vec<String> {
+    let Ok(output) = Command::new(swiftc).arg("-print-target-info").output() else {
+        return Vec::new();
+    };
+    if !output.status.success() {
+        return Vec::new();
+    }
+    let info = String::from_utf8_lossy(&output.stdout);
+    let Some(key) = info.find("\"runtimeLibraryPaths\"") else {
+        return Vec::new();
+    };
+    let Some(open) = info[key..].find('[').map(|offset| key + offset) else {
+        return Vec::new();
+    };
+    let Some(close) = info[open..].find(']').map(|offset| open + offset) else {
+        return Vec::new();
+    };
+    info[open + 1..close]
+        .split('"')
+        .skip(1)
+        .step_by(2)
+        .filter(|path| !path.is_empty())
+        .map(str::to_owned)
+        .collect()
 }
 
 /// Swift's target spelling for the configured Cargo target architecture.
