@@ -57,9 +57,9 @@ pub struct RecordArgs {
 pub struct TranscribeArgs {
     /// 16-bit PCM WAV file to transcribe.
     pub input: PathBuf,
-    /// GGUF speech model.
+    /// GGUF speech model. Omit to use the platform's system model.
     #[arg(long)]
-    pub model: PathBuf,
+    pub model: Option<PathBuf>,
     /// BCP 47 language tag, for example `ja`.
     #[arg(long)]
     pub language: Option<String>,
@@ -214,7 +214,7 @@ mod tests {
             panic!("expected transcribe");
         };
         assert_eq!(args.input, PathBuf::from("take.wav"));
-        assert_eq!(args.model, PathBuf::from("tiny.gguf"));
+        assert_eq!(args.model, Some(PathBuf::from("tiny.gguf")));
         assert_eq!(args.language.as_deref(), Some("ja"));
         assert!(args.timestamps);
     }
@@ -272,7 +272,7 @@ mod tests {
             vec!["record", "take.ogg", "--duration", "0"],
             vec!["record", "take.ogg", "--rate", "fast"],
             vec!["record", "take.ogg", "--gain", "loud"],
-            vec!["transcribe", "take.wav"],
+            vec!["transcribe"],
         ] {
             assert!(parse(&args).is_err(), "{args:?} must be rejected");
         }

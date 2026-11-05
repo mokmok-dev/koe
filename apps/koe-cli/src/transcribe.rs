@@ -13,7 +13,10 @@ use crate::wav;
 /// Transcribes the WAV file `args` names.
 pub fn execute(args: &TranscribeArgs, host: &dyn Host, io: &mut Io<'_>) -> Result<(), AppError> {
     let audio = wav::read(&args.input)?;
-    let model = model(&args.model)?;
+    let model = match &args.model {
+        Some(path) => model(path)?,
+        None => Model::system_speech(),
+    };
     let recognizer = host.recognizer(&model)?;
     let options = options(args.language.as_deref());
     match recognizer.transcribe(&audio.samples, audio.spec, &options) {
@@ -78,7 +81,7 @@ mod tests {
     fn args(input: PathBuf) -> TranscribeArgs {
         TranscribeArgs {
             input,
-            model: PathBuf::from("tiny.gguf"),
+            model: Some(PathBuf::from("tiny.gguf")),
             language: None,
             timestamps: false,
         }
@@ -272,12 +275,42 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = wav_file(dir.path());
         let mut args = args(path);
-        args.model = PathBuf::from(OsString::from_vec(vec![0xFF]));
+        args.model = Some(PathBuf::from(OsString::from_vec(vec![0xFF])));
         let host = FakeHost::default();
         let (result, _, _) = run(&args, &host);
         let error = result.unwrap_err();
         assert!(matches!(&error, AppError::Usage(_)));
         assert_eq!(error.exit_code(), 2);
+    }
+
+    #[test]
+    fn an_omitted_model_uses_the_system_speech_model() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = wav_file(dir.path());
+        let host =
+            FakeHost::default().with_recognizer(Box::new(FakeRecognizer::new(Ok(transcript()))));
+        let mut args = args(path);
+        args.model = None;
+        let (result, _, _) = run(&args, &host);
+        assert!(result.is_ok());
+        assert_eq!(
+            host.models_seen.lock().unwrap().as_slice(),
+            [Model::system_speech()]
+        );
+    }
+
+    #[test]
+    fn a_model_path_reaches_the_host_as_a_gguf_model() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = wav_file(dir.path());
+        let host =
+            FakeHost::default().with_recognizer(Box::new(FakeRecognizer::new(Ok(transcript()))));
+        let (result, _, _) = run(&args(path), &host);
+        assert!(result.is_ok());
+        assert_eq!(
+            host.models_seen.lock().unwrap().as_slice(),
+            [Model::gguf("tiny.gguf")]
+        );
     }
 
     #[test]

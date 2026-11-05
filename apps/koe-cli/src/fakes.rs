@@ -24,6 +24,8 @@ pub struct FakeHost {
     pub sink: Arc<Mutex<SinkState>>,
     /// Every stream spec the pump asked to open.
     pub opens_seen: Mutex<Vec<StreamSpec>>,
+    /// Every model the transcribe command asked for.
+    pub models_seen: Mutex<Vec<Model>>,
 }
 
 impl FakeHost {
@@ -127,7 +129,8 @@ impl Host for FakeHost {
         }
     }
 
-    fn recognizer(&self, _model: &Model) -> Result<Box<dyn Recognizer>, AppError> {
+    fn recognizer(&self, model: &Model) -> Result<Box<dyn Recognizer>, AppError> {
+        self.models_seen.lock().unwrap().push(model.clone());
         match self.recognizer.lock().unwrap().take() {
             Some(Ok(recognizer)) => Ok(recognizer),
             Some(Err(error)) => Err(error),

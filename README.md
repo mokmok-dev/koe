@@ -26,5 +26,6 @@ cargo run -p koe-cli --features linux -- transcribe take.wav --model model.gguf 
 
 Use `--features macos` or `--features windows` on those platforms. `record`
 writes Ogg Opus (`.ogg`, `.oga`, `.opus`) or WAV (`.wav`) and stops after
-`--duration` or on Ctrl-C. `transcribe` prints committed text and keeps the
-text it received when the engine fails partway.
+`--duration` or on Ctrl-C. `transcribe` reads 16-bit PCM WAV and prints
+committed text, keeping the text it received when the engine fails partway.
+On macOS, omit `--model` to use the system speech model.
