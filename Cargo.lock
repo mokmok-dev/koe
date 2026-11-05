@@ -186,6 +186,7 @@ name = "koe-capture-macos"
 version = "2026.11.1"
 dependencies = [
  "koe-capture-core",
+ "proptest",
 ]
 
 [[package]]
@@ -193,6 +194,7 @@ name = "koe-capture-windows"
 version = "2026.11.1"
 dependencies = [
  "koe-capture-core",
+ "proptest",
 ]
 
 [[package]]
