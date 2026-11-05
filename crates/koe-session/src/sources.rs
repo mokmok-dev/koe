@@ -71,7 +71,22 @@ impl SourceSet {
             .filter(move |source| self.contains(*source))
     }
 
-    const fn bit(source: Source) -> u8 {
+    /// The raw bit mask, in the encoding of [`Self::from_bits`].
+    pub(crate) const fn bits(self) -> u8 {
+        self.0
+    }
+
+    /// The set a wire mask names, or [`None`] when it names anything but the
+    /// two capture sources.
+    pub(crate) const fn from_bits(mask: u8) -> Option<Self> {
+        if mask & !Self::MEETING.0 == 0 {
+            Some(Self(mask))
+        } else {
+            None
+        }
+    }
+
+    pub(crate) const fn bit(source: Source) -> u8 {
         match source {
             Source::Microphone => MICROPHONE_BIT,
             Source::SystemAudio => SYSTEM_AUDIO_BIT,
@@ -159,5 +174,28 @@ mod tests {
         assert_eq!(index(Source::SystemAudio), 1);
         assert_eq!(SOURCES[index(Source::Microphone)], Source::Microphone);
         assert_eq!(SOURCES[index(Source::SystemAudio)], Source::SystemAudio);
+    }
+
+    #[test]
+    fn wire_masks_round_trip_for_the_real_sets() {
+        for set in [
+            SourceSet::EMPTY,
+            SourceSet::MICROPHONE,
+            SourceSet::SYSTEM_AUDIO,
+            SourceSet::MEETING,
+        ] {
+            assert_eq!(SourceSet::from_bits(set.bits()), Some(set));
+        }
+        assert_eq!(SourceSet::from_bits(0), Some(SourceSet::EMPTY));
+        assert_eq!(SourceSet::from_bits(1), Some(SourceSet::MICROPHONE));
+        assert_eq!(SourceSet::from_bits(2), Some(SourceSet::SYSTEM_AUDIO));
+        assert_eq!(SourceSet::from_bits(3), Some(SourceSet::MEETING));
+    }
+
+    #[test]
+    fn a_wire_mask_with_unknown_bits_is_rejected() {
+        for mask in 4u8..=u8::MAX {
+            assert_eq!(SourceSet::from_bits(mask), None);
+        }
     }
 }
