@@ -80,7 +80,7 @@ mod tests {
 
     use super::*;
 
-    const WAIT: Duration = Duration::from_secs(5);
+    const WAIT: Duration = Duration::from_secs(2);
 
     struct Gate {
         open: Mutex<bool>,
@@ -365,7 +365,7 @@ mod tests {
         let session = with_engine(mock).live(mono(), &Options::new()).unwrap();
 
         session.feed(&[0.5; 1_600]).unwrap();
-        started.recv().unwrap();
+        started.recv_timeout(WAIT).unwrap();
         for _ in 0..64 {
             session.feed(&[0.5; 1_600]).unwrap();
         }

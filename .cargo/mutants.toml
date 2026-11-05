@@ -4,14 +4,19 @@
 # mutants would report as missed with no test able to run them.
 exclude_globs = ["crates/*/src/ffi.rs"]
 
-# These mutants keep the observable filter response inside the tolerance the
-# converter guarantees, or are equivalent to the original:
+# Each entry either keeps the observable behaviour inside the tolerance the
+# code guarantees, is equivalent to the original, or is compiled out on the
+# check host:
 # - the fractional phase only shifts the kernel by a fraction of a sample;
 # - `TAPS - 1` to `TAPS + 1`/`TAPS / 1` moves the window length from 47 to 49/48;
 # - flipping the sign of the phase is symmetric for a symmetric kernel;
 # - `>` and `>=` differ only when a row sums to exactly f32::EPSILON;
-# - a sample rate of 1 asks for 16000x the output, so the converter test hangs
-#   instead of failing, and the accessor test already covers the field.
+# - a sample rate of 1 asks for 16000x the output, and the accessor test
+#   already covers the field;
+# - the macOS-gated `engine` body is compiled out on Linux, and its macOS arm
+#   runs on the macOS workflow;
+# - a failed thread spawn has no native code, so the sign of the placeholder
+#   cannot be observed.
 exclude_re = [
   "convert.rs:120:32: replace \\* with / in Converter::interpolate",
   "convert.rs:161:48: replace - with \\+ in build_kernel",
@@ -19,4 +24,8 @@ exclude_re = [
   "convert.rs:164:58: replace - with / in build_kernel",
   "convert.rs:175:22: replace > with >= in build_kernel",
   "config.rs:48:9: replace AudioSpec::sample_rate -> u32 with 1",
+  "koe-transcribe-macos/src/lib.rs:20:5: replace engine",
+  "koe-transcribe-macos/src/lib.rs:21:9: delete match arm Model::SystemSpeech",
+  "koe-transcribe-macos/src/lib.rs:22:9: delete match arm Model::Gguf",
+  "koe-transcribe/src/live.rs:60:50: delete - in LiveSession::start",
 ]

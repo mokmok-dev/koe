@@ -177,9 +177,8 @@
                   buildPhaseCargoCommand = "";
                   buildPhase = ''
                     runHook preBuild
-                    cargo mutants --jobs 8 \
-                      --package koe-capture-core \
-                      --package koe-transcribe-core
+                    # The ggml backend rebuilds its C++ library per mutant.
+                    cargo mutants --jobs 8 --exclude koe-transcribe-ggml
                     test ! -s mutants.out/missed.txt
                     test ! -s mutants.out/timeout.txt
                     runHook postBuild

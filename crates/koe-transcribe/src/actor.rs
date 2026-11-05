@@ -131,7 +131,8 @@ impl Task {
             return Ok(());
         }
         let silence = [0.0_f32; SILENCE_BLOCK];
-        while remaining > 0 {
+        let blocks = remaining.div_ceil(SILENCE_BLOCK as u64);
+        for _ in 0..blocks {
             let len = usize::try_from(remaining.min(SILENCE_BLOCK as u64)).unwrap_or(SILENCE_BLOCK);
             self.session.feed(&silence[..len])?;
             remaining = remaining.saturating_sub(u64::try_from(len).unwrap_or(remaining));
