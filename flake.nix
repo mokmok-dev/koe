@@ -138,26 +138,24 @@
               backendTest = craneLib.cargoTest backendArgs;
             }
             // pkgs.lib.optionalAttrs (system == "x86_64-linux") {
-              mutation = craneLib.mkCargoDerivation {
-                inherit
-                  src
-                  cargoArtifacts
-                  ;
-                pname = "koe-mutants";
-                nativeBuildInputs = [ pkgs.cargo-mutants ];
-                doCheck = false;
-                buildPhaseCargoCommand = "";
-                buildPhase = ''
-                  runHook preBuild
-                  cargo mutants \
-                    --package koe-capture-core \
-                    --jobs 8
-                  test ! -s mutants.out/missed.txt
-                  test ! -s mutants.out/timeout.txt
-                  runHook postBuild
-                '';
-                installPhase = "mkdir -p $out";
-              };
+              mutation = craneLib.mkCargoDerivation (
+                cargoCommonArgs
+                // {
+                  inherit cargoArtifacts;
+                  pname = "koe-mutants";
+                  nativeBuildInputs = [ pkgs.cargo-mutants ];
+                  doCheck = false;
+                  buildPhaseCargoCommand = "";
+                  buildPhase = ''
+                    runHook preBuild
+                    cargo mutants --jobs 8
+                    test ! -s mutants.out/missed.txt
+                    test ! -s mutants.out/timeout.txt
+                    runHook postBuild
+                  '';
+                  installPhase = "mkdir -p $out";
+                }
+              );
               crossMacos = crossCheck "aarch64-apple-darwin" "koe-capture-macos";
               crossWindows = crossCheck "x86_64-pc-windows-gnu" "koe-capture-windows";
               coreNoStd = craneLib.mkCargoDerivation {
