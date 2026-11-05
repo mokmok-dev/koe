@@ -1,8 +1,9 @@
 //! The recording format registry.
 //!
 //! This module is the only place a format is described. Adding one means a
-//! variant here, its extension arms, and one arm in the private `open` factory
-//! in `file.rs`; the compiler reports every other place that needs to change.
+//! variant here, a row in `EXTENSIONS`, and one arm in the private `open`
+//! factory in `file.rs`. The compiler reports the match arms; `EXTENSIONS` and
+//! the test's `ALL` list are hand-kept, so a new variant needs both.
 
 use std::path::Path;
 
@@ -14,7 +15,15 @@ use koe_record_core::{Error, RecordingSpec};
 pub enum Format {
     /// Ogg with Opus audio.
     Ogg,
+    /// Uncompressed RIFF/WAVE with 16-bit PCM audio.
+    Wav,
 }
+
+/// Every name the registry claims, canonical one first.
+const EXTENSIONS: [(Format, &[&str]); 2] = [
+    (Format::Ogg, &["ogg", "oga", "opus"]),
+    (Format::Wav, &["wav"]),
+];
 
 impl Format {
     /// File extension the format writes, without the dot.
@@ -22,6 +31,7 @@ impl Format {
     pub const fn extension(self) -> &'static str {
         match self {
             Self::Ogg => "ogg",
+            Self::Wav => "wav",
         }
     }
 
@@ -30,10 +40,19 @@ impl Format {
     /// `oga` and `opus` name Ogg too, because players accept all three.
     #[must_use]
     pub const fn from_extension(extension: &str) -> Option<Self> {
-        let is_ogg = extension.eq_ignore_ascii_case("ogg")
-            || extension.eq_ignore_ascii_case("oga")
-            || extension.eq_ignore_ascii_case("opus");
-        if is_ogg { Some(Self::Ogg) } else { None }
+        let mut row = 0;
+        while row < EXTENSIONS.len() {
+            let (format, names) = EXTENSIONS[row];
+            let mut name = 0;
+            while name < names.len() {
+                if extension.eq_ignore_ascii_case(names[name]) {
+                    return Some(format);
+                }
+                name += 1;
+            }
+            row += 1;
+        }
+        None
     }
 
     /// Resolves the format a path names.
@@ -55,6 +74,8 @@ impl Format {
                     Err(Error::UnsupportedRate { rate })
                 }
             }
+            // Every rate a `RecordingSpec` accepts fits WAV's `u32` rate field.
+            Self::Wav => Ok(()),
         }
     }
 }
@@ -67,6 +88,8 @@ mod tests {
 
     use super::*;
 
+    const ALL: [Format; 2] = [Format::Ogg, Format::Wav];
+
     #[test]
     fn extensions_name_the_format_in_either_case() {
         for extension in ["ogg", "OGG", "Ogg", "oga", "opus", "OPUS"] {
@@ -76,11 +99,18 @@ mod tests {
                 "`{extension}` must name Ogg"
             );
         }
+        for extension in ["wav", "WAV", "Wav"] {
+            assert_eq!(
+                Format::from_extension(extension),
+                Some(Format::Wav),
+                "`{extension}` must name WAV"
+            );
+        }
     }
 
     #[test]
     fn other_extensions_name_no_format() {
-        for extension in ["wav", "mp3", "og", "", " ogg"] {
+        for extension in ["wave", "mp3", "og", "", " ogg"] {
             assert_eq!(
                 Format::from_extension(extension),
                 None,
@@ -93,18 +123,47 @@ mod tests {
     fn paths_are_resolved_by_extension() {
         assert_eq!(Format::from_path("take.ogg"), Some(Format::Ogg));
         assert_eq!(Format::from_path("/tmp/dir/take.OPUS"), Some(Format::Ogg));
+        assert_eq!(Format::from_path("take.wav"), Some(Format::Wav));
+        assert_eq!(Format::from_path("/tmp/dir/take.WAV"), Some(Format::Wav));
         assert_eq!(Format::from_path("take"), None);
-        assert_eq!(Format::from_path("take.wav"), None);
+        assert_eq!(Format::from_path("take.mp3"), None);
         assert_eq!(Format::from_path(".ogg"), None);
+        assert_eq!(Format::from_path(".wav"), None);
     }
 
     #[test]
     fn the_extension_round_trips() {
-        assert_eq!(Format::Ogg.extension(), "ogg");
-        assert_eq!(
-            Format::from_path(Path::new("take").with_extension(Format::Ogg.extension())),
-            Some(Format::Ogg)
-        );
+        for format in ALL {
+            let extension = format.extension();
+            assert_eq!(Format::from_extension(extension), Some(format));
+            assert_eq!(
+                Format::from_path(Path::new("take").with_extension(extension)),
+                Some(format)
+            );
+        }
+    }
+
+    #[test]
+    fn every_variant_has_a_row_and_every_row_names_a_variant() {
+        for format in ALL {
+            let row = EXTENSIONS
+                .iter()
+                .find(|(candidate, _)| *candidate == format);
+            assert!(row.is_some(), "no `EXTENSIONS` row for {format:?}");
+            if let Some((_, names)) = row {
+                assert_eq!(
+                    names.first(),
+                    Some(&format.extension()),
+                    "the canonical name leads the row for {format:?}"
+                );
+            }
+        }
+        for (format, _) in EXTENSIONS {
+            assert!(
+                ALL.contains(&format),
+                "an `EXTENSIONS` row names {format:?}, which is not a variant"
+            );
+        }
     }
 
     #[test]
@@ -128,6 +187,20 @@ mod tests {
                 Err(Error::UnsupportedRate { rate }),
                 "{rate} Hz must be rejected"
             );
+        }
+    }
+
+    #[test]
+    fn wav_accepts_every_rate_the_spec_allows() {
+        for rate in [8_000, 11_025, 22_050, 44_100, 96_000, 192_000, 384_000] {
+            for channels in [Channels::Mono, Channels::Stereo] {
+                let spec = RecordingSpec::new(rate, channels).unwrap();
+                assert_eq!(
+                    Format::Wav.validate(spec),
+                    Ok(()),
+                    "{rate} Hz {channels:?} must be accepted"
+                );
+            }
         }
     }
 }

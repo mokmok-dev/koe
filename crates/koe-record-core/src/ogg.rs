@@ -6,6 +6,7 @@
 use alloc::vec::Vec;
 
 use crate::error::Error;
+use crate::sink::Sink;
 use crate::spec::Channels;
 
 /// Page body cap; a local choice, not an RFC 3533 limit.
@@ -28,16 +29,6 @@ const FLAG_EOS: u8 = 0x04;
 
 /// Byte offset of the CRC field in a page header.
 const CRC_OFFSET: usize = 22;
-
-/// Where framed pages go.
-pub trait Sink {
-    /// Writes every byte of `bytes`.
-    ///
-    /// # Errors
-    ///
-    /// Returns the sink's own error when the write fails.
-    fn write_all(&mut self, bytes: &[u8]) -> Result<(), Error>;
-}
 
 /// What the identification header announces about the stream.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

@@ -160,8 +160,10 @@ impl Recorder {
     /// Returns [`Error::SourceNotRegistered`] when the source has no stream,
     /// [`Error::SourceEnded`] after [`end`](Self::end),
     /// [`Error::MisalignedBuffer`] for a partial frame, [`Error::InputOverflow`]
-    /// when the source's queue cannot hold the block, and the file's error when
-    /// a mixed block cannot be written.
+    /// when the source's queue cannot hold the block,
+    /// [`Error::RecordingTooLarge`] when the container's size field can no
+    /// longer describe the audio, and the file's error when a mixed block
+    /// cannot be written.
     pub fn write(&mut self, source: Source, samples: &[f32]) -> Result<(), Error> {
         {
             let slot = &mut self.sources[index(source)];
@@ -214,14 +216,16 @@ impl Recorder {
     /// Mixes what is left, completes the file, and reports the recording.
     ///
     /// Frames that never paired with another live source stay in their queue
-    /// and are not written.
+    /// and are not written. The container is completed before a failed last
+    /// mix is reported, so the file stays readable.
     ///
     /// # Errors
     ///
-    /// Returns the file's error when the last block or the file itself cannot
-    /// be written.
+    /// Returns [`Error::RecordingTooLarge`] when the container's size field can
+    /// no longer describe the audio, and the file's error when the last block
+    /// or the file itself cannot be written.
     pub fn finish(mut self) -> Result<Summary, Error> {
-        self.drain()?;
+        let drained = self.drain();
         let nanoseconds =
             self.frames
                 .checked_mul(1_000_000_000)
@@ -234,7 +238,9 @@ impl Recorder {
             clipped_samples: self.clipped_samples,
             duration: Duration::from_nanos(nanoseconds),
         };
-        self.file.finish()?;
+        let closed = self.file.finish();
+        drained?;
+        closed?;
         Ok(summary)
     }
 
@@ -339,5 +345,80 @@ const fn index(source: Source) -> usize {
     match source {
         Source::Microphone => 0,
         Source::SystemAudio => 1,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used)]
+
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    use super::*;
+    use crate::file::AudioFile;
+
+    /// A file that refuses every sample block and reports whether it closed.
+    struct FailingFile {
+        finished: Arc<AtomicBool>,
+    }
+
+    impl AudioFile for FailingFile {
+        fn write(&mut self, _samples: &[f32]) -> Result<(), Error> {
+            Err(Error::Io {
+                operation: "write",
+                code: 1,
+            })
+        }
+
+        fn finish(self: Box<Self>) -> Result<(), Error> {
+            self.finished.store(true, Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn a_failed_last_mix_still_closes_the_file() {
+        let finished = Arc::new(AtomicBool::new(false));
+        let mut recorder = Recorder {
+            spec: RecordingSpec::new(48_000, Channels::Stereo).unwrap(),
+            mixer: Mixer::new(Channels::Stereo),
+            file: Box::new(FailingFile {
+                finished: Arc::clone(&finished),
+            }),
+            sources: [SourceSlot::empty(), SourceSlot::empty()],
+            microphone: vec![0.0; MAX_BLOCK_FRAMES * 2],
+            system_audio: vec![0.0; MAX_BLOCK_FRAMES * 2],
+            mixed: vec![0.0; MAX_BLOCK_FRAMES * 2],
+            frames: 0,
+            clipped_samples: 0,
+        };
+        recorder
+            .add_source(
+                Source::Microphone,
+                &StreamSpec::new(Source::Microphone, 48_000, 1).unwrap(),
+            )
+            .unwrap();
+
+        // One frame beyond the drain cap stays queued, so the failure repeats.
+        let samples = vec![0.25; MAX_BLOCK_FRAMES + 1];
+        let write_error = Error::Io {
+            operation: "write",
+            code: 1,
+        };
+        assert_eq!(
+            recorder.write(Source::Microphone, &samples).err().unwrap(),
+            write_error
+        );
+        assert!(
+            !finished.load(Ordering::SeqCst),
+            "a failed write leaves the file open"
+        );
+
+        assert_eq!(recorder.finish().err().unwrap(), write_error);
+        assert!(
+            finished.load(Ordering::SeqCst),
+            "the file closes even when the last mix fails"
+        );
     }
 }
