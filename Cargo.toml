@@ -1,5 +1,6 @@
 [workspace]
 members = [
+  "apps/koe-cli",
   "crates/koe-capture",
   "crates/koe-capture-core",
   "crates/koe-capture-linux",
@@ -17,6 +18,16 @@ members = [
 resolver = "3"
 
 [workspace.dependencies]
+clap = { version = "4.6.7", default-features = false, features = [
+  "derive",
+  "error-context",
+  "help",
+  "std",
+  "suggestions",
+  "usage"
+] }
+ctrlc = "3.5.2"
+koe-capture = { path = "crates/koe-capture" }
 koe-capture-core = { path = "crates/koe-capture-core" }
 koe-capture-linux = { path = "crates/koe-capture-linux" }
 koe-capture-macos = { path = "crates/koe-capture-macos" }
@@ -33,6 +44,7 @@ libm = "0.2"
 opus = "0.4.0"
 proptest = "1.12.0"
 stateright = "0.31.0"
+tempfile = "3.27.0"
 transcribe-cpp = "0.4.1"
 
 [workspace.lints.clippy]

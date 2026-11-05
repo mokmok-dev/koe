@@ -11,3 +11,20 @@ A privacy-first recording & transcription app.
 - Simple local storage
 - Featherlight UI
 - Cross platform
+
+## Command line
+
+The `koe` CLI records the microphone and the system audio into one file and
+transcribes 16-bit PCM WAV files offline. Build it with the backend for the
+host:
+
+```console
+cargo run -p koe-cli --features linux -- devices
+cargo run -p koe-cli --features linux -- record take.ogg --source both
+cargo run -p koe-cli --features linux -- transcribe take.wav --model model.gguf --language ja
+```
+
+Use `--features macos` or `--features windows` on those platforms. `record`
+writes Ogg Opus (`.ogg`, `.oga`, `.opus`) or WAV (`.wav`) and stops after
+`--duration` or on Ctrl-C. `transcribe` prints committed text and keeps the
+text it received when the engine fails partway.

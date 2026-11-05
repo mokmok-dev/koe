@@ -1,0 +1,30 @@
+[package]
+description = "Command-line recorder and transcriber for koe"
+edition.workspace = true
+license.workspace = true
+name = "koe-cli"
+version.workspace = true
+
+[[bin]]
+name = "koe"
+path = "src/main.rs"
+
+[dependencies]
+clap.workspace = true
+ctrlc.workspace = true
+koe-capture.workspace = true
+koe-record.workspace = true
+koe-transcribe.workspace = true
+
+[dev-dependencies]
+koe-capture-core.workspace = true
+tempfile.workspace = true
+
+[features]
+default = []
+linux = ["koe-capture/linux", "koe-transcribe/linux"]
+macos = ["koe-capture/macos", "koe-transcribe/macos"]
+windows = ["koe-capture/windows", "koe-transcribe/windows"]
+
+[lints]
+workspace = true
