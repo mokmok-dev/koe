@@ -1,0 +1,13 @@
+[package]
+description = "transcribe.cpp backend for koe-transcribe"
+edition.workspace = true
+license.workspace = true
+name = "koe-transcribe-ggml"
+version.workspace = true
+
+[dependencies]
+koe-transcribe-core.workspace = true
+transcribe-cpp.workspace = true
+
+[lints]
+workspace = true

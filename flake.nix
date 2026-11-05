@@ -90,6 +90,12 @@
                 inherit src;
                 pname = "koe";
                 strictDeps = true;
+                # The Darwin stdenv has no swiftc, and the macOS speech shim
+                # cannot be built without it.
+                nativeBuildInputs = [
+                  pkgs.cmake
+                ]
+                ++ pkgs.lib.optional pkgs.stdenv.hostPlatform.isDarwin pkgs.swift;
               }
               // pkgs.lib.optionalAttrs pkgs.stdenv.hostPlatform.isLinux {
                 buildInputs = [ pkgs.libpulseaudio ];
@@ -111,6 +117,21 @@
                 inherit cargoArtifacts;
                 cargoClippyExtraArgs = "--package koe-capture-linux --package koe-capture-macos --package koe-capture-windows --all-targets -- --deny warnings";
                 cargoTestExtraArgs = "--package koe-capture-linux --package koe-capture-macos --package koe-capture-windows";
+              };
+              transcribeCoreArgs = cargoCommonArgs // {
+                inherit cargoArtifacts;
+                cargoClippyExtraArgs = "--package koe-transcribe-core --all-targets -- --deny warnings";
+                cargoTestExtraArgs = "--package koe-transcribe-core";
+              };
+              transcribeFacadeArgs = cargoCommonArgs // {
+                inherit cargoArtifacts;
+                cargoClippyExtraArgs = "--package koe-transcribe --all-targets --features ${platformFeature} -- --deny warnings";
+                cargoTestExtraArgs = "--package koe-transcribe --features ${platformFeature}";
+              };
+              transcribeBackendArgs = cargoCommonArgs // {
+                inherit cargoArtifacts;
+                cargoClippyExtraArgs = "--package koe-transcribe-ggml --package koe-transcribe-macos --all-targets -- --deny warnings";
+                cargoTestExtraArgs = "--package koe-transcribe-ggml --package koe-transcribe-macos";
               };
 
               crossCheck =
@@ -136,6 +157,12 @@
               facadeTest = craneLib.cargoTest facadeArgs;
               backendClippy = craneLib.cargoClippy backendArgs;
               backendTest = craneLib.cargoTest backendArgs;
+              transcribeCoreClippy = craneLib.cargoClippy transcribeCoreArgs;
+              transcribeCoreTest = craneLib.cargoTest transcribeCoreArgs;
+              transcribeFacadeClippy = craneLib.cargoClippy transcribeFacadeArgs;
+              transcribeBackendClippy = craneLib.cargoClippy transcribeBackendArgs;
+              transcribeFacadeTest = craneLib.cargoTest transcribeFacadeArgs;
+              transcribeBackendTest = craneLib.cargoTest transcribeBackendArgs;
             }
             // pkgs.lib.optionalAttrs (system == "x86_64-linux") {
               mutation = craneLib.mkCargoDerivation (
@@ -143,12 +170,16 @@
                 // {
                   inherit cargoArtifacts;
                   pname = "koe-mutants";
-                  nativeBuildInputs = [ pkgs.cargo-mutants ];
+                  nativeBuildInputs = [
+                    pkgs.cargo-mutants
+                    pkgs.cmake
+                  ];
                   doCheck = false;
                   buildPhaseCargoCommand = "";
                   buildPhase = ''
                     runHook preBuild
-                    cargo mutants --jobs 8
+                    # The ggml backend rebuilds its C++ library per mutant.
+                    cargo mutants --jobs 8 --exclude koe-transcribe-ggml
                     test ! -s mutants.out/missed.txt
                     test ! -s mutants.out/timeout.txt
                     runHook postBuild
@@ -180,11 +211,13 @@
               with pkgs;
               [
                 cargo-mutants
+                cmake
                 linkerPackages
                 rustToolchain
                 sccache
               ]
-              ++ pkgs.lib.optional pkgs.stdenv.hostPlatform.isLinux libpulseaudio;
+              ++ pkgs.lib.optional pkgs.stdenv.hostPlatform.isLinux libpulseaudio
+              ++ pkgs.lib.optional pkgs.stdenv.hostPlatform.isDarwin swift;
 
             shellHook = ''
               export RUSTC_WRAPPER="${pkgs.sccache}/bin/sccache"

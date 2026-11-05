@@ -20,3 +20,7 @@ jobs:
       - run: cargo clippy -p koe-capture --all-targets --features windows -- --deny warnings
       - run: cargo test -p koe-capture-core
       - run: cargo test -p koe-capture --features windows
+      - run: cargo clippy -p koe-transcribe-ggml --all-targets -- --deny warnings
+      - run: cargo clippy -p koe-transcribe --all-targets --features windows -- --deny warnings
+      - run: cargo test -p koe-transcribe-ggml
+      - run: cargo test -p koe-transcribe --features windows

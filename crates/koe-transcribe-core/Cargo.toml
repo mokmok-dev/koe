@@ -1,0 +1,15 @@
+[package]
+description = "Platform-independent speech-to-text types and audio conversion"
+edition.workspace = true
+license.workspace = true
+name = "koe-transcribe-core"
+version.workspace = true
+
+[dependencies]
+libm.workspace = true
+
+[dev-dependencies]
+proptest.workspace = true
+
+[lints]
+workspace = true

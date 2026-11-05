@@ -1,0 +1,20 @@
+[package]
+description = "Cross-platform speech-to-text"
+edition.workspace = true
+license.workspace = true
+name = "koe-transcribe"
+version.workspace = true
+
+[dependencies]
+koe-transcribe-core.workspace = true
+koe-transcribe-ggml = { workspace = true, optional = true }
+koe-transcribe-macos = { workspace = true, optional = true }
+
+[features]
+default = []
+linux = ["dep:koe-transcribe-ggml"]
+macos = ["dep:koe-transcribe-macos"]
+windows = ["dep:koe-transcribe-ggml"]
+
+[lints]
+workspace = true

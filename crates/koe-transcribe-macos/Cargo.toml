@@ -1,0 +1,12 @@
+[package]
+description = "SpeechAnalyzer backend for koe-transcribe"
+edition.workspace = true
+license.workspace = true
+name = "koe-transcribe-macos"
+version.workspace = true
+
+[dependencies]
+koe-transcribe-core.workspace = true
+
+[lints]
+workspace = true

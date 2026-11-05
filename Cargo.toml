@@ -5,6 +5,10 @@ members = [
   "crates/koe-capture-linux",
   "crates/koe-capture-macos",
   "crates/koe-capture-windows",
+  "crates/koe-transcribe",
+  "crates/koe-transcribe-core",
+  "crates/koe-transcribe-ggml",
+  "crates/koe-transcribe-macos",
 ]
 resolver = "3"
 
@@ -13,7 +17,13 @@ koe-capture-core = { path = "crates/koe-capture-core" }
 koe-capture-linux = { path = "crates/koe-capture-linux" }
 koe-capture-macos = { path = "crates/koe-capture-macos" }
 koe-capture-windows = { path = "crates/koe-capture-windows" }
+koe-transcribe = { path = "crates/koe-transcribe" }
+koe-transcribe-core = { path = "crates/koe-transcribe-core" }
+koe-transcribe-ggml = { path = "crates/koe-transcribe-ggml" }
+koe-transcribe-macos = { path = "crates/koe-transcribe-macos" }
+libm = "0.2"
 proptest = "1.12.0"
+transcribe-cpp = "0.4.1"
 
 [workspace.lints.clippy]
 all = "warn"

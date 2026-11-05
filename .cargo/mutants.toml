@@ -3,3 +3,7 @@
 # them. The Linux file compiles here but needs a live PulseAudio server. Their
 # mutants would report as missed with no test able to run them.
 exclude_globs = ["crates/*/src/ffi.rs"]
+
+# Equivalent mutant: the comparison differs only when a kernel row sums to
+# exactly f32::EPSILON, which no input can produce.
+exclude_re = ["convert.rs:180:22: replace > with >= in build_kernel"]
