@@ -15,34 +15,21 @@ use koe_transcribe_core::{Engine, Error, Model};
 /// Returns [`Error::Unavailable`] when the backend cannot transcribe with the
 /// requested model, [`Error::Unsupported`] on targets without
 /// `SpeechAnalyzer`, and the platform's error when a session cannot start.
-#[cfg(target_os = "macos")]
 pub fn engine(model: &Model) -> Result<Box<dyn Engine>, Error> {
     match model {
-        Model::SystemSpeech => Ok(Box::new(pipeline::Engine::new(ffi::SpeechShim))),
+        Model::SystemSpeech => {
+            #[cfg(target_os = "macos")]
+            {
+                Ok(Box::new(pipeline::Engine::new(ffi::SpeechShim)))
+            }
+            #[cfg(not(target_os = "macos"))]
+            {
+                Err(Error::Unsupported)
+            }
+        }
         Model::Gguf(_) => Err(Error::Unavailable {
             feature: "gguf transcription",
         }),
-        // Later variants have no macOS system-speech mapping to fall into.
-        _ => Err(Error::Unavailable {
-            feature: "the requested model kind",
-        }),
-    }
-}
-
-/// Prepares the system speech engine.
-///
-/// # Errors
-///
-/// Returns [`Error::Unavailable`] when the backend cannot transcribe with the
-/// requested model, and [`Error::Unsupported`] because the target has no
-/// `SpeechAnalyzer`.
-#[cfg(not(target_os = "macos"))]
-pub fn engine(model: &Model) -> Result<Box<dyn Engine>, Error> {
-    match model {
-        Model::Gguf(_) => Err(Error::Unavailable {
-            feature: "gguf transcription",
-        }),
-        Model::SystemSpeech => Err(Error::Unsupported),
         // Later variants have no macOS system-speech mapping to fall into.
         _ => Err(Error::Unavailable {
             feature: "the requested model kind",

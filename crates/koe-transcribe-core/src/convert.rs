@@ -58,6 +58,9 @@ impl Converter {
     #[must_use]
     pub fn new(spec: AudioSpec) -> Self {
         let sample_rate = spec.sample_rate();
+        // `AudioSpec` validates this range; the check keeps the resampling
+        // ratio bounded if a converter is ever built from a hand-made spec.
+        debug_assert!(crate::config::MIN_SAMPLE_RATE <= sample_rate);
         let channels = usize::from(spec.channels());
         Self {
             sample_rate,
@@ -358,6 +361,75 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// One output sample computed with exact arithmetic from the design
+    /// constants, at the same 1/256 phase resolution the table uses.
+    fn reference(source: &[f32], rate: u32, k: usize) -> f64 {
+        let scaled = k as u64 * u64::from(rate);
+        let anchor = usize::try_from(scaled / 16_000).unwrap();
+        let phase = (scaled % 16_000) * 256 / 16_000;
+        let fraction = phase as f64 / 256.0;
+        let cycles = 0.45 * f64::from(rate.min(16_000)) / f64::from(rate);
+
+        let mut weighted = 0.0;
+        let mut weights = 0.0;
+        for tap in 0..48_usize {
+            let Some(index) = anchor
+                .checked_sub(47)
+                .and_then(|base| base.checked_add(tap))
+            else {
+                continue;
+            };
+            let distance = tap as f64 - 23.5 - fraction;
+            let window = f64::mul_add(
+                -0.46,
+                (2.0 * std::f64::consts::PI * tap as f64 / 47.0).cos(),
+                0.54,
+            );
+            let gain = if distance == 0.0 {
+                2.0 * cycles
+            } else {
+                (2.0 * std::f64::consts::PI * cycles * distance).sin()
+                    / (std::f64::consts::PI * distance)
+            };
+            let weight = gain * window;
+            weighted = f64::mul_add(f64::from(source[index]), weight, weighted);
+            weights += weight;
+        }
+        weighted / weights
+    }
+
+    #[test]
+    fn the_table_matches_an_exact_sinc_reference() {
+        let source: Vec<f32> = (0..44_100)
+            .map(|index| (index as f32 * 0.013).sin() * 0.5)
+            .collect();
+        let mut converter = Converter::new(spec(44_100, 1));
+        let mut out = Vec::new();
+        converter.push(&source, &mut out);
+
+        let mut worst = 0.0_f64;
+        for k in 2_000..4_000 {
+            let expected = reference(&source, 44_100, k);
+            worst = worst.max((f64::from(out[k]) - expected).abs());
+        }
+        assert!(worst < 1e-5, "worst {worst}");
+    }
+
+    #[test]
+    fn a_fractional_ratio_tone_keeps_its_level() {
+        let source = tone(44_100, 3_000.0, 44_100);
+        let mut converter = Converter::new(spec(44_100, 1));
+        let mut out = Vec::new();
+        converter.push(&source, &mut out);
+
+        let expected = amplitude(&source[22_050..], 1_500);
+        let actual = amplitude(&out[8_000..], 1_500);
+        assert!(
+            (actual - expected).abs() / expected < 0.02,
+            "expected {expected}, got {actual}"
+        );
     }
 
     #[test]

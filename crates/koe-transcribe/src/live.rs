@@ -57,7 +57,7 @@ impl LiveSession {
         );
         let handle = task.spawn().map_err(|error| Error::Backend {
             operation: "spawn session task",
-            code: error.raw_os_error().unwrap_or(-1),
+            code: error.raw_os_error().unwrap_or_default(),
         })?;
 
         Ok(Self {
