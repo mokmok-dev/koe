@@ -128,6 +128,11 @@
                 cargoClippyExtraArgs = "--package koe-session --all-targets -- --deny warnings";
                 cargoTestExtraArgs = "--package koe-session";
               };
+              recordCoreArgs = cargoCommonArgs // {
+                inherit cargoArtifacts;
+                cargoClippyExtraArgs = "--package koe-record-core --all-targets -- --deny warnings";
+                cargoTestExtraArgs = "--package koe-record-core";
+              };
               transcribeFacadeArgs = cargoCommonArgs // {
                 inherit cargoArtifacts;
                 cargoClippyExtraArgs = "--package koe-transcribe --all-targets --features ${platformFeature} -- --deny warnings";
@@ -166,6 +171,8 @@
               transcribeCoreTest = craneLib.cargoTest transcribeCoreArgs;
               sessionClippy = craneLib.cargoClippy sessionArgs;
               sessionTest = craneLib.cargoTest sessionArgs;
+              recordCoreClippy = craneLib.cargoClippy recordCoreArgs;
+              recordCoreTest = craneLib.cargoTest recordCoreArgs;
               transcribeFacadeClippy = craneLib.cargoClippy transcribeFacadeArgs;
               transcribeBackendClippy = craneLib.cargoClippy transcribeBackendArgs;
               transcribeFacadeTest = craneLib.cargoTest transcribeFacadeArgs;
@@ -204,7 +211,7 @@
                 buildPhaseCargoCommand = "";
                 buildPhase = ''
                   runHook preBuild
-                  cargo check --package koe-capture-core --package koe-session --target thumbv7em-none-eabi
+                  cargo check --package koe-capture-core --package koe-session --package koe-record-core --target thumbv7em-none-eabi
                   runHook postBuild
                 '';
                 installPhase = "mkdir -p $out";

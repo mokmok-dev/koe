@@ -310,6 +310,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "koe-record-core"
+version = "2026.11.1"
+dependencies = [
+ "koe-capture-core",
+ "proptest",
+]
+
+[[package]]
 name = "koe-session"
 version = "2026.11.1"
 dependencies = [
