@@ -1,20 +1,19 @@
 //! The `transcribe` command.
 
-use std::path::Path;
-
-use koe_transcribe::{Model, Options, Transcript};
+use koe_transcribe::{Model, Transcript};
 
 use crate::cli::TranscribeArgs;
 use crate::error::AppError;
 use crate::host::Host;
 use crate::io::Io;
+use crate::model::{model_from_path, options};
 use crate::wav;
 
 /// Transcribes the WAV file `args` names.
 pub fn execute(args: &TranscribeArgs, host: &dyn Host, io: &mut Io<'_>) -> Result<(), AppError> {
     let audio = wav::read(&args.input)?;
     let model = match &args.model {
-        Some(path) => model(path)?,
+        Some(path) => model_from_path(path)?,
         None => Model::system_speech(),
     };
     let recognizer = host.recognizer(&model)?;
@@ -29,20 +28,6 @@ pub fn execute(args: &TranscribeArgs, host: &dyn Host, io: &mut Io<'_>) -> Resul
             Err(AppError::Transcribe(incomplete.error().clone()))
         }
     }
-}
-
-fn model(path: &Path) -> Result<Model, AppError> {
-    let text = path.to_str().ok_or_else(|| {
-        AppError::usage(format!(
-            "model path `{}` is not valid UTF-8",
-            path.display()
-        ))
-    })?;
-    Ok(Model::gguf(text))
-}
-
-fn options(language: Option<&str>) -> Options {
-    language.map_or_else(Options::new, |language| Options::new().language(language))
 }
 
 fn render(transcript: &Transcript, timestamps: bool, io: &mut Io<'_>) {
@@ -70,7 +55,7 @@ fn render(transcript: &Transcript, timestamps: bool, io: &mut Io<'_>) {
 mod tests {
     #![allow(clippy::unwrap_used, clippy::float_cmp)]
 
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
     use std::sync::Arc;
 
     use koe_transcribe::{Incomplete, Segment, Transcript};
@@ -311,19 +296,5 @@ mod tests {
             host.models_seen.lock().unwrap().as_slice(),
             [Model::gguf("tiny.gguf")]
         );
-    }
-
-    #[test]
-    fn a_model_path_becomes_a_gguf_model() {
-        assert_eq!(
-            model(Path::new("/models/tiny.gguf")).unwrap(),
-            Model::gguf("/models/tiny.gguf")
-        );
-    }
-
-    #[test]
-    fn options_keep_a_requested_language() {
-        assert_eq!(options(None).language_tag(), None);
-        assert_eq!(options(Some("pt-BR")).language_tag(), Some("pt-BR"));
     }
 }

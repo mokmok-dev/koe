@@ -4,6 +4,7 @@
     test,
     allow(
         clippy::assert_is_empty,
+        clippy::expect_used,
         clippy::float_cmp,
         clippy::panic,
         clippy::significant_drop_tightening,
@@ -30,6 +31,7 @@ mod devices;
 mod error;
 mod host;
 mod io;
+mod model;
 mod record;
 mod transcribe;
 mod wav;
