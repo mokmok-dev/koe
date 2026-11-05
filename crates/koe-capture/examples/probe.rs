@@ -1,6 +1,6 @@
-//! Lists capture devices and reads one short block from a default device.
+//! Lists capture devices and reads one short block from each default source.
 
-use koe_capture::{Source, StreamSpec};
+use koe_capture::{DeviceInfo, Source, StreamSpec};
 
 fn main() {
     let devices = match koe_capture::devices() {
@@ -23,22 +23,36 @@ fn main() {
         );
     }
 
-    let source = if devices
+    for source in [Source::Microphone, Source::SystemAudio] {
+        probe(source, &devices);
+    }
+}
+
+fn probe(source: Source, devices: &[DeviceInfo]) {
+    let Some(device) = devices
         .iter()
-        .any(|device| device.source() == Source::SystemAudio)
-    {
-        Source::SystemAudio
-    } else {
-        Source::Microphone
+        .find(|device| device.source() == source && device.is_default())
+        .or_else(|| devices.iter().find(|device| device.source() == source))
+    else {
+        println!("no {source} device");
+        return;
     };
-    let spec = match StreamSpec::new(source, 48_000, 1) {
+    let rate = if (koe_capture::MIN_SAMPLE_RATE..=koe_capture::MAX_SAMPLE_RATE)
+        .contains(&device.default_sample_rate())
+    {
+        device.default_sample_rate()
+    } else {
+        48_000
+    };
+    let channels = device.channels().max(1);
+    let spec = match StreamSpec::new(source, rate, channels) {
         Ok(spec) => spec,
         Err(error) => {
-            eprintln!("invalid spec: {error}");
+            eprintln!("invalid {source} spec: {error}");
             return;
         }
     };
-    let mut capture = match koe_capture::open(&spec) {
+    let mut capture = match koe_capture::open_device(device, &spec) {
         Ok(capture) => capture,
         Err(error) => {
             eprintln!("cannot open {source}: {error}");
@@ -46,14 +60,14 @@ fn main() {
         }
     };
 
-    let mut samples = vec![0.0_f32; 4_800];
+    let mut samples = vec![0.0_f32; usize::from(channels) * (rate as usize / 10)];
     match capture.read(&mut samples) {
         Ok(frames) => {
             let peak = samples
                 .iter()
                 .fold(0.0_f32, |peak, sample| peak.max(sample.abs()));
-            println!("read {frames} frames, peak {peak}");
+            println!("{source}: read {frames} frames, peak {peak}");
         }
-        Err(error) => eprintln!("read failed: {error}"),
+        Err(error) => eprintln!("{source}: read failed: {error}"),
     }
 }

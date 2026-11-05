@@ -22,11 +22,16 @@ runtime, and no helper process.
 | Target | Feature | System audio |
 | --- | --- | --- |
 | Linux | `linux` | monitor sources of the default sink |
-| macOS | `macos` | `CoreAudio` process tap on the default output, wrapped in a private aggregate device |
+| macOS | `macos` | `CoreAudio` process tap pinned to the selected output device, wrapped in a private aggregate device |
 | Windows | `windows` | shared-mode loopback on the render endpoint |
 
 Enable exactly one platform feature. A build with no platform feature keeps
 the full API and returns `Error::Unsupported` from each capture call.
+
+The macOS system-audio entry is stereo, because the tap is a stereo mix. The
+backend pins the tap to the selected output device, so each `system:` entry
+records the audio played to that device. `read` blocks, so capture the
+microphone and system audio on separate threads, each opening its own stream.
 
 ## Usage
 
@@ -34,12 +39,17 @@ the full API and returns `Error::Unsupported` from each capture call.
 use koe_capture::{Source, StreamSpec};
 
 # fn main() -> Result<(), koe_capture::Error> {
-let spec = StreamSpec::new(Source::SystemAudio, 48_000, 2)?;
 for device in koe_capture::devices()? {
     println!("{}: {} ({:?})", device.id(), device.name(), device.source());
 }
 
-let mut capture = koe_capture::open(&spec)?;
+let device = koe_capture::default_device(Source::SystemAudio)?;
+let spec = StreamSpec::new(
+    Source::SystemAudio,
+    device.default_sample_rate(),
+    device.channels(),
+)?;
+let mut capture = koe_capture::open_device(&device, &spec)?;
 let mut samples = vec![0.0_f32; usize::from(spec.channels()) * 480];
 loop {
     let frames = capture.read(&mut samples)?;
@@ -54,8 +64,15 @@ your buffer. The buffer length must be a multiple of the channel count.
 ## Build prerequisites
 
 - Linux: `libpulseaudio` development files. The flake's dev shell provides it.
-- macOS: nothing beyond the system frameworks.
-- Windows: nothing beyond `ole32` and `kernel32`.
+- macOS: macOS 14.2 or later for system audio; the microphone works on
+  earlier versions. The app bundle needs
+  `NSMicrophoneUsageDescription` for the microphone and
+  `NSAudioCaptureUsageDescription` for the tap, plus the Microphone and
+  Screen & System Audio Recording permissions. A bare `cargo run` binary has no
+  bundle, so TCC cannot grant it and capture stays silent.
+- Windows: Windows 10 1703 or later for event-driven loopback. The requested
+  `StreamSpec` must match the endpoint's native mix format; use the selected
+  `DeviceInfo`'s `default_sample_rate()` and `channels()` with `open_device`.
 
 ## Verification
 
@@ -66,14 +83,17 @@ cargo test -p koe-capture-core
 # Facade and the host backend.
 cargo test -p koe-capture --features linux
 
-# Every gate: clippy, tests, mutation score, macOS check, Windows check.
+# Every Linux gate: clippy, tests, mutation score, macOS check, Windows check.
 nix flake check
 
 # Only the mutation gate.
 nix build .#checks.x86_64-linux.mutation
+
+# Inspect the default microphone and system-audio devices on the host.
+cargo run -p koe-capture --features linux --example probe
 ```
 
 The mutation gate targets `koe-capture-core`. The OS crates are separate
-crates, so no mutation exclusion is needed. The macOS and ARM jobs run clippy
-and the test suite on their native targets. CI also runs the Windows adapter
-on a Windows runner.
+crates, so no mutation exclusion is needed. Native macOS and Windows CI jobs
+run clippy and the test suite against their backends. They compile and link,
+but they do not open a real capture device.
