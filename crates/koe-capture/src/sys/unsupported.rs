@@ -5,7 +5,10 @@ use crate::device::DeviceInfo;
 use crate::error::Error;
 use crate::stream::RawStream;
 
-pub const fn devices() -> Result<Vec<DeviceInfo>, Error> {
+// Kept non-const so `crate::devices` has one signature in every feature
+// configuration.
+#[allow(clippy::missing_const_for_fn)]
+pub fn devices() -> Result<Vec<DeviceInfo>, Error> {
     Err(Error::Unsupported)
 }
 

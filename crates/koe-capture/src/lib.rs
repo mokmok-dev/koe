@@ -43,7 +43,6 @@ pub use stream::CaptureStream;
 ///
 /// Returns [`Error::Unsupported`] when no platform feature matches the target,
 /// or the backend's error when the audio server cannot be reached.
-#[allow(clippy::missing_const_for_fn)]
 pub fn devices() -> Result<Vec<DeviceInfo>, Error> {
     sys::devices()
 }
