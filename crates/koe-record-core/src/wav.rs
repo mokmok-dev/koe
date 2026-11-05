@@ -184,8 +184,6 @@ impl<S: PatchSink> WavWriter<S> {
         let sizes = self.sizes.grow(bytes, self.limit)?;
 
         self.bytes.clear();
-        self.bytes
-            .reserve(samples.len() * usize::from(SAMPLE_BYTES));
         for sample in samples {
             self.bytes.extend_from_slice(&pcm16(*sample).to_le_bytes());
         }
