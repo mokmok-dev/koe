@@ -90,6 +90,7 @@
                 inherit src;
                 pname = "koe";
                 strictDeps = true;
+                nativeBuildInputs = [ pkgs.cmake ];
               }
               // pkgs.lib.optionalAttrs pkgs.stdenv.hostPlatform.isLinux {
                 buildInputs = [ pkgs.libpulseaudio ];
@@ -111,6 +112,21 @@
                 inherit cargoArtifacts;
                 cargoClippyExtraArgs = "--package koe-capture-linux --package koe-capture-macos --package koe-capture-windows --all-targets -- --deny warnings";
                 cargoTestExtraArgs = "--package koe-capture-linux --package koe-capture-macos --package koe-capture-windows";
+              };
+              transcribeCoreArgs = cargoCommonArgs // {
+                inherit cargoArtifacts;
+                cargoClippyExtraArgs = "--package koe-transcribe-core --all-targets -- --deny warnings";
+                cargoTestExtraArgs = "--package koe-transcribe-core";
+              };
+              transcribeFacadeArgs = cargoCommonArgs // {
+                inherit cargoArtifacts;
+                cargoClippyExtraArgs = "--package koe-transcribe --all-targets --features ${platformFeature} -- --deny warnings";
+                cargoTestExtraArgs = "--package koe-transcribe --features ${platformFeature}";
+              };
+              transcribeBackendArgs = cargoCommonArgs // {
+                inherit cargoArtifacts;
+                cargoClippyExtraArgs = "--package koe-transcribe-ggml --all-targets -- --deny warnings";
+                cargoTestExtraArgs = "--package koe-transcribe-ggml";
               };
 
               crossCheck =
@@ -136,6 +152,14 @@
               facadeTest = craneLib.cargoTest facadeArgs;
               backendClippy = craneLib.cargoClippy backendArgs;
               backendTest = craneLib.cargoTest backendArgs;
+              transcribeCoreClippy = craneLib.cargoClippy transcribeCoreArgs;
+              transcribeCoreTest = craneLib.cargoTest transcribeCoreArgs;
+              transcribeFacadeClippy = craneLib.cargoClippy transcribeFacadeArgs;
+              transcribeBackendClippy = craneLib.cargoClippy transcribeBackendArgs;
+            }
+            // pkgs.lib.optionalAttrs pkgs.stdenv.hostPlatform.isLinux {
+              transcribeFacadeTest = craneLib.cargoTest transcribeFacadeArgs;
+              transcribeBackendTest = craneLib.cargoTest transcribeBackendArgs;
             }
             // pkgs.lib.optionalAttrs (system == "x86_64-linux") {
               mutation = craneLib.mkCargoDerivation (
@@ -143,12 +167,17 @@
                 // {
                   inherit cargoArtifacts;
                   pname = "koe-mutants";
-                  nativeBuildInputs = [ pkgs.cargo-mutants ];
+                  nativeBuildInputs = [
+                    pkgs.cargo-mutants
+                    pkgs.cmake
+                  ];
                   doCheck = false;
                   buildPhaseCargoCommand = "";
                   buildPhase = ''
                     runHook preBuild
-                    cargo mutants --jobs 8
+                    cargo mutants --jobs 8 \
+                      --package koe-capture-core \
+                      --package koe-transcribe-core
                     test ! -s mutants.out/missed.txt
                     test ! -s mutants.out/timeout.txt
                     runHook postBuild
@@ -180,6 +209,7 @@
               with pkgs;
               [
                 cargo-mutants
+                cmake
                 linkerPackages
                 rustToolchain
                 sccache
