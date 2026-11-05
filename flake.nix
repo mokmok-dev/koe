@@ -133,6 +133,11 @@
                 cargoClippyExtraArgs = "--package koe-transcribe-ggml --package koe-transcribe-macos --all-targets -- --deny warnings";
                 cargoTestExtraArgs = "--package koe-transcribe-ggml --package koe-transcribe-macos";
               };
+              sessionCoreArgs = cargoCommonArgs // {
+                inherit cargoArtifacts;
+                cargoClippyExtraArgs = "--package koe-session-core --all-targets -- --deny warnings";
+                cargoTestExtraArgs = "--package koe-session-core";
+              };
 
               crossCheck =
                 target: package:
@@ -163,6 +168,8 @@
               transcribeBackendClippy = craneLib.cargoClippy transcribeBackendArgs;
               transcribeFacadeTest = craneLib.cargoTest transcribeFacadeArgs;
               transcribeBackendTest = craneLib.cargoTest transcribeBackendArgs;
+              sessionCoreClippy = craneLib.cargoClippy sessionCoreArgs;
+              sessionCoreTest = craneLib.cargoTest sessionCoreArgs;
             }
             // pkgs.lib.optionalAttrs (system == "x86_64-linux") {
               mutation = craneLib.mkCargoDerivation (
@@ -197,7 +204,7 @@
                 buildPhaseCargoCommand = "";
                 buildPhase = ''
                   runHook preBuild
-                  cargo check --package koe-capture-core --target thumbv7em-none-eabi
+                  cargo check --package koe-capture-core --package koe-session-core --target thumbv7em-none-eabi
                   runHook postBuild
                 '';
                 installPhase = "mkdir -p $out";
