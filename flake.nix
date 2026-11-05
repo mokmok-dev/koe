@@ -36,7 +36,12 @@
           ...
         }:
         let
-          rustToolchain = pkgs.rust-bin.stable.latest.default;
+          rustToolchain = pkgs.rust-bin.stable.latest.default.override {
+            targets = [
+              "aarch64-apple-darwin"
+              "x86_64-pc-windows-gnu"
+            ];
+          };
           craneLib = (crane.mkLib pkgs).overrideToolchain rustToolchain;
 
           linkerPackages = pkgs.lib.optionals pkgs.stdenv.hostPlatform.isLinux (
@@ -68,6 +73,8 @@
                 inherit src;
                 pname = "koe";
                 strictDeps = true;
+                buildInputs = [ pkgs.libpulseaudio ];
+                LD_LIBRARY_PATH = pkgs.lib.makeLibraryPath [ pkgs.libpulseaudio ];
               };
               cargoArtifacts = craneLib.buildDepsOnly cargoCommonArgs;
             in
@@ -99,6 +106,7 @@
 
             packages = with pkgs; [
               cargo-mutants
+              libpulseaudio
               linkerPackages
               rustToolchain
               sccache
