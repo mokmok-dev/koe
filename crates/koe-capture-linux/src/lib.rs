@@ -256,7 +256,11 @@ impl Context {
                 std::ptr::from_mut(collector).cast(),
             )
         };
-        self.wait_operation(mainloop, operation, "pa_context_get_server_info")
+        self.wait_operation(mainloop, operation, "pa_context_get_server_info")?;
+        if let Some(code) = collector.failure.take() {
+            return Err(backend("pa_context_get_server_info", code));
+        }
+        Ok(())
     }
 
     fn query_sources(&self, mainloop: &Mainloop, collector: &mut Collector) -> Result<(), Error> {
@@ -267,7 +271,11 @@ impl Context {
                 std::ptr::from_mut(collector).cast(),
             )
         };
-        self.wait_operation(mainloop, operation, "pa_context_get_source_info_list")
+        self.wait_operation(mainloop, operation, "pa_context_get_source_info_list")?;
+        if let Some(code) = collector.failure.take() {
+            return Err(backend("pa_context_get_source_info_list", code));
+        }
+        Ok(())
     }
 
     fn wait_operation(
@@ -288,7 +296,12 @@ impl Context {
                 }
                 PA_OPERATION_CANCELLED => {
                     unsafe { pa_operation_unref(operation) };
-                    return Err(backend(name, self.errno()));
+                    let code = self.errno();
+                    return Err(if code == 0 {
+                        Error::Timeout { operation: name }
+                    } else {
+                        backend(name, code)
+                    });
                 }
                 _ => {}
             }
@@ -299,7 +312,13 @@ impl Context {
                 }
                 return Err(Error::Timeout { operation: name });
             }
-            mainloop.iterate()?;
+            if let Err(error) = mainloop.iterate() {
+                unsafe {
+                    pa_operation_cancel(operation);
+                    pa_operation_unref(operation);
+                }
+                return Err(error);
+            }
             thread::sleep(Duration::from_millis(1));
         }
     }
@@ -319,33 +338,46 @@ struct Collector {
     devices: Vec<DeviceInfo>,
     default_sink: Option<String>,
     default_source: Option<String>,
+    failure: Option<c_int>,
 }
 
 extern "C" fn collect_server(
-    _context: *mut c_void,
+    context: *mut c_void,
     info: *const PaServerInfo,
     userdata: *mut c_void,
 ) {
-    if info.is_null() || userdata.is_null() {
+    if userdata.is_null() {
+        return;
+    }
+    let collector = unsafe { &mut *userdata.cast::<Collector>() };
+    if info.is_null() {
+        collector.failure = Some(unsafe { pa_context_errno(context) });
         return;
     }
     let info = unsafe { &*info };
-    let collector = unsafe { &mut *userdata.cast::<Collector>() };
-    collector.default_sink = text(info.default_sink_name);
-    collector.default_source = text(info.default_source_name);
+    // PipeWire reports `@DEFAULT_SINK@`/`@DEFAULT_SOURCE@` instead of a name.
+    collector.default_sink = text(info.default_sink_name).filter(|name| !name.starts_with('@'));
+    collector.default_source = text(info.default_source_name).filter(|name| !name.starts_with('@'));
 }
 
 extern "C" fn collect_source(
-    _context: *mut c_void,
+    context: *mut c_void,
     info: *const PaSourceInfo,
     end_of_list: c_int,
     userdata: *mut c_void,
 ) {
-    if end_of_list != 0 || info.is_null() || userdata.is_null() {
+    if userdata.is_null() {
+        return;
+    }
+    let collector = unsafe { &mut *userdata.cast::<Collector>() };
+    if end_of_list < 0 {
+        collector.failure = Some(unsafe { pa_context_errno(context) });
+        return;
+    }
+    if end_of_list != 0 || info.is_null() {
         return;
     }
     let info = unsafe { &*info };
-    let collector = unsafe { &mut *userdata.cast::<Collector>() };
     let Some(name) = text(info.name) else {
         return;
     };
@@ -358,11 +390,13 @@ extern "C" fn collect_source(
     } else {
         Source::Microphone
     };
+    let is_default_source = collector.default_source.as_deref() == Some(name.as_str());
     let is_default = if is_monitor {
-        text(info.monitor_of_sink_name)
-            .is_some_and(|sink| collector.default_sink.as_deref() == Some(sink.as_str()))
+        is_default_source
+            || text(info.monitor_of_sink_name)
+                .is_some_and(|sink| collector.default_sink.as_deref() == Some(sink.as_str()))
     } else {
-        collector.default_source.as_deref() == Some(name.as_str())
+        is_default_source
     };
     let Ok(id) = DeviceId::new(name) else {
         return;
