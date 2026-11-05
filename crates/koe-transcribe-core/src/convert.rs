@@ -157,6 +157,8 @@ impl Converter {
 fn build_kernel(sample_rate: u32) -> Box<[[f32; TAPS]]> {
     let cutoff = 0.45 * sample_rate.min(ENGINE_RATE) as f32;
     let cycles = cutoff / sample_rate as f32;
+    // The cutoff is 0.45 of the lower rate, so the kernel never reaches Nyquist.
+    debug_assert!(cycles <= 0.5);
     let mut kernel = vec![[0.0_f32; TAPS]; PHASES];
     for (phase, row) in kernel.iter_mut().enumerate() {
         let fraction = phase as f32 / PHASES as f32;
