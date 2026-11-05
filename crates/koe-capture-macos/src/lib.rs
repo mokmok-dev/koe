@@ -14,7 +14,7 @@ use std::ffi::CString;
 use std::ffi::{CStr, c_char, c_void};
 use std::mem::size_of;
 use std::ptr::{addr_of, from_ref, null, null_mut};
-use std::sync::atomic::{AtomicPtr, Ordering};
+use std::sync::atomic::{AtomicI32, AtomicPtr, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -56,6 +56,7 @@ const UNIT_SCOPE_OUTPUT: u32 = 2;
 const INPUT_ELEMENT: u32 = 1;
 const OUTPUT_ELEMENT: u32 = 0;
 const UNIT_STREAM_FORMAT: u32 = 8;
+const UNIT_MAX_FRAMES_PER_SLICE: u32 = 14;
 const UNIT_CURRENT_DEVICE: u32 = 2_000;
 const UNIT_ENABLE_IO: u32 = 2_003;
 const UNIT_INPUT_CALLBACK: u32 = 2_005;
@@ -135,10 +136,34 @@ unsafe extern "C" {
         size: *mut u32,
         data: *mut c_void,
     ) -> i32;
-    fn AudioHardwareCreateProcessTap(description: *mut c_void, tap: *mut u32) -> i32;
-    fn AudioHardwareDestroyProcessTap(tap: u32) -> i32;
     fn AudioHardwareCreateAggregateDevice(description: *const c_void, device: *mut u32) -> i32;
     fn AudioHardwareDestroyAggregateDevice(device: u32) -> i32;
+}
+
+// The process-tap entry points only exist from macOS 14.2 on, so they are
+// resolved by name; a hard link would make the whole binary fail to launch on
+// 14.0 and 14.1.
+unsafe extern "C" {
+    fn dlsym(handle: *mut c_void, symbol: *const c_char) -> *mut c_void;
+}
+const RTLD_DEFAULT: *mut c_void = (-2isize).cast_unsigned() as *mut c_void;
+type CreateTap = unsafe extern "C" fn(*mut c_void, *mut u32) -> i32;
+type DestroyTap = unsafe extern "C" fn(u32) -> i32;
+#[derive(Clone, Copy)]
+struct TapApi {
+    create: CreateTap,
+    destroy: DestroyTap,
+}
+fn tap_api() -> Option<TapApi> {
+    let create = unsafe { dlsym(RTLD_DEFAULT, c"AudioHardwareCreateProcessTap".as_ptr()) };
+    let destroy = unsafe { dlsym(RTLD_DEFAULT, c"AudioHardwareDestroyProcessTap".as_ptr()) };
+    if create.is_null() || destroy.is_null() {
+        return None;
+    }
+    Some(TapApi {
+        create: unsafe { std::mem::transmute::<*mut c_void, CreateTap>(create) },
+        destroy: unsafe { std::mem::transmute::<*mut c_void, DestroyTap>(destroy) },
+    })
 }
 
 #[link(name = "AudioToolbox", kind = "framework")]
@@ -352,8 +377,8 @@ fn describe(object: u32, default_input: u32, default_output: u32) -> Vec<DeviceI
         && let Ok(id) = DeviceId::new(format!("{SYSTEM_PREFIX}{uid}"))
     {
         let default = object == default_output;
-        let count = u16::try_from(outputs).unwrap_or(u16::MAX);
-        let entry = DeviceInfo::new(id, name, Source::SystemAudio, default, rate, count);
+        // The stereo global tap always delivers two channels.
+        let entry = DeviceInfo::new(id, name, Source::SystemAudio, default, rate, 2);
         devices.push(entry);
     }
     devices
@@ -392,10 +417,13 @@ fn send(receiver: *mut c_void, selector: *mut c_void, argument: *mut c_void) -> 
     unsafe { send(receiver, selector, argument) }
 }
 
-struct ProcessTap(u32);
+struct ProcessTap {
+    tap: u32,
+    destroy: DestroyTap,
+}
 impl Drop for ProcessTap {
     fn drop(&mut self) {
-        unsafe { AudioHardwareDestroyProcessTap(self.0) };
+        unsafe { (self.destroy)(self.tap) };
     }
 }
 struct AggregateDevice(u32);
@@ -404,13 +432,21 @@ impl Drop for AggregateDevice {
         unsafe { AudioHardwareDestroyAggregateDevice(self.0) };
     }
 }
-fn create_tap(name: &str) -> Result<(ProcessTap, String), Error> {
+fn create_tap(name: &str, output_uid: &str) -> Result<(ProcessTap, String), Error> {
+    let api = tap_api().ok_or(Error::Unavailable {
+        feature: "system audio capture",
+    })?;
+    if objc_class(c"CATapDescription").is_null() {
+        return Err(Error::Unavailable {
+            feature: "system audio capture",
+        });
+    }
     let pool = unsafe { objc_autoreleasePoolPush() };
-    let created = tap_object(name);
+    let created = tap_object(name, output_uid, api);
     unsafe { objc_autoreleasePoolPop(pool) };
     created
 }
-fn tap_object(name: &str) -> Result<(ProcessTap, String), Error> {
+fn tap_object(name: &str, output_uid: &str, api: TapApi) -> Result<(ProcessTap, String), Error> {
     let description = send(
         send(
             objc_class(c"CATapDescription"),
@@ -439,10 +475,29 @@ fn tap_object(name: &str) -> Result<(ProcessTap, String), Error> {
         );
         send(description, selector(c"setName:"), string);
     }
+    // The tap must follow the chosen output device and stay private to us.
+    let device = cf_make(output_uid)?;
+    send(
+        description,
+        selector(c"setDeviceUID:"),
+        device.raw().cast_mut(),
+    );
+    send(description, selector(c"setMuteBehavior:"), null_mut());
+    send(
+        description,
+        selector(c"setPrivate:"),
+        std::ptr::without_provenance_mut(1),
+    );
     let mut tap = 0;
-    let status = unsafe { AudioHardwareCreateProcessTap(description, &raw mut tap) };
+    let status = unsafe { (api.create)(description, &raw mut tap) };
     if status == 0 {
-        Ok((ProcessTap(tap), uuid_text))
+        Ok((
+            ProcessTap {
+                tap,
+                destroy: api.destroy,
+            },
+            uuid_text,
+        ))
     } else {
         Err(backend("AudioHardwareCreateProcessTap", status))
     }
@@ -493,18 +548,23 @@ struct Shared {
     scratch: Mutex<Vec<f32>>,
     /// Written before the callback is installed and read on the audio thread.
     unit: AtomicPtr<c_void>,
+    /// Last non-zero `AudioUnitRender` status, reported to the reader.
+    last_error: AtomicI32,
     channels: usize,
     capacity: usize,
 }
 impl Shared {
     fn new(channels: usize, unit: *mut c_void) -> Self {
+        let capacity = channels * QUEUE_FRAMES;
         Self {
             queue: Mutex::new(FrameQueue::new(channels, QUEUE_FRAMES)),
-            pending: Mutex::new(Vec::new()),
+            // Sized up front so the render callback never reallocates it.
+            pending: Mutex::new(Vec::with_capacity(capacity)),
             scratch: Mutex::new(vec![0.0; channels * CALLBACK_FRAMES]),
             unit: AtomicPtr::new(unit),
+            last_error: AtomicI32::new(0),
             channels,
-            capacity: channels * QUEUE_FRAMES,
+            capacity,
         }
     }
     fn take(&self, out: &mut [f32]) -> usize {
@@ -555,8 +615,12 @@ extern "C" fn render(
     };
     let status = unsafe { AudioUnitRender(unit, flags, stamp, b, wanted, &raw mut list) };
     if status != 0 {
-        return status;
+        // Returning the status would make the HAL tear the IO proc down for
+        // good, so the failure is handed to the reader instead.
+        shared.last_error.store(status, Ordering::Release);
+        return 0;
     }
+    shared.last_error.store(0, Ordering::Release);
     let delivered = list.buffers[0].data_byte_size as usize / size_of::<f32>();
     let delivered = delivered - delivered % channels;
     if delivered == 0 {
@@ -571,8 +635,9 @@ extern "C" fn render(
         carry.drain(..accepted);
     }
     let accepted = queue.push(received) * channels;
-    carry.extend_from_slice(&received[accepted..]);
-    carry.truncate(shared.capacity);
+    let extra = &received[accepted..];
+    let room = shared.capacity.saturating_sub(carry.len());
+    carry.extend_from_slice(&extra[..extra.len().min(room)]);
     drop(scratch);
     *pending = carry;
     drop(queue);
@@ -644,6 +709,13 @@ impl RawStream for AudioStream {
                 break;
             }
             if Instant::now() >= deadline {
+                if produced > 0 {
+                    break;
+                }
+                let code = self.shared.last_error.load(Ordering::Acquire);
+                if code != 0 {
+                    return Err(backend("AudioUnitRender", code));
+                }
                 return Err(Error::Timeout {
                     operation: "AudioUnitRender",
                 });
@@ -663,6 +735,12 @@ impl RawStream for AudioStream {
 pub fn open(device: &DeviceInfo, spec: StreamSpec) -> Result<Box<dyn RawStream>, Error> {
     let channels = usize::from(spec.channels());
     let width = u32::try_from(channels).unwrap_or(1);
+    if device.source() == Source::SystemAudio && spec.channels() != 2 {
+        return Err(Error::DeviceFormat {
+            sample_rate: spec.sample_rate(),
+            channels: spec.channels(),
+        });
+    }
     let (object, aggregate, tap) = match device.source() {
         Source::Microphone => (object_for(device.id().as_str(), device)?, None, None),
         Source::SystemAudio => {
@@ -675,7 +753,7 @@ pub fn open(device: &DeviceInfo, spec: StreamSpec) -> Result<Box<dyn RawStream>,
             if channel_count(output, SCOPE_OUTPUT) == 0 {
                 return Err(Error::DeviceNotFound(device.id().clone()));
             }
-            let (tap, tap_uid) = create_tap(device.name())?;
+            let (tap, tap_uid) = create_tap(device.name(), uid)?;
             let aggregate = create_aggregate(&tap_uid, device.name())?;
             let object = aggregate.0;
             (object, Some(aggregate), Some(tap))
@@ -719,6 +797,12 @@ pub fn open(device: &DeviceInfo, spec: StreamSpec) -> Result<Box<dyn RawStream>,
         UNIT_SCOPE_GLOBAL,
         ELEMENT_MAIN,
         &callback,
+    )?;
+    unit.set(
+        UNIT_MAX_FRAMES_PER_SLICE,
+        UNIT_SCOPE_GLOBAL,
+        ELEMENT_MAIN,
+        &u32::try_from(CALLBACK_FRAMES).unwrap_or(u32::MAX),
     )?;
     let status = unsafe { AudioUnitInitialize(unit.0) };
     if status != 0 {

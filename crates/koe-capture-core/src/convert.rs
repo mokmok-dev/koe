@@ -9,6 +9,8 @@ use crate::error::Error;
 pub enum SampleFormat {
     /// Signed 16-bit integers in native byte order.
     I16,
+    /// Signed 24-bit integers in native byte order, three bytes each.
+    I24,
     /// Signed 32-bit integers in native byte order.
     I32,
     /// 32-bit floats in native byte order.
@@ -21,7 +23,33 @@ impl SampleFormat {
     pub const fn bytes_per_sample(self) -> usize {
         match self {
             Self::I16 => 2,
+            Self::I24 => 3,
             Self::I32 | Self::F32 => 4,
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+enum ByteOrder {
+    Little,
+    Big,
+}
+
+const NATIVE_ORDER: ByteOrder = if cfg!(target_endian = "little") {
+    ByteOrder::Little
+} else {
+    ByteOrder::Big
+};
+
+const fn i24_value(chunk: &[u8], order: ByteOrder) -> i32 {
+    match order {
+        ByteOrder::Little => {
+            let extension = if chunk[2] & 0x80 == 0 { 0 } else { 0xFF };
+            i32::from_le_bytes([chunk[0], chunk[1], chunk[2], extension])
+        }
+        ByteOrder::Big => {
+            let extension = if chunk[0] & 0x80 == 0 { 0 } else { 0xFF };
+            i32::from_be_bytes([extension, chunk[0], chunk[1], chunk[2]])
         }
     }
 }
@@ -55,6 +83,7 @@ pub fn decode(bytes: &[u8], format: SampleFormat, out: &mut [f32]) -> Result<usi
     for (index, chunk) in bytes.chunks_exact(sample_size).enumerate() {
         out[index] = match format {
             SampleFormat::I16 => f32::from(i16::from_ne_bytes([chunk[0], chunk[1]])) / 32_768.0,
+            SampleFormat::I24 => i24_value(chunk, NATIVE_ORDER) as f32 / 8_388_608.0,
             SampleFormat::I32 => {
                 i32::from_ne_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]) as f32
                     / 2_147_483_648.0
@@ -80,8 +109,50 @@ mod tests {
     #[test]
     fn sample_sizes_are_exact() {
         assert_eq!(SampleFormat::I16.bytes_per_sample(), 2);
+        assert_eq!(SampleFormat::I24.bytes_per_sample(), 3);
         assert_eq!(SampleFormat::I32.bytes_per_sample(), 4);
         assert_eq!(SampleFormat::F32.bytes_per_sample(), 4);
+    }
+
+    fn i24_bytes(value: i32) -> [u8; 3] {
+        let bytes = value.to_ne_bytes();
+        if cfg!(target_endian = "little") {
+            [bytes[0], bytes[1], bytes[2]]
+        } else {
+            [bytes[1], bytes[2], bytes[3]]
+        }
+    }
+
+    #[test]
+    fn i24_value_handles_both_byte_orders() {
+        assert_eq!(
+            i24_value(&[0x00, 0x00, 0x80], ByteOrder::Little),
+            -8_388_608
+        );
+        assert_eq!(i24_value(&[0x80, 0x00, 0x00], ByteOrder::Big), -8_388_608);
+        assert_eq!(i24_value(&[0xFF, 0xFF, 0x7F], ByteOrder::Little), 8_388_607);
+        assert_eq!(i24_value(&[0x7F, 0xFF, 0xFF], ByteOrder::Big), 8_388_607);
+        assert_eq!(i24_value(&[0, 0, 0], ByteOrder::Little), 0);
+        assert_eq!(i24_value(&[0, 0, 0], ByteOrder::Big), 0);
+    }
+
+    #[test]
+    fn decodes_i24_full_scale() {
+        let bytes = [
+            i24_bytes(-8_388_608),
+            i24_bytes(-1),
+            i24_bytes(0),
+            i24_bytes(1),
+            i24_bytes(8_388_607),
+        ]
+        .concat();
+        let mut out = [0.0; 5];
+        assert_eq!(decode(&bytes, SampleFormat::I24, &mut out).unwrap(), 5);
+        assert_eq!(out[0], -1.0);
+        assert_eq!(out[1], -1.0 / 8_388_608.0);
+        assert_eq!(out[2], 0.0);
+        assert_eq!(out[3], 1.0 / 8_388_608.0);
+        assert_eq!(out[4], 8_388_607.0 / 8_388_608.0);
     }
 
     #[test]
@@ -173,6 +244,19 @@ mod tests {
             prop_assert_eq!(decoded, values.len());
             for (actual, expected) in out.iter().zip(values.iter()) {
                 prop_assert_eq!(*actual, f32::from(*expected) / 32_768.0);
+            }
+        }
+
+        #[test]
+        fn i24_decoding_matches_full_scale_scaling(
+            values in proptest::collection::vec(-8_388_608i32..=8_388_607, 0..64)
+        ) {
+            let bytes: Vec<u8> = values.iter().flat_map(|value| i24_bytes(*value)).collect();
+            let mut out = vec![0.0; values.len()];
+            let decoded = decode(&bytes, SampleFormat::I24, &mut out).unwrap();
+            prop_assert_eq!(decoded, values.len());
+            for (actual, expected) in out.iter().zip(values.iter()) {
+                prop_assert_eq!(*actual, *expected as f32 / 8_388_608.0);
             }
         }
 

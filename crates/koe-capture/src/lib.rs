@@ -69,7 +69,10 @@ pub fn open(spec: &StreamSpec) -> Result<CaptureStream, Error> {
 /// # Errors
 ///
 /// Returns [`Error::WrongSource`] when `device` captures a different source
-/// than `spec`, and the backend's error when the stream cannot start.
+/// than `spec`, [`Error::DeviceFormat`] when the device cannot deliver the
+/// requested rate and channel count, [`Error::UnsupportedSample`] when its
+/// native sample type cannot be decoded, and the backend's error when the
+/// stream cannot start.
 pub fn open_device(device: &DeviceInfo, spec: &StreamSpec) -> Result<CaptureStream, Error> {
     if device.source() != spec.source() {
         return Err(Error::WrongSource {
