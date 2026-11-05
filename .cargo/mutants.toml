@@ -1,4 +1,5 @@
-# Each backend's FFI adapter is gated on its own target OS, so a mutation run
-# on any one host never compiles the other two. Their mutants would report as
-# missed with no test on that host able to reach them.
+# The adapters cannot be reached from a test on the check host. The macOS and
+# Windows files are gated on their target OS, so a run elsewhere never compiles
+# them. The Linux file compiles here but needs a live PulseAudio server. Their
+# mutants would report as missed with no test able to run them.
 exclude_globs = ["crates/*/src/ffi.rs"]
