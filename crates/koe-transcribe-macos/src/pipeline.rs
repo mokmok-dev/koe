@@ -5,13 +5,6 @@ use std::ffi::{CStr, CString};
 
 use koe_transcribe_core::{EngineEvent, EngineSession, Error, Options};
 
-/// Status codes the C ABI returns.
-pub type Status = i32;
-
-/// Locale the shim falls back to when the caller passes none; the Rust side
-/// cannot read the locale `Locale.current` resolves to through the C ABI.
-const SYSTEM_LOCALE: &str = "system locale";
-
 /// One committed phrase the shim handed back.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CommittedPhrase {
@@ -37,35 +30,35 @@ pub trait Shim: Clone + Send + Sync + 'static {
     /// # Errors
     ///
     /// Returns the shim's status when the session cannot start.
-    fn create(&self, locale: Option<&CStr>) -> Result<Self::Handle, Status>;
+    fn create(&self, locale: Option<&CStr>) -> Result<Self::Handle, i32>;
 
     /// Appends 16 kHz mono samples.
     ///
     /// # Errors
     ///
     /// Returns the shim's status when the engine rejects the audio.
-    fn feed(&self, handle: &mut Self::Handle, pcm: &[f32]) -> Result<(), Status>;
+    fn feed(&self, handle: &mut Self::Handle, pcm: &[f32]) -> Result<(), i32>;
 
     /// Pops the next committed phrase, if one is queued.
     ///
     /// # Errors
     ///
     /// Returns the shim's status when the engine failed.
-    fn take_committed(&self, handle: &mut Self::Handle) -> Result<Option<CommittedPhrase>, Status>;
+    fn take_committed(&self, handle: &mut Self::Handle) -> Result<Option<CommittedPhrase>, i32>;
 
     /// Returns the volatile tail, if it changed since the previous take.
     ///
     /// # Errors
     ///
     /// Returns the shim's status when the engine failed.
-    fn take_volatile(&self, handle: &mut Self::Handle) -> Result<Option<VolatileTail>, Status>;
+    fn take_volatile(&self, handle: &mut Self::Handle) -> Result<Option<VolatileTail>, i32>;
 
     /// Ends the stream and flushes what the engine still holds.
     ///
     /// # Errors
     ///
     /// Returns the shim's status when the flush fails or runs past its bound.
-    fn finish(&self, handle: &mut Self::Handle) -> Result<(), Status>;
+    fn finish(&self, handle: &mut Self::Handle) -> Result<(), i32>;
 
     /// Consumes the handle and tears the session down.
     fn destroy(&self, handle: Self::Handle);
@@ -181,14 +174,14 @@ impl<S: Shim> Drop for Session<S> {
 }
 
 /// Maps `create`'s status onto the session-open errors.
-fn create_error(status: Status, language: Option<&str>) -> Error {
+fn create_error(status: i32, language: Option<&str>) -> Error {
     match status {
         -1 => Error::Unavailable {
             feature: "SpeechAnalyzer",
         },
         -2 => Error::OptionsInvalid { option: "language" },
         -3 => Error::ModelMissing {
-            language: language.unwrap_or(SYSTEM_LOCALE).into(),
+            language: language.unwrap_or("system locale").into(),
         },
         -5 => Error::BackendInvariant {
             operation: "create",
@@ -201,7 +194,7 @@ fn create_error(status: Status, language: Option<&str>) -> Error {
 }
 
 /// Maps a status from an already-open session onto the engine errors.
-const fn status_error(operation: &'static str, status: Status) -> Error {
+const fn status_error(operation: &'static str, status: i32) -> Error {
     if status == -5 {
         Error::BackendInvariant { operation }
     } else {
@@ -246,9 +239,9 @@ mod tests {
         creates: Mutex<usize>,
         locales: Mutex<Vec<Option<String>>>,
         feeds: Mutex<Vec<Vec<f32>>>,
-        committed: Mutex<VecDeque<Result<Option<CommittedPhrase>, Status>>>,
-        volatile: Mutex<VecDeque<Result<Option<VolatileTail>, Status>>>,
-        finishes: Mutex<VecDeque<Result<(), Status>>>,
+        committed: Mutex<VecDeque<Result<Option<CommittedPhrase>, i32>>>,
+        volatile: Mutex<VecDeque<Result<Option<VolatileTail>, i32>>>,
+        finishes: Mutex<VecDeque<Result<(), i32>>>,
         destroys: Mutex<usize>,
     }
 
@@ -260,7 +253,7 @@ mod tests {
     impl Shim for Scripted {
         type Handle = Handle;
 
-        fn create(&self, locale: Option<&CStr>) -> Result<Handle, Status> {
+        fn create(&self, locale: Option<&CStr>) -> Result<Handle, i32> {
             *self.0.creates.lock().unwrap() += 1;
             self.0
                 .locales
@@ -273,7 +266,7 @@ mod tests {
             }
         }
 
-        fn feed(&self, _handle: &mut Handle, pcm: &[f32]) -> Result<(), Status> {
+        fn feed(&self, _handle: &mut Handle, pcm: &[f32]) -> Result<(), i32> {
             self.0.feeds.lock().unwrap().push(pcm.to_owned());
             match *self.0.feed_status.lock().unwrap() {
                 0 => Ok(()),
@@ -281,7 +274,7 @@ mod tests {
             }
         }
 
-        fn take_committed(&self, _handle: &mut Handle) -> Result<Option<CommittedPhrase>, Status> {
+        fn take_committed(&self, _handle: &mut Handle) -> Result<Option<CommittedPhrase>, i32> {
             self.0
                 .committed
                 .lock()
@@ -290,7 +283,7 @@ mod tests {
                 .unwrap_or(Ok(None))
         }
 
-        fn take_volatile(&self, _handle: &mut Handle) -> Result<Option<VolatileTail>, Status> {
+        fn take_volatile(&self, _handle: &mut Handle) -> Result<Option<VolatileTail>, i32> {
             self.0
                 .volatile
                 .lock()
@@ -299,7 +292,7 @@ mod tests {
                 .unwrap_or(Ok(None))
         }
 
-        fn finish(&self, _handle: &mut Handle) -> Result<(), Status> {
+        fn finish(&self, _handle: &mut Handle) -> Result<(), i32> {
             self.0
                 .finishes
                 .lock()

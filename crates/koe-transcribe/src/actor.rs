@@ -21,9 +21,6 @@ pub enum Command {
     End,
 }
 
-/// What the task reports back to `finish`.
-pub type Outcome = Result<Transcript, Incomplete>;
-
 /// Acquires `mutex`, ignoring poisoning.
 ///
 /// A panic while a lock is held leaves no state the crate trusts less than the
@@ -46,7 +43,7 @@ pub struct Task {
     pub pending: Arc<AtomicU64>,
     pub total: Arc<AtomicU64>,
     pub latch: Arc<Mutex<Option<Error>>>,
-    pub reply: SyncSender<Outcome>,
+    pub reply: SyncSender<Result<Transcript, Incomplete>>,
     segments: Vec<Segment>,
     revision: u64,
 }
@@ -60,7 +57,7 @@ impl Task {
         pending: Arc<AtomicU64>,
         total: Arc<AtomicU64>,
         latch: Arc<Mutex<Option<Error>>>,
-        reply: SyncSender<Outcome>,
+        reply: SyncSender<Result<Transcript, Incomplete>>,
     ) -> Self {
         Self {
             session,
@@ -75,7 +72,7 @@ impl Task {
         }
     }
 
-    /// Starts the thread. It always sends exactly one [`Outcome`] before it
+    /// Starts the thread. It always sends exactly one result before it
     /// returns, on every exit path.
     ///
     /// # Errors

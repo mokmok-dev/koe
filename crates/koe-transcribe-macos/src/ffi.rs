@@ -9,7 +9,7 @@ use std::ptr::{null, null_mut};
 use std::slice;
 use std::str;
 
-use crate::pipeline::{CommittedPhrase, Shim, Status, VolatileTail};
+use crate::pipeline::{CommittedPhrase, Shim, VolatileTail};
 
 /// Opaque handle the shim hands back.
 #[repr(C)]
@@ -58,7 +58,7 @@ pub struct SpeechShim;
 impl Shim for SpeechShim {
     type Handle = EngineHandle;
 
-    fn create(&self, locale: Option<&CStr>) -> Result<EngineHandle, Status> {
+    fn create(&self, locale: Option<&CStr>) -> Result<EngineHandle, i32> {
         let locale = locale.map_or(null(), CStr::as_ptr);
         let mut handle: *mut KoeSttEngine = null_mut();
         let status = unsafe { koe_stt_engine_create(locale, &raw mut handle) };
@@ -71,7 +71,7 @@ impl Shim for SpeechShim {
         Ok(EngineHandle(handle))
     }
 
-    fn feed(&self, handle: &mut EngineHandle, pcm: &[f32]) -> Result<(), Status> {
+    fn feed(&self, handle: &mut EngineHandle, pcm: &[f32]) -> Result<(), i32> {
         // Feeds past u32::MAX frames go out in chunks; the shim consumes each
         // buffer fully, so no audio is lost between them.
         let mut rest = pcm;
@@ -87,7 +87,7 @@ impl Shim for SpeechShim {
         Ok(())
     }
 
-    fn take_committed(&self, handle: &mut EngineHandle) -> Result<Option<CommittedPhrase>, Status> {
+    fn take_committed(&self, handle: &mut EngineHandle) -> Result<Option<CommittedPhrase>, i32> {
         let mut text = KoeSttString {
             data: null(),
             length: 0,
@@ -113,7 +113,7 @@ impl Shim for SpeechShim {
         }
     }
 
-    fn take_volatile(&self, handle: &mut EngineHandle) -> Result<Option<VolatileTail>, Status> {
+    fn take_volatile(&self, handle: &mut EngineHandle) -> Result<Option<VolatileTail>, i32> {
         let mut text = KoeSttString {
             data: null(),
             length: 0,
@@ -131,7 +131,7 @@ impl Shim for SpeechShim {
         }
     }
 
-    fn finish(&self, handle: &mut EngineHandle) -> Result<(), Status> {
+    fn finish(&self, handle: &mut EngineHandle) -> Result<(), i32> {
         match unsafe { koe_stt_engine_finish(handle.0) } {
             0 => Ok(()),
             status => Err(status),
@@ -147,7 +147,7 @@ impl Shim for SpeechShim {
 ///
 /// A length past a null data pointer, or bytes outside UTF-8, cannot come from
 /// the shim's own `strdup` of its Swift strings, so both break the contract.
-fn str_from(text: &KoeSttString) -> Result<&str, Status> {
+fn str_from(text: &KoeSttString) -> Result<&str, i32> {
     if text.length == 0 {
         return Ok("");
     }

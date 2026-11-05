@@ -9,7 +9,7 @@ use koe_transcribe_core::{
     AudioSpec, Converter, Engine, Error, Event, Incomplete, Options, Transcript,
 };
 
-use crate::actor::{Command, Outcome, Task, duration_ms, lock};
+use crate::actor::{Command, Task, duration_ms, lock};
 
 /// Converted chunks the queue holds before it starts dropping.
 const QUEUE_CHUNKS: usize = 64;
@@ -27,7 +27,7 @@ pub struct LiveSession {
     pending: Arc<AtomicU64>,
     total: Arc<AtomicU64>,
     latch: Arc<Mutex<Option<Error>>>,
-    reply: Mutex<Receiver<Outcome>>,
+    reply: Mutex<Receiver<Result<Transcript, Incomplete>>>,
     handle: Option<JoinHandle<()>>,
 }
 
