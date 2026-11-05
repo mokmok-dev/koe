@@ -1,0 +1,7 @@
+# The OS adapters make blocking calls whose results only exist on a machine with
+# a live audio server, so their mutants are unobservable in CI. Every decision
+# they could get wrong lives in the safe core, which stays in scope.
+exclude_globs = [
+  "crates/koe-capture/src/sys.rs",
+  "crates/koe-capture/src/sys/**",
+]
