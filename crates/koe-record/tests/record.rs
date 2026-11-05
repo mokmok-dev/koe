@@ -62,6 +62,16 @@ struct Header {
     input_rate: u32,
 }
 
+struct WavHeader {
+    riff_len: u32,
+    data_len: u32,
+    channels: u16,
+    sample_rate: u32,
+    byte_rate: u32,
+    block_align: u16,
+    bits: u16,
+}
+
 fn parse_crc(bytes: &[u8]) -> u32 {
     let mut crc = 0_u32;
     for byte in bytes {
@@ -145,6 +155,53 @@ fn decode(pages: &[Page]) -> Vec<f32> {
         }
     }
     samples_out
+}
+
+/// Parses a canonical 16-bit PCM WAV, asserting the chunks a reader needs.
+fn parse_wav(bytes: &[u8]) -> (WavHeader, Vec<i16>) {
+    assert_eq!(
+        bytes.get(..4),
+        Some(&b"RIFF"[..]),
+        "the file starts with the RIFF id"
+    );
+    assert_eq!(
+        bytes.get(8..12),
+        Some(&b"WAVE"[..]),
+        "the form type is WAVE"
+    );
+    assert_eq!(
+        bytes.get(12..16),
+        Some(&b"fmt "[..]),
+        "the first chunk is `fmt `"
+    );
+    let format_size = u32::from_le_bytes(bytes[16..20].try_into().unwrap());
+    assert_eq!(format_size, 16, "a PCM `fmt ` chunk is 16 bytes");
+    let tag = u16::from_le_bytes(bytes[20..22].try_into().unwrap());
+    assert_eq!(tag, 1, "the format tag is PCM");
+    assert_eq!(&bytes[36..40], b"data", "the data chunk follows `fmt `");
+
+    let riff_len = u32::from_le_bytes(bytes[4..8].try_into().unwrap());
+    let data_len = u32::from_le_bytes(bytes[40..44].try_into().unwrap());
+    let end = 44 + usize::try_from(data_len).unwrap();
+    assert!(end <= bytes.len(), "the data chunk lies inside the file");
+    let samples = bytes[44..end]
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|pair| i16::from_le_bytes(*pair))
+        .collect();
+    (
+        WavHeader {
+            riff_len,
+            data_len,
+            channels: u16::from_le_bytes(bytes[22..24].try_into().unwrap()),
+            sample_rate: u32::from_le_bytes(bytes[24..28].try_into().unwrap()),
+            byte_rate: u32::from_le_bytes(bytes[28..32].try_into().unwrap()),
+            block_align: u16::from_le_bytes(bytes[32..34].try_into().unwrap()),
+            bits: u16::from_le_bytes(bytes[34..36].try_into().unwrap()),
+        },
+        samples,
+    )
 }
 
 fn correlation(actual: &[f32], expected: &[f32]) -> f64 {
@@ -286,14 +343,14 @@ fn records_a_mix_that_decodes_to_the_recorded_length() {
 
 #[test]
 fn an_unknown_extension_is_rejected() {
-    let file = TempFile::new("wav");
+    let file = TempFile::new("mp3");
     let error = Recorder::create(file.path(), recording_spec())
         .err()
         .unwrap();
     assert_eq!(
         error,
         Error::UnknownFormat {
-            extension: "wav".into()
+            extension: "mp3".into()
         }
     );
     assert!(
@@ -605,4 +662,261 @@ fn blocks_of_different_sizes_pair_up() {
 fn the_recorder_can_cross_a_thread_boundary() {
     fn assert_send<T: Send>() {}
     assert_send::<Recorder>();
+}
+
+#[test]
+fn records_a_wav_that_parses_to_the_mixed_samples() {
+    let file = TempFile::new("wav");
+    let rate = 44_100;
+    let spec = RecordingSpec::new(rate, Channels::Stereo).unwrap();
+    let mut recorder = Recorder::create(file.path(), spec).unwrap();
+    recorder
+        .add_source(
+            Source::Microphone,
+            &StreamSpec::new(Source::Microphone, rate, 1).unwrap(),
+        )
+        .unwrap();
+    recorder
+        .add_source(
+            Source::SystemAudio,
+            &StreamSpec::new(Source::SystemAudio, rate, 2).unwrap(),
+        )
+        .unwrap();
+
+    let mut system_audio = vec![0.0_f32; BLOCK_FRAMES * 2];
+    for frame in 0..BLOCK_FRAMES {
+        system_audio[frame * 2] = 0.5;
+        system_audio[frame * 2 + 1] = -0.5;
+    }
+    recorder
+        .write(Source::Microphone, &[0.25; BLOCK_FRAMES])
+        .unwrap();
+    recorder.write(Source::SystemAudio, &system_audio).unwrap();
+
+    let summary = recorder.finish().unwrap();
+    assert_eq!(summary.frames, BLOCK_FRAMES as u64);
+    assert_eq!(summary.duration, Duration::from_nanos(21_768_707));
+    assert_eq!(summary.clipped_samples, 0);
+
+    let bytes = std::fs::read(file.path()).unwrap();
+    let (header, samples) = parse_wav(&bytes);
+    assert_eq!(header.channels, 2);
+    assert_eq!(header.sample_rate, rate);
+    assert_eq!(header.byte_rate, 176_400);
+    assert_eq!(header.block_align, 4);
+    assert_eq!(header.bits, 16);
+    assert_eq!(header.data_len, (BLOCK_FRAMES * 4) as u32);
+    assert_eq!(header.riff_len, header.data_len + 36);
+    assert_eq!(bytes.len(), 44 + header.data_len as usize);
+    assert_eq!(samples.len(), BLOCK_FRAMES * 2);
+    for frame in samples.as_chunks::<2>().0 {
+        assert_eq!(frame[0], 24_576, "microphone plus the left system tone");
+        assert_eq!(frame[1], -8_192, "microphone plus the right system tone");
+    }
+}
+
+#[test]
+fn a_mono_wav_has_a_two_byte_block_align() {
+    let file = TempFile::new("wav");
+    let rate = 8_000;
+    let spec = RecordingSpec::new(rate, Channels::Mono).unwrap();
+    let mut recorder = Recorder::create(file.path(), spec).unwrap();
+    recorder
+        .add_source(
+            Source::Microphone,
+            &StreamSpec::new(Source::Microphone, rate, 1).unwrap(),
+        )
+        .unwrap();
+    recorder
+        .add_source(
+            Source::SystemAudio,
+            &StreamSpec::new(Source::SystemAudio, rate, 2).unwrap(),
+        )
+        .unwrap();
+
+    let mut system_audio = vec![0.0_f32; BLOCK_FRAMES * 2];
+    for frame in 0..BLOCK_FRAMES {
+        system_audio[frame * 2] = 0.5;
+        system_audio[frame * 2 + 1] = 0.25;
+    }
+    recorder
+        .write(Source::Microphone, &[0.25; BLOCK_FRAMES])
+        .unwrap();
+    recorder.write(Source::SystemAudio, &system_audio).unwrap();
+    assert_eq!(recorder.finish().unwrap().frames, BLOCK_FRAMES as u64);
+
+    let bytes = std::fs::read(file.path()).unwrap();
+    let (header, samples) = parse_wav(&bytes);
+    assert_eq!(header.channels, 1);
+    assert_eq!(header.sample_rate, rate);
+    assert_eq!(header.byte_rate, 16_000);
+    assert_eq!(header.block_align, 2);
+    assert_eq!(header.data_len, (BLOCK_FRAMES * 2) as u32);
+    assert_eq!(
+        samples,
+        vec![20_480; BLOCK_FRAMES],
+        "the microphone plus the averaged system frame"
+    );
+}
+
+#[test]
+fn an_empty_wav_is_a_bare_header() {
+    let file = TempFile::new("wav");
+    let summary = Recorder::create(file.path(), recording_spec())
+        .unwrap()
+        .finish()
+        .unwrap();
+    assert_eq!(summary.frames, 0);
+    assert_eq!(summary.clipped_samples, 0);
+    assert_eq!(summary.duration, Duration::ZERO);
+
+    let bytes = std::fs::read(file.path()).unwrap();
+    assert_eq!(bytes.len(), 44, "an empty recording is a bare header");
+    let (header, samples) = parse_wav(&bytes);
+    assert_eq!(header.riff_len, 36);
+    assert_eq!(header.data_len, 0);
+    assert_eq!(samples, Vec::<i16>::new());
+}
+
+#[test]
+fn audio_reaches_the_file_before_finish() {
+    let file = TempFile::new("wav");
+    let mut recorder = stereo_recorder(file.path());
+    for _ in 0..10 {
+        recorder
+            .write(Source::Microphone, &[0.25; BLOCK_FRAMES])
+            .unwrap();
+        recorder
+            .write(Source::SystemAudio, &[0.5; BLOCK_FRAMES * 2])
+            .unwrap();
+    }
+    let length = std::fs::metadata(file.path()).unwrap().len();
+    assert!(
+        length > 44,
+        "the samples reach the file while the recording runs"
+    );
+
+    recorder.finish().unwrap();
+    let length = std::fs::metadata(file.path()).unwrap().len();
+    assert_eq!(length, 44 + 10 * BLOCK_FRAMES as u64 * 4);
+}
+
+#[test]
+fn a_wav_extension_is_matched_in_either_case() {
+    for extension in ["WAV", "Wav"] {
+        let file = TempFile::new(extension);
+        let mut recorder = stereo_recorder(file.path());
+        recorder
+            .write(Source::Microphone, &[0.25; BLOCK_FRAMES])
+            .unwrap();
+        recorder
+            .write(Source::SystemAudio, &[0.5; BLOCK_FRAMES * 2])
+            .unwrap();
+        assert_eq!(recorder.finish().unwrap().frames, BLOCK_FRAMES as u64);
+
+        let bytes = std::fs::read(file.path()).unwrap();
+        let (header, samples) = parse_wav(&bytes);
+        assert_eq!(header.sample_rate, RATE, "`{extension}` must name WAV");
+        assert_eq!(samples.len(), BLOCK_FRAMES * 2);
+    }
+}
+
+#[test]
+fn a_clipped_mix_reaches_full_scale_intact() {
+    let file = TempFile::new("wav");
+    let mut recorder = stereo_recorder(file.path());
+    recorder
+        .write(Source::Microphone, &[-0.9; BLOCK_FRAMES])
+        .unwrap();
+    recorder
+        .write(Source::SystemAudio, &[-0.9; BLOCK_FRAMES * 2])
+        .unwrap();
+    recorder
+        .write(Source::Microphone, &[0.9; BLOCK_FRAMES])
+        .unwrap();
+    recorder
+        .write(Source::SystemAudio, &[0.9; BLOCK_FRAMES * 2])
+        .unwrap();
+
+    let summary = recorder.finish().unwrap();
+    assert_eq!(summary.frames, 2 * BLOCK_FRAMES as u64);
+    assert_eq!(
+        summary.clipped_samples,
+        4 * BLOCK_FRAMES as u64,
+        "every channel of both blocks saturates"
+    );
+
+    let bytes = std::fs::read(file.path()).unwrap();
+    let (_, samples) = parse_wav(&bytes);
+    let block = BLOCK_FRAMES * 2;
+    assert!(samples[..block].iter().all(|sample| *sample == i16::MIN));
+    assert!(samples[block..].iter().all(|sample| *sample == i16::MAX));
+}
+
+#[test]
+fn every_rate_a_spec_accepts_records_a_wav() {
+    for rate in [8_000, 11_025, 22_050, 44_100, 96_000, 192_000, 384_000] {
+        let file = TempFile::new("wav");
+        let spec = RecordingSpec::new(rate, Channels::Mono).unwrap();
+        let mut recorder = Recorder::create(file.path(), spec).unwrap();
+        recorder
+            .add_source(
+                Source::Microphone,
+                &StreamSpec::new(Source::Microphone, rate, 1).unwrap(),
+            )
+            .unwrap();
+        recorder.write(Source::Microphone, &[0.5]).unwrap();
+        assert_eq!(recorder.finish().unwrap().frames, 1);
+
+        let bytes = std::fs::read(file.path()).unwrap();
+        let (header, samples) = parse_wav(&bytes);
+        assert_eq!(header.sample_rate, rate);
+        assert_eq!(header.byte_rate, rate * 2, "{rate} Hz mono byte rate");
+        assert_eq!(samples, vec![16_384]);
+    }
+}
+
+#[test]
+fn a_wav_recording_uses_the_tag_the_transcribe_readers_accept() {
+    let file = TempFile::new("wav");
+    let mut recorder = stereo_recorder(file.path());
+    recorder
+        .write(Source::Microphone, &[0.1; BLOCK_FRAMES])
+        .unwrap();
+    recorder
+        .write(Source::SystemAudio, &[0.2; BLOCK_FRAMES * 2])
+        .unwrap();
+    recorder.finish().unwrap();
+
+    // Walks the chunks exactly as `koe-transcribe`'s reader does.
+    let bytes = std::fs::read(file.path()).unwrap();
+    let mut format = 0_u16;
+    let mut bits = 0_u16;
+    let mut position = 12;
+    let mut samples = Vec::new();
+    while position + 8 <= bytes.len() {
+        let id = &bytes[position..position + 4];
+        let size =
+            u32::from_le_bytes(bytes[position + 4..position + 8].try_into().unwrap()) as usize;
+        let body = position + 8;
+        let end = body
+            .checked_add(size)
+            .filter(|end| *end <= bytes.len())
+            .unwrap();
+        if id == b"fmt " {
+            format = u16::from_le_bytes([bytes[body], bytes[body + 1]]);
+            bits = u16::from_le_bytes([bytes[body + 14], bytes[body + 15]]);
+        } else if id == b"data" {
+            assert_eq!(format, 1, "the reader accepts only format tag 1");
+            assert_eq!(bits, 16, "the reader accepts only 16-bit samples");
+            samples = bytes[body..end]
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .map(|pair| i16::from_le_bytes(*pair))
+                .collect();
+        }
+        position = end + (size & 1);
+    }
+    assert_eq!(samples.len(), BLOCK_FRAMES * 2);
 }

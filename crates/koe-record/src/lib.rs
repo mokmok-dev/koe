@@ -6,7 +6,7 @@
 //! and written as one interleaved block.
 //!
 //! The file format is chosen from the path extension; `.ogg`, `.oga`, and
-//! `.opus` all name Ogg with Opus audio.
+//! `.opus` all name Ogg with Opus audio, and `.wav` names 16-bit PCM WAV.
 //!
 //! ```no_run
 //! use std::error::Error;

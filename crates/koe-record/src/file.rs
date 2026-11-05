@@ -1,11 +1,13 @@
 //! The audio file backends behind a recorder.
 
 use std::fs::File;
-use std::io::{BufWriter, Write};
+use std::io::{BufWriter, Seek, SeekFrom, Write};
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use koe_record_core::{Channels, Error, OggOpusConfig, OggOpusWriter, RecordingSpec, Sink};
+use koe_record_core::{
+    Channels, Error, OggOpusConfig, OggOpusWriter, PatchSink, RecordingSpec, Sink, WavWriter,
+};
 // shiguredo/opus-rs downloads a prebuilt static library in its build script,
 // which a sandboxed Nix build cannot do. `opusic-sys` compiles the same libopus
 // source with CMake, and the encoder settings and lookahead handling below
@@ -32,8 +34,10 @@ pub trait AudioFile: Send {
     ///
     /// # Errors
     ///
-    /// Returns [`Error::MisalignedBuffer`] for a partial frame, and the
-    /// codec's or the file's error when a block cannot be written.
+    /// Returns [`Error::MisalignedBuffer`] for a partial frame,
+    /// [`Error::RecordingTooLarge`] when the container's size field can no
+    /// longer describe the audio, and the codec's or the file's error when a
+    /// block cannot be written.
     fn write(&mut self, samples: &[f32]) -> Result<(), Error>;
 
     /// Completes the file and releases it.
@@ -53,7 +57,13 @@ pub trait AudioFile: Send {
 pub fn open(path: &Path, spec: RecordingSpec, format: Format) -> Result<Box<dyn AudioFile>, Error> {
     match format {
         Format::Ogg => Ok(Box::new(OggOpusFile::create(path, spec)?)),
+        Format::Wav => Ok(Box::new(wav_file(path, spec)?)),
     }
+}
+
+fn wav_file(path: &Path, spec: RecordingSpec) -> Result<WavWriter<FileSink>, Error> {
+    let file = File::create(path).map_err(io_error("create"))?;
+    WavWriter::new(FileSink::new(file), spec)
 }
 
 /// An Ogg Opus file fed with whole-frame blocks at the recording rate.
@@ -209,7 +219,17 @@ impl AudioFile for OggOpusFile {
     }
 }
 
-/// Where framed pages are written.
+impl AudioFile for WavWriter<FileSink> {
+    fn write(&mut self, samples: &[f32]) -> Result<(), Error> {
+        Self::write(self, samples)
+    }
+
+    fn finish(self: Box<Self>) -> Result<(), Error> {
+        Self::finish(*self)?.finish()
+    }
+}
+
+/// Where encoded bytes are written.
 struct FileSink {
     writer: BufWriter<File>,
 }
@@ -236,6 +256,24 @@ impl FileSink {
 impl Sink for FileSink {
     fn write_all(&mut self, bytes: &[u8]) -> Result<(), Error> {
         self.writer.write_all(bytes).map_err(io_error("write"))
+    }
+}
+
+impl PatchSink for FileSink {
+    fn write_at(&mut self, offset: usize, bytes: &[u8]) -> Result<(), Error> {
+        let offset =
+            u64::try_from(offset).map_err(|_| Error::ContainerInvariant { operation: "seek" })?;
+        // `Seek` on a `BufWriter` flushes first; seeking the inner file would
+        // strand buffered audio behind the header.
+        self.writer
+            .seek(SeekFrom::Start(offset))
+            .map_err(io_error("seek"))?;
+        self.writer.write_all(bytes).map_err(io_error("write"))?;
+        // The append position stays at the end, so a later block appends.
+        self.writer
+            .seek(SeekFrom::End(0))
+            .map_err(io_error("seek"))?;
+        Ok(())
     }
 }
 

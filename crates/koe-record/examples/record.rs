@@ -3,6 +3,7 @@
 //!
 //! ```text
 //! cargo run -p koe-record --example record -- /tmp/koe-record-example.ogg
+//! cargo run -p koe-record --example record -- /tmp/koe-record-example.wav
 //! ```
 
 use std::env;
