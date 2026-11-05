@@ -1,0 +1,15 @@
+[package]
+description = "Meeting recording session state machine"
+edition.workspace = true
+license.workspace = true
+name = "koe-session"
+version.workspace = true
+
+[dependencies]
+koe-capture-core.workspace = true
+
+[dev-dependencies]
+stateright.workspace = true
+
+[lints]
+workspace = true
