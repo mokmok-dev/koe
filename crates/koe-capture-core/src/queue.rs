@@ -1,5 +1,8 @@
 //! Fixed-capacity ring of whole sample frames.
 
+use alloc::boxed::Box;
+use alloc::vec;
+
 /// A ring buffer that only ever stores complete interleaved frames.
 #[derive(Clone, Debug)]
 pub struct FrameQueue {
@@ -14,8 +17,8 @@ impl FrameQueue {
     ///
     /// # Panics
     ///
-    /// Panics when `channels` or `capacity_frames` is zero. Both are internal
-    /// invariants, never caller input.
+    /// Panics when `channels` or `capacity_frames` is zero.
+    #[must_use]
     pub fn new(channels: usize, capacity_frames: usize) -> Self {
         assert!(channels > 0);
         assert!(capacity_frames > 0);
@@ -28,16 +31,19 @@ impl FrameQueue {
     }
 
     /// Frames the queue can hold in total.
+    #[must_use]
     pub const fn capacity_frames(&self) -> usize {
         self.samples.len() / self.channels
     }
 
     /// Whole frames currently stored.
+    #[must_use]
     pub const fn available_frames(&self) -> usize {
         self.len / self.channels
     }
 
     /// Whole frames the queue can still accept.
+    #[must_use]
     pub const fn free_frames(&self) -> usize {
         self.capacity_frames() - self.available_frames()
     }
@@ -45,6 +51,7 @@ impl FrameQueue {
     /// Appends whole frames, returning how many frames were accepted.
     ///
     /// A trailing partial frame in `samples` is ignored.
+    #[must_use]
     pub fn push(&mut self, samples: &[f32]) -> usize {
         let frames = (samples.len() / self.channels).min(self.free_frames());
         let count = frames * self.channels;
@@ -60,6 +67,7 @@ impl FrameQueue {
     /// Removes whole frames into `out`, returning the frames removed.
     ///
     /// A trailing partial frame slot in `out` stays untouched.
+    #[must_use]
     pub fn pop_into(&mut self, out: &mut [f32]) -> usize {
         let frames = (out.len() / self.channels).min(self.available_frames());
         let count = frames * self.channels;

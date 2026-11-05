@@ -5,12 +5,10 @@
 //! audio taps the output mix with a `CATapDescription` and runs the same unit
 //! against a private aggregate device.
 
-use crate::Source;
-use crate::config::StreamSpec;
-use crate::device::{DeviceId, DeviceInfo};
-use crate::error::Error;
-use crate::queue::FrameQueue;
-use crate::stream::RawStream;
+#![cfg(target_os = "macos")]
+#![allow(unsafe_code)]
+
+use koe_capture_core::{DeviceId, DeviceInfo, Error, FrameQueue, RawStream, Source, StreamSpec};
 
 use std::ffi::CString;
 use std::ffi::{CStr, c_char, c_void};
@@ -362,6 +360,11 @@ fn describe(object: u32, default_input: u32, default_output: u32) -> Vec<DeviceI
 }
 
 /// Lists the capture devices `CoreAudio` reports.
+/// Lists the microphones and output devices `CoreAudio` reports.
+///
+/// # Errors
+///
+/// Returns the backend's error when a `CoreAudio` property cannot be read.
 pub fn devices() -> Result<Vec<DeviceInfo>, Error> {
     let default_input = value(SYSTEM_OBJECT, &main(DEFAULT_INPUT, SCOPE_GLOBAL)).unwrap_or(0);
     let default_output = value(SYSTEM_OBJECT, &main(DEFAULT_OUTPUT, SCOPE_GLOBAL)).unwrap_or(0);
@@ -652,6 +655,11 @@ impl RawStream for AudioStream {
 }
 
 /// Opens a capture stream on `device`.
+/// Opens a microphone or a system-audio tap.
+///
+/// # Errors
+///
+/// Returns the backend's error when the audio unit or tap cannot start.
 pub fn open(device: &DeviceInfo, spec: StreamSpec) -> Result<Box<dyn RawStream>, Error> {
     let channels = usize::from(spec.channels());
     let width = u32::try_from(channels).unwrap_or(1);

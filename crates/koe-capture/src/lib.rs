@@ -1,11 +1,11 @@
 //! Cross-platform microphone and system audio capture.
 //!
-//! The crate talks to the operating system's audio API directly. There is no
-//! runtime dependency and no helper process.
+//! The crate is a thin facade over `koe-capture-core` and one platform
+//! backend. The core is `no_std` with `alloc`; the platform backend uses std.
 //!
 //! # Platform features
 //!
-//! Enable exactly the feature for the target you build:
+//! Enable exactly one feature for the target you build:
 //!
 //! | Target | Feature |
 //! | --- | --- |
@@ -13,9 +13,8 @@
 //! | macOS | `macos` |
 //! | Windows | `windows` |
 //!
-//! A build with no platform feature keeps the full API and the property-tested
-//! core, and reports [`Error::Unsupported`] from every capture call. This is
-//! the configuration used for mutation testing.
+//! A build with no platform feature keeps the full API and reports
+//! [`Error::Unsupported`] from every capture call.
 //!
 //! ```
 //! use koe_capture::{Source, StreamSpec};
@@ -24,27 +23,23 @@
 //! assert_eq!(spec.channels(), 2);
 //! ```
 
-mod config;
-mod convert;
-mod device;
-mod error;
-mod queue;
-mod stream;
-mod sys;
+mod platform;
 
-pub use config::{MAX_CHANNELS, MAX_SAMPLE_RATE, MIN_SAMPLE_RATE, StreamSpec};
-pub use device::{DeviceId, DeviceInfo, Source};
-pub use error::Error;
-pub use stream::CaptureStream;
+pub use koe_capture_core::{
+    CaptureStream, DeviceId, DeviceInfo, Error, MAX_CHANNELS, MAX_SAMPLE_RATE, MIN_SAMPLE_RATE,
+    Source, StreamSpec,
+};
+
+use koe_capture_core::select;
 
 /// Lists the capture devices the platform reports.
 ///
 /// # Errors
 ///
-/// Returns [`Error::Unsupported`] when no platform feature matches the target,
-/// or the backend's error when the audio server cannot be reached.
+/// Returns [`Error::Unsupported`] when no platform feature is enabled, or the
+/// backend's error when the audio server cannot be reached.
 pub fn devices() -> Result<Vec<DeviceInfo>, Error> {
-    sys::devices()
+    platform::devices()
 }
 
 /// Returns the default device for `source`.
@@ -54,8 +49,8 @@ pub fn devices() -> Result<Vec<DeviceInfo>, Error> {
 /// Returns [`Error::NoDevice`] when the platform reports no device for the
 /// source, and the same errors as [`devices`].
 pub fn default_device(source: Source) -> Result<DeviceInfo, Error> {
-    let devices = sys::devices()?;
-    device::select(&devices, source, None).cloned()
+    let devices = platform::devices()?;
+    select(&devices, source, None).cloned()
 }
 
 /// Opens the default device for the source named in `spec`.
@@ -64,8 +59,8 @@ pub fn default_device(source: Source) -> Result<DeviceInfo, Error> {
 ///
 /// Returns the same errors as [`default_device`] and [`open_device`].
 pub fn open(spec: &StreamSpec) -> Result<CaptureStream, Error> {
-    let devices = sys::devices()?;
-    let device = device::select(&devices, spec.source(), None)?.clone();
+    let devices = platform::devices()?;
+    let device = select(&devices, spec.source(), None)?.clone();
     open_device(&device, spec)
 }
 
@@ -82,18 +77,13 @@ pub fn open_device(device: &DeviceInfo, spec: &StreamSpec) -> Result<CaptureStre
             actual: device.source(),
         });
     }
-    let raw = sys::open(device, *spec)?;
+    let raw = platform::open(device, *spec)?;
     Ok(CaptureStream::new(raw, device.clone(), *spec))
 }
 
 #[cfg(test)]
 mod tests {
-    #![allow(
-        clippy::unwrap_used,
-        clippy::float_cmp,
-        clippy::cast_precision_loss,
-        clippy::needless_range_loop
-    )]
+    #![allow(clippy::unwrap_used)]
 
     use super::*;
 
@@ -123,11 +113,7 @@ mod tests {
         );
     }
 
-    #[cfg(not(any(
-        all(feature = "linux", target_os = "linux"),
-        all(feature = "macos", target_os = "macos"),
-        all(feature = "windows", target_os = "windows")
-    )))]
+    #[cfg(not(any(feature = "linux", feature = "macos", feature = "windows")))]
     #[test]
     fn a_build_without_a_platform_feature_reports_unsupported() {
         assert_eq!(devices(), Err(Error::Unsupported));

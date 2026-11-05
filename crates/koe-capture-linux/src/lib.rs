@@ -4,6 +4,9 @@
 //! main loop. Capture uses `libpulse-simple`, which blocks in `read` and keeps
 //! the rest of the crate free of callback plumbing.
 
+#![cfg(target_os = "linux")]
+#![allow(unsafe_code)]
+
 use std::ffi::CString;
 use std::ffi::{CStr, c_char, c_int, c_void};
 use std::mem::size_of;
@@ -11,11 +14,7 @@ use std::ptr::{null, null_mut};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use crate::Source;
-use crate::config::StreamSpec;
-use crate::device::{DeviceId, DeviceInfo};
-use crate::error::Error;
-use crate::stream::RawStream;
+use koe_capture_core::{DeviceId, DeviceInfo, Error, RawStream, Source, StreamSpec};
 
 #[cfg(target_endian = "little")]
 const PA_SAMPLE_FLOAT32_NATIVE: c_int = 5;
@@ -378,6 +377,12 @@ extern "C" fn collect_source(
     ));
 }
 
+/// Lists the capture sources the `PulseAudio` server reports.
+///
+/// # Errors
+///
+/// Returns [`Error::Backend`] or [`Error::Timeout`] when the server cannot be
+/// reached.
 pub fn devices() -> Result<Vec<DeviceInfo>, Error> {
     let mainloop = Mainloop::new()?;
     let api = mainloop.api()?;
@@ -423,6 +428,11 @@ impl Drop for PulseStream {
     }
 }
 
+/// Opens a source for blocking capture.
+///
+/// # Errors
+///
+/// Returns [`Error::Backend`] when the stream cannot start.
 pub fn open(device: &DeviceInfo, spec: StreamSpec) -> Result<Box<dyn RawStream>, Error> {
     let device_name = CString::new(device.id().as_str()).map_err(|_| Error::InvalidId)?;
     let app = c"koe-capture";

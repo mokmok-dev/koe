@@ -1,0 +1,12 @@
+[package]
+description = "WASAPI backend for koe-capture"
+edition.workspace = true
+license.workspace = true
+name = "koe-capture-windows"
+version.workspace = true
+
+[dependencies]
+koe-capture-core.workspace = true
+
+[lints]
+workspace = true

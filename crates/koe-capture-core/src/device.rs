@@ -1,7 +1,8 @@
 //! Capture sources, device identifiers, and device selection.
 
-use std::fmt;
-use std::str::FromStr;
+use alloc::boxed::Box;
+use core::fmt;
+use core::str::FromStr;
 
 use crate::error::Error;
 
@@ -86,8 +87,8 @@ pub struct DeviceInfo {
 }
 
 impl DeviceInfo {
-    // Constructed by the cfg-gated platform adapters and by tests.
-    #[allow(dead_code)]
+    /// Builds device metadata. Backends call this after reading the platform.
+    #[must_use]
     pub fn new(
         id: DeviceId,
         name: impl Into<Box<str>>,
@@ -106,7 +107,7 @@ impl DeviceInfo {
         }
     }
 
-    /// Stable identifier accepted by [`crate::open_device`].
+    /// Stable identifier for the device.
     #[must_use]
     pub const fn id(&self) -> &DeviceId {
         &self.id
@@ -148,6 +149,12 @@ impl DeviceInfo {
 /// An explicit id is matched by identity, then checked against the requested
 /// source. Without an id, the default device for the source wins over the first
 /// reported device.
+///
+/// # Errors
+///
+/// Returns [`Error::DeviceNotFound`] for an unknown id, [`Error::WrongSource`]
+/// when an explicit id names a device for another source, and
+/// [`Error::NoDevice`] when no device provides the requested source.
 pub fn select<'a>(
     devices: &'a [DeviceInfo],
     source: Source,

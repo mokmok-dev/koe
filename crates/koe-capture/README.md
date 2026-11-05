@@ -2,24 +2,31 @@
 
 Cross-platform microphone and system audio capture for [koe](../..).
 
-The crate talks to the operating system's audio stack through its system
-library. `[dependencies]` is empty: no `cpal`, no COM binding crate, no async
-runtime, no helper process.
+The public crate is a thin facade. The typed core is `no_std` with `alloc`,
+and each operating system has its own backend crate. `[dependencies]` holds
+only the workspace path crates: no `cpal`, no COM binding crate, no async
+runtime, and no helper process.
+
+## Crates
+
+| Crate | std | Role |
+| --- | --- | --- |
+| `koe-capture-core` | `no_std + alloc` | types, device selection, sample decoding, frame queue, `CaptureStream` |
+| `koe-capture-linux` | std | `PulseAudio` backend |
+| `koe-capture-macos` | std | `CoreAudio` backend |
+| `koe-capture-windows` | std | WASAPI backend |
+| `koe-capture` | std | feature-selected facade and public API |
 
 ## Platforms
 
-| Target | Feature | Backend | System audio |
-| --- | --- | --- | --- |
-| Linux | `linux` | `PulseAudio` (`libpulse`, `libpulse-simple`) | monitor sources of the default sink |
-| macOS | `macos` | CoreAudio / AudioToolbox | CoreAudio process tap on the default output, wrapped in a private aggregate device |
-| Windows | `windows` | WASAPI | shared-mode loopback on the render endpoint |
+| Target | Feature | System audio |
+| --- | --- | --- |
+| Linux | `linux` | monitor sources of the default sink |
+| macOS | `macos` | `CoreAudio` process tap on the default output, wrapped in a private aggregate device |
+| Windows | `windows` | shared-mode loopback on the render endpoint |
 
-A build with no platform feature keeps the typed core and every property test,
-and returns `Error::Unsupported` from each capture call. That is the
-configuration used for mutation testing.
-
-The features are additive. Modules are also gated on `target_os`, so
-`--all-features` builds only the backend of the target in use.
+Enable exactly one platform feature. A build with no platform feature keeps
+the full API and returns `Error::Unsupported` from each capture call.
 
 ## Usage
 
@@ -54,9 +61,9 @@ your buffer. The buffer length must be a multiple of the channel count.
 
 ```bash
 # Core, property tests, no hardware or audio server needed.
-cargo test -p koe-capture
+cargo test -p koe-capture-core
 
-# Linux backend: enumerate and capture from the running server.
+# Facade and the host backend.
 cargo test -p koe-capture --features linux
 
 # Every gate: clippy, tests, mutation score, macOS check, Windows check.
@@ -66,12 +73,7 @@ nix flake check
 nix build .#checks.x86_64-linux.mutation
 ```
 
-The mutation gate and the two cross-target checks are defined for
-`x86_64-linux`. The macOS and ARM jobs run clippy and the test suite on their
-native targets. CI also runs the Windows adapter on a Windows runner.
-
-The OS adapters live under `src/sys/` and are excluded from mutation testing:
-their calls only produce a result against a live audio server, so a surviving
-mutant there is unobservable, not untested. Every decision they could get wrong
-(device ranking, format validation, sample decoding, frame and queue
-arithmetic) lives in the safe core and stays in scope.
+The mutation gate targets `koe-capture-core`. The OS crates are separate
+crates, so no mutation exclusion is needed. The macOS and ARM jobs run clippy
+and the test suite on their native targets. CI also runs the Windows adapter
+on a Windows runner.

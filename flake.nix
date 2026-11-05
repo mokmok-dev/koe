@@ -39,6 +39,7 @@
           rustToolchain = pkgs.rust-bin.stable.latest.default.override {
             targets = [
               "aarch64-apple-darwin"
+              "thumbv7em-none-eabi"
               "x86_64-pc-windows-gnu"
             ];
           };
@@ -83,6 +84,8 @@
                   && !(pkgs.lib.hasPrefix "result" name);
               };
 
+              platformFeature = if pkgs.stdenv.hostPlatform.isDarwin then "macos" else "linux";
+
               cargoCommonArgs = {
                 inherit src;
                 pname = "koe";
@@ -94,8 +97,19 @@
               };
               cargoArtifacts = craneLib.buildDepsOnly cargoCommonArgs;
 
+              coreArgs = cargoCommonArgs // {
+                inherit cargoArtifacts;
+                cargoClippyExtraArgs = "--package koe-capture-core --all-targets -- --deny warnings";
+                cargoTestExtraArgs = "--package koe-capture-core";
+              };
+              facadeArgs = cargoCommonArgs // {
+                inherit cargoArtifacts;
+                cargoClippyExtraArgs = "--package koe-capture --all-targets --features ${platformFeature} -- --deny warnings";
+                cargoTestExtraArgs = "--package koe-capture --features ${platformFeature}";
+              };
+
               crossCheck =
-                target: feature:
+                target: package:
                 craneLib.mkCargoDerivation {
                   inherit src;
                   pname = "koe-check-${target}";
@@ -104,33 +118,17 @@
                   buildPhaseCargoCommand = "";
                   buildPhase = ''
                     runHook preBuild
-                    cargo check --package koe-capture --target ${target} --features ${feature}
+                    cargo clippy --package ${package} --all-targets --target ${target} -- --deny warnings
                     runHook postBuild
                   '';
                   installPhase = "mkdir -p $out";
                 };
             in
             {
-              cargoClippy = craneLib.cargoClippy (
-                cargoCommonArgs
-                // {
-                  inherit
-                    src
-                    cargoArtifacts
-                    ;
-                  cargoClippyExtraArgs = "--all-targets --all-features -- --deny warnings";
-                }
-              );
-              cargoTest = craneLib.cargoTest (
-                cargoCommonArgs
-                // {
-                  inherit
-                    src
-                    cargoArtifacts
-                    ;
-                  cargoTestExtraArgs = "--all-features";
-                }
-              );
+              coreClippy = craneLib.cargoClippy coreArgs;
+              facadeClippy = craneLib.cargoClippy facadeArgs;
+              coreTest = craneLib.cargoTest coreArgs;
+              facadeTest = craneLib.cargoTest facadeArgs;
             }
             // pkgs.lib.optionalAttrs (system == "x86_64-linux") {
               mutation = craneLib.mkCargoDerivation {
@@ -145,8 +143,7 @@
                 buildPhase = ''
                   runHook preBuild
                   cargo mutants \
-                    --package koe-capture \
-                    --no-default-features \
+                    --package koe-capture-core \
                     --jobs 8
                   test ! -s mutants.out/missed.txt
                   test ! -s mutants.out/timeout.txt
@@ -154,8 +151,21 @@
                 '';
                 installPhase = "mkdir -p $out";
               };
-              crossMacos = crossCheck "aarch64-apple-darwin" "macos";
-              crossWindows = crossCheck "x86_64-pc-windows-gnu" "windows";
+              crossMacos = crossCheck "aarch64-apple-darwin" "koe-capture-macos";
+              crossWindows = crossCheck "x86_64-pc-windows-gnu" "koe-capture-windows";
+              coreNoStd = craneLib.mkCargoDerivation {
+                inherit src;
+                pname = "koe-core-no-std";
+                cargoArtifacts = null;
+                doCheck = false;
+                buildPhaseCargoCommand = "";
+                buildPhase = ''
+                  runHook preBuild
+                  cargo check --package koe-capture-core --target thumbv7em-none-eabi
+                  runHook postBuild
+                '';
+                installPhase = "mkdir -p $out";
+              };
             };
 
           devShells.default = pkgs.mkShellNoCC {

@@ -6,17 +6,15 @@
 
 // The Win32 structures and vtable slots below exist for their layout, and the
 // operating system owns how much of them this backend names.
+#![cfg(target_os = "windows")]
 #![allow(dead_code)]
+#![allow(unsafe_code)]
 
 use std::ffi::c_void;
 use std::marker::PhantomData;
 use std::ptr::{from_ref, null, null_mut};
 
-use crate::Source;
-use crate::config::StreamSpec;
-use crate::device::{DeviceId, DeviceInfo};
-use crate::error::Error;
-use crate::stream::RawStream;
+use koe_capture_core::{DeviceId, DeviceInfo, Error, RawStream, Source, StreamSpec};
 
 const COINIT_MULTITHREADED: u32 = 0;
 const CLSCTX_ALL: u32 = 0x17;
@@ -638,6 +636,11 @@ unsafe fn describe(
     )))
 }
 
+/// Lists the capture and render endpoints WASAPI reports.
+///
+/// # Errors
+///
+/// Returns the backend's error when COM or the endpoint enumerator fails.
 pub fn devices() -> Result<Vec<DeviceInfo>, Error> {
     let _com = Com::initialize()?;
     let enumerator = Owned::<EnumeratorVtable>::create()?;
@@ -779,6 +782,11 @@ impl Drop for WasapiStream {
     }
 }
 
+/// Opens a capture or loopback stream.
+///
+/// # Errors
+///
+/// Returns the backend's error when the audio client cannot start.
 pub fn open(device: &DeviceInfo, spec: StreamSpec) -> Result<Box<dyn RawStream>, Error> {
     let com = Com::initialize()?;
     let enumerator = Owned::<EnumeratorVtable>::create()?;

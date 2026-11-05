@@ -1,0 +1,14 @@
+[package]
+description = "Platform-independent capture types and pipeline"
+edition.workspace = true
+license.workspace = true
+name = "koe-capture-core"
+version.workspace = true
+
+[dependencies]
+
+[dev-dependencies]
+proptest.workspace = true
+
+[lints]
+workspace = true

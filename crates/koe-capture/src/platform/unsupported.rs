@@ -1,9 +1,6 @@
-//! Fallback used when no platform feature matches the target.
+//! Fallback used when no platform feature is enabled.
 
-use crate::config::StreamSpec;
-use crate::device::DeviceInfo;
-use crate::error::Error;
-use crate::stream::RawStream;
+use koe_capture_core::{DeviceInfo, Error, RawStream, StreamSpec};
 
 // Kept non-const so `crate::devices` has one signature in every feature
 // configuration.

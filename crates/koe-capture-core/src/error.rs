@@ -1,6 +1,6 @@
 //! Errors crossing the capture boundary.
 
-use std::fmt;
+use core::fmt;
 
 use crate::Source;
 
@@ -121,7 +121,7 @@ impl fmt::Display for Error {
     }
 }
 
-impl std::error::Error for Error {}
+impl core::error::Error for Error {}
 
 #[cfg(test)]
 mod tests {

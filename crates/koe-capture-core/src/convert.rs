@@ -1,10 +1,6 @@
 //! Sample decoding into the interleaved `f32` form the crate returns.
 //!
-//! Only the cfg-gated platform adapters call this in a release build. The
-//! core-only build keeps it compiled so property tests and mutation testing
-//! still cover it.
-
-#![allow(dead_code)]
+//! Backends that cannot request `f32` use this to convert their native format.
 
 use crate::error::Error;
 
@@ -21,6 +17,7 @@ pub enum SampleFormat {
 
 impl SampleFormat {
     /// Bytes occupied by one sample.
+    #[must_use]
     pub const fn bytes_per_sample(self) -> usize {
         match self {
             Self::I16 => 2,

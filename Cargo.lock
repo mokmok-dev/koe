@@ -161,7 +161,38 @@ dependencies = [
 name = "koe-capture"
 version = "2026.11.1"
 dependencies = [
+ "koe-capture-core",
+ "koe-capture-linux",
+ "koe-capture-macos",
+ "koe-capture-windows",
+]
+
+[[package]]
+name = "koe-capture-core"
+version = "2026.11.1"
+dependencies = [
  "proptest",
+]
+
+[[package]]
+name = "koe-capture-linux"
+version = "2026.11.1"
+dependencies = [
+ "koe-capture-core",
+]
+
+[[package]]
+name = "koe-capture-macos"
+version = "2026.11.1"
+dependencies = [
+ "koe-capture-core",
+]
+
+[[package]]
+name = "koe-capture-windows"
+version = "2026.11.1"
+dependencies = [
+ "koe-capture-core",
 ]
 
 [[package]]

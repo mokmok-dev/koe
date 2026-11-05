@@ -1,5 +1,9 @@
 //! The capture stream facade shared by every platform backend.
 
+use alloc::boxed::Box;
+use alloc::vec;
+use alloc::vec::Vec;
+
 use crate::config::StreamSpec;
 use crate::device::DeviceInfo;
 use crate::error::Error;
@@ -13,6 +17,10 @@ pub trait RawStream {
     /// Blocking read of at most `out.len() / channels` frames.
     ///
     /// Returns the number of frames written, or zero once the stream ends.
+    ///
+    /// # Errors
+    ///
+    /// Returns the backend's error when the read fails.
     fn read(&mut self, out: &mut [f32]) -> Result<usize, Error>;
 }
 

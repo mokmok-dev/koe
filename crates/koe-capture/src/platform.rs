@@ -1,0 +1,32 @@
+//! Platform backend selection.
+
+#[cfg(any(
+    all(feature = "linux", feature = "macos"),
+    all(feature = "linux", feature = "windows"),
+    all(feature = "macos", feature = "windows"),
+))]
+compile_error!("enable at most one of the linux, macos, and windows features");
+
+#[cfg(all(feature = "linux", not(target_os = "linux")))]
+compile_error!("the linux feature requires a Linux target");
+
+#[cfg(all(feature = "macos", not(target_os = "macos")))]
+compile_error!("the macos feature requires a macOS target");
+
+#[cfg(all(feature = "windows", not(target_os = "windows")))]
+compile_error!("the windows feature requires a Windows target");
+
+#[cfg(feature = "linux")]
+pub use koe_capture_linux::{devices, open};
+
+#[cfg(feature = "macos")]
+pub use koe_capture_macos::{devices, open};
+
+#[cfg(feature = "windows")]
+pub use koe_capture_windows::{devices, open};
+
+#[cfg(not(any(feature = "linux", feature = "macos", feature = "windows")))]
+mod unsupported;
+
+#[cfg(not(any(feature = "linux", feature = "macos", feature = "windows")))]
+pub use unsupported::{devices, open};
