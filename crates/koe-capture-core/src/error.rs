@@ -10,6 +10,11 @@ use crate::Source;
 pub enum Error {
     /// No capture backend is enabled for the current target.
     Unsupported,
+    /// The platform version lacks an API the requested capture needs.
+    Unavailable {
+        /// Capability that is unavailable.
+        feature: &'static str,
+    },
     /// The platform reported no device for the requested source.
     NoDevice(Source),
     /// An explicit device id did not match any enumerated device.
@@ -28,6 +33,15 @@ pub enum Error {
         /// Requested channel count.
         channels: u16,
     },
+    /// The selected device cannot deliver the requested stream format.
+    DeviceFormat {
+        /// Requested sample rate in hertz.
+        sample_rate: u32,
+        /// Requested channel count.
+        channels: u16,
+    },
+    /// The device's native sample type cannot be decoded.
+    UnsupportedSample,
     /// A device id was empty.
     InvalidId,
     /// The capture stream reached its end.
@@ -74,6 +88,12 @@ impl fmt::Display for Error {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Unsupported => formatter.write_str("no audio capture backend is enabled"),
+            Self::Unavailable { feature } => {
+                write!(
+                    formatter,
+                    "{feature} is not available on this platform version"
+                )
+            }
             Self::NoDevice(source) => write!(formatter, "no {source} device is available"),
             Self::DeviceNotFound(id) => write!(formatter, "device `{id}` was not found"),
             Self::WrongSource { expected, actual } => {
@@ -86,6 +106,16 @@ impl fmt::Display for Error {
                 formatter,
                 "unsupported stream spec: {sample_rate} Hz, {channels} channels"
             ),
+            Self::DeviceFormat {
+                sample_rate,
+                channels,
+            } => write!(
+                formatter,
+                "device cannot deliver {sample_rate} Hz, {channels} channels"
+            ),
+            Self::UnsupportedSample => {
+                formatter.write_str("the device's native sample type is not supported")
+            }
             Self::InvalidId => formatter.write_str("device id is empty"),
             Self::StreamClosed => formatter.write_str("capture stream is closed"),
             Self::Backend { operation, code } => {
@@ -143,6 +173,12 @@ mod tests {
         let cases = [
             (Error::Unsupported, "no audio capture backend is enabled"),
             (
+                Error::Unavailable {
+                    feature: "system audio capture",
+                },
+                "system audio capture is not available on this platform version",
+            ),
+            (
                 Error::NoDevice(Source::Microphone),
                 "no microphone device is available",
             ),
@@ -167,6 +203,17 @@ mod tests {
                     channels: 0,
                 },
                 "unsupported stream spec: 7999 Hz, 0 channels",
+            ),
+            (
+                Error::DeviceFormat {
+                    sample_rate: 48_000,
+                    channels: 1,
+                },
+                "device cannot deliver 48000 Hz, 1 channels",
+            ),
+            (
+                Error::UnsupportedSample,
+                "the device's native sample type is not supported",
             ),
             (Error::InvalidId, "device id is empty"),
             (Error::StreamClosed, "capture stream is closed"),
