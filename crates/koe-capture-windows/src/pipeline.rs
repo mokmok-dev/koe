@@ -176,11 +176,20 @@ pub fn read_readback(
     }
     let timeout = timeout_milliseconds(out.len() / channels, rate);
     let mut filled = 0;
-    while filled < out.len() {
+    loop {
         filled += drain(state, &mut out[filled..]);
-        if filled < out.len() && !receive(source, state, channels, format, timeout)? {
+        if filled == out.len() {
+            break;
+        }
+        if !receive(source, state, channels, format, timeout)? {
             out[filled..].fill(0.0);
-            filled = out.len();
+            return Ok(out.len() / channels);
+        }
+        // A reported packet leaves samples behind, so an empty readback here
+        // means the packet source broke its contract. Without this check the
+        // loop would retry forever.
+        if state.is_empty() {
+            return Err(invariant("IAudioCaptureClient::GetBuffer"));
         }
     }
     Ok(filled / channels)
@@ -202,12 +211,17 @@ pub const fn check_spec(spec: StreamSpec, native: MixFormat) -> Result<(), Error
 
 #[cfg(test)]
 mod tests {
-    #![allow(clippy::unwrap_used, clippy::float_cmp)]
+    #![allow(clippy::unwrap_used, clippy::float_cmp, clippy::cast_precision_loss)]
 
     use std::cell::{Cell, RefCell};
     use std::collections::VecDeque;
 
     use koe_capture_core::Source;
+    use proptest::prelude::*;
+
+    /// A pump that stops making progress must fail the test instead of hanging
+    /// it, because a hang is reported as a timeout rather than a caught mutant.
+    const SOURCE_CALLS: usize = 1_000;
 
     use super::*;
 
@@ -231,6 +245,15 @@ mod tests {
         packet(u32::try_from(bytes.len() / 4).unwrap(), false, Some(bytes))
     }
 
+    fn interleaved(samples: impl IntoIterator<Item = f32>, channels: usize) -> Scripted {
+        let bytes: Vec<u8> = samples.into_iter().flat_map(f32::to_ne_bytes).collect();
+        packet(
+            u32::try_from(bytes.len() / 4 / channels).unwrap(),
+            false,
+            Some(bytes),
+        )
+    }
+
     fn as_packet(scripted: &Scripted) -> Packet<'_> {
         Packet {
             frames: scripted.frames,
@@ -244,6 +267,10 @@ mod tests {
         waits: RefCell<VecDeque<u32>>,
         packets: RefCell<VecDeque<Scripted>>,
         waits_taken: Cell<u32>,
+        requested: RefCell<Vec<u32>>,
+        calls: Cell<usize>,
+        clock: Instant,
+        timeout_when_zero: bool,
     }
 
     impl FakeSource {
@@ -257,17 +284,41 @@ mod tests {
                 waits: RefCell::new(waits.into_iter().collect()),
                 packets: RefCell::new(packets.into_iter().collect()),
                 waits_taken: Cell::new(0),
+                requested: RefCell::new(Vec::new()),
+                calls: Cell::new(0),
+                clock: Instant::now(),
+                timeout_when_zero: false,
             }
+        }
+
+        fn timing_out_when_zero(mut self) -> Self {
+            self.timeout_when_zero = true;
+            self
+        }
+
+        fn counting(&self) {
+            let calls = self.calls.get() + 1;
+            assert!(
+                calls <= SOURCE_CALLS,
+                "the pump loop stopped making progress"
+            );
+            self.calls.set(calls);
         }
     }
 
     impl PacketSource for FakeSource {
         fn next_packet(&self) -> Result<u32, Error> {
+            self.counting();
             Ok(self.sizes.borrow_mut().pop_front().unwrap_or(0))
         }
 
-        fn wait_event(&self, _milliseconds: u32) -> Result<u32, Error> {
+        fn wait_event(&self, milliseconds: u32) -> Result<u32, Error> {
+            self.counting();
             self.waits_taken.set(self.waits_taken.get() + 1);
+            self.requested.borrow_mut().push(milliseconds);
+            if self.timeout_when_zero && milliseconds == 0 {
+                return Ok(WAIT_TIMEOUT);
+            }
             Ok(self.waits.borrow_mut().pop_front().unwrap_or(WAIT_TIMEOUT))
         }
 
@@ -275,12 +326,13 @@ mod tests {
             &self,
             store: impl FnOnce(Packet<'_>) -> Result<R, Error>,
         ) -> Result<R, Error> {
+            self.counting();
             let scripted = self.packets.borrow_mut().pop_front().unwrap();
             store(as_packet(&scripted))
         }
 
         fn now(&self) -> Instant {
-            Instant::now()
+            self.clock
         }
     }
 
@@ -420,6 +472,13 @@ mod tests {
     }
 
     #[test]
+    fn a_wait_inside_the_window_keeps_polling() {
+        let source = FakeSource::new([0, 1], [WAIT_OBJECT_0], []).timing_out_when_zero();
+        assert!(wait_for_packet(&source, 5).unwrap());
+        assert_eq!(source.requested.borrow().as_slice(), [5]);
+    }
+
+    #[test]
     fn drain_resumes_across_reads_and_resets_after_a_full_read() {
         let mut state = Readback::new();
         let first = loud([1.0, 2.0, 3.0]);
@@ -465,6 +524,87 @@ mod tests {
         );
         assert_eq!(out, [1.0, 2.0, 3.0, 4.0]);
         assert!(state.is_empty());
+    }
+
+    #[test]
+    fn a_two_channel_read_requests_the_frames_window() {
+        let source = FakeSource::new([1], [WAIT_TIMEOUT], [interleaved([1.0, 2.0], 2)]);
+        let mut state = Readback::new();
+        let mut out = [0.0; 960];
+        assert_eq!(
+            read_readback(&source, &mut state, 2, SampleFormat::F32, 48_000, &mut out).unwrap(),
+            480
+        );
+        assert_eq!(out[..2], [1.0, 2.0]);
+        assert!(source.requested.borrow().iter().all(|ms| *ms == 10));
+    }
+
+    #[test]
+    fn a_full_read_does_not_consume_another_packet() {
+        let source = FakeSource::new([2], [], [loud([1.0, 2.0])]);
+        let mut state = Readback::new();
+        let mut out = [0.0; 2];
+        assert_eq!(
+            read_readback(&source, &mut state, 1, SampleFormat::F32, 48_000, &mut out).unwrap(),
+            2
+        );
+        assert!(source.requested.borrow().is_empty());
+    }
+
+    proptest! {
+        #[test]
+        fn read_readback_keeps_packet_order(
+            channels in 1usize..=2,
+            wanted in 1usize..=6,
+            cuts in proptest::collection::vec(1usize..=3, 0..6),
+        ) {
+            let mut remaining = wanted;
+            let mut sizes = Vec::new();
+            let mut packets = Vec::new();
+            let mut next = 1.0f32;
+            let cover = |frames: usize, sizes: &mut Vec<u32>, packets: &mut Vec<Scripted>, next: &mut f32| {
+                sizes.push(u32::try_from(frames).unwrap());
+                let mut samples = Vec::new();
+                for _ in 0..frames {
+                    for _ in 0..channels {
+                        samples.push(*next);
+                    }
+                    *next += 1.0;
+                }
+                packets.push(interleaved(samples, channels));
+            };
+            for cut in cuts {
+                if remaining == 0 {
+                    break;
+                }
+                let frames = cut.min(remaining);
+                remaining -= frames;
+                cover(frames, &mut sizes, &mut packets, &mut next);
+            }
+            if remaining > 0 {
+                cover(remaining, &mut sizes, &mut packets, &mut next);
+            }
+
+            let source = FakeSource::new(sizes, [], packets);
+            let mut state = Readback::new();
+            let mut out = vec![-1.0f32; wanted * channels];
+            prop_assert_eq!(
+                read_readback(
+                    &source,
+                    &mut state,
+                    channels,
+                    SampleFormat::F32,
+                    48_000,
+                    &mut out,
+                )
+                .unwrap(),
+                wanted
+            );
+            for (index, sample) in out.iter().enumerate() {
+                prop_assert_eq!(*sample, 1.0 + (index / channels) as f32);
+            }
+            prop_assert!(source.requested.borrow().is_empty());
+        }
     }
 
     #[test]
