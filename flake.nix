@@ -107,6 +107,11 @@
                 cargoClippyExtraArgs = "--package koe-capture --all-targets --features ${platformFeature} -- --deny warnings";
                 cargoTestExtraArgs = "--package koe-capture --features ${platformFeature}";
               };
+              backendArgs = cargoCommonArgs // {
+                inherit cargoArtifacts;
+                cargoClippyExtraArgs = "--package koe-capture-linux --package koe-capture-macos --package koe-capture-windows --all-targets -- --deny warnings";
+                cargoTestExtraArgs = "--package koe-capture-linux --package koe-capture-macos --package koe-capture-windows";
+              };
 
               crossCheck =
                 target: package:
@@ -129,6 +134,8 @@
               facadeClippy = craneLib.cargoClippy facadeArgs;
               coreTest = craneLib.cargoTest coreArgs;
               facadeTest = craneLib.cargoTest facadeArgs;
+              backendClippy = craneLib.cargoClippy backendArgs;
+              backendTest = craneLib.cargoTest backendArgs;
             }
             // pkgs.lib.optionalAttrs (system == "x86_64-linux") {
               mutation = craneLib.mkCargoDerivation {
