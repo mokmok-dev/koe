@@ -56,9 +56,18 @@ impl Transcriber {
         LiveSession::start(self.engine.as_ref(), spec, options)
     }
 
+    /// Builds a transcriber over an engine the caller supplies.
+    ///
+    /// [`new`](Self::new) is the usual constructor. This one lets an embedder
+    /// provide its own [`Engine`] implementation.
+    #[must_use]
+    pub fn with_engine(engine: Arc<dyn Engine>) -> Self {
+        Self { engine }
+    }
+
     #[cfg(test)]
     pub fn from_engine(engine: Arc<dyn Engine>) -> Self {
-        Self { engine }
+        Self::with_engine(engine)
     }
 }
 
