@@ -55,13 +55,18 @@ impl Sink {
     }
 }
 
-/// Whole frames the driver's byte count can yield.
+/// Whole frames the driver's byte count can yield from `capacity_samples`.
 pub const fn delivered_samples(
     reported_bytes: u32,
     channels: usize,
-    _capacity_samples: usize,
+    capacity_samples: usize,
 ) -> usize {
     let samples = reported_bytes as usize / SAMPLE_BYTES as usize;
+    let samples = if samples > capacity_samples {
+        capacity_samples
+    } else {
+        samples
+    };
     samples - samples % channels
 }
 
@@ -174,6 +179,16 @@ mod tests {
     #[test]
     fn delivered_samples_accepts_exactly_the_capacity() {
         assert_eq!(delivered_samples(32, 2, 8), 8);
+    }
+
+    #[test]
+    fn delivered_samples_clamps_bytes_over_the_capacity() {
+        assert_eq!(delivered_samples(64, 2, 8), 8);
+    }
+
+    #[test]
+    fn delivered_samples_clamps_the_largest_byte_count() {
+        assert_eq!(delivered_samples(u32::MAX, 2, 8), 8);
     }
 
     #[test]
