@@ -87,6 +87,8 @@
                 inherit src;
                 pname = "koe";
                 strictDeps = true;
+              }
+              // pkgs.lib.optionalAttrs pkgs.stdenv.hostPlatform.isLinux {
                 buildInputs = [ pkgs.libpulseaudio ];
                 LD_LIBRARY_PATH = pkgs.lib.makeLibraryPath [ pkgs.libpulseaudio ];
               };
@@ -129,6 +131,8 @@
                   cargoTestExtraArgs = "--all-features";
                 }
               );
+            }
+            // pkgs.lib.optionalAttrs (system == "x86_64-linux") {
               mutation = craneLib.mkCargoDerivation {
                 inherit
                   src
@@ -157,13 +161,15 @@
           devShells.default = pkgs.mkShellNoCC {
             inputsFrom = [ config.pre-commit.devShell ];
 
-            packages = with pkgs; [
-              cargo-mutants
-              libpulseaudio
-              linkerPackages
-              rustToolchain
-              sccache
-            ];
+            packages =
+              with pkgs;
+              [
+                cargo-mutants
+                linkerPackages
+                rustToolchain
+                sccache
+              ]
+              ++ pkgs.lib.optional pkgs.stdenv.hostPlatform.isLinux libpulseaudio;
 
             shellHook = ''
               export RUSTC_WRAPPER="${pkgs.sccache}/bin/sccache"

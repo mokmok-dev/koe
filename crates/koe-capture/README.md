@@ -66,6 +66,10 @@ nix flake check
 nix build .#checks.x86_64-linux.mutation
 ```
 
+The mutation gate and the two cross-target checks are defined for
+`x86_64-linux`. The macOS and ARM jobs run clippy and the test suite on their
+native targets. CI also runs the Windows adapter on a Windows runner.
+
 The OS adapters live under `src/sys/` and are excluded from mutation testing:
 their calls only produce a result against a live audio server, so a surviving
 mutant there is unobservable, not untested. Every decision they could get wrong
