@@ -551,6 +551,19 @@ mod tests {
         assert!(source.requested.borrow().is_empty());
     }
 
+    #[test]
+    fn a_packet_that_stores_nothing_is_an_invariant() {
+        let source = FakeSource::new([1], [], [packet(0, false, None)]);
+        let mut state = Readback::new();
+        let mut out = [0.0; 1];
+        assert_eq!(
+            read_readback(&source, &mut state, 1, SampleFormat::F32, 48_000, &mut out),
+            Err(Error::BackendInvariant {
+                operation: "IAudioCaptureClient::GetBuffer"
+            })
+        );
+    }
+
     proptest! {
         #[test]
         fn read_readback_keeps_packet_order(
