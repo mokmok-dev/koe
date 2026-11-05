@@ -310,6 +310,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "koe-record"
+version = "2026.11.1"
+dependencies = [
+ "koe-capture",
+ "koe-capture-core",
+ "koe-record-core",
+ "opus",
+]
+
+[[package]]
+name = "koe-record-core"
+version = "2026.11.1"
+dependencies = [
+ "koe-capture-core",
+ "proptest",
+]
+
+[[package]]
 name = "koe-session"
 version = "2026.11.1"
 dependencies = [
@@ -408,6 +426,24 @@ name = "once_cell"
 version = "1.21.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9f7c3e4beb33f85d45ae3e3a1792185706c8e16d043238c593331cc7cd313b50"
+
+[[package]]
+name = "opus"
+version = "0.4.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "33718946cc77d4032911d4efe03a66dbcbfbd2bb16c3da06aaeadcc637c32216"
+dependencies = [
+ "opusic-sys",
+]
+
+[[package]]
+name = "opusic-sys"
+version = "0.7.7"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "986d749e9dc12035f11bf3ecc83a2a696ff7534d4143be9469a4a0faa25b9fd1"
+dependencies = [
+ "cmake",
+]
 
 [[package]]
 name = "parking_lot"

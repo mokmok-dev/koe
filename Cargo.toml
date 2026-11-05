@@ -5,6 +5,8 @@ members = [
   "crates/koe-capture-linux",
   "crates/koe-capture-macos",
   "crates/koe-capture-windows",
+  "crates/koe-record",
+  "crates/koe-record-core",
   "crates/koe-session",
   "crates/koe-transcribe",
   "crates/koe-transcribe-core",
@@ -18,12 +20,15 @@ koe-capture-core = { path = "crates/koe-capture-core" }
 koe-capture-linux = { path = "crates/koe-capture-linux" }
 koe-capture-macos = { path = "crates/koe-capture-macos" }
 koe-capture-windows = { path = "crates/koe-capture-windows" }
+koe-record = { path = "crates/koe-record" }
+koe-record-core = { path = "crates/koe-record-core" }
 koe-session = { path = "crates/koe-session" }
 koe-transcribe = { path = "crates/koe-transcribe" }
 koe-transcribe-core = { path = "crates/koe-transcribe-core" }
 koe-transcribe-ggml = { path = "crates/koe-transcribe-ggml" }
 koe-transcribe-macos = { path = "crates/koe-transcribe-macos" }
 libm = "0.2"
+opus = "0.4.0"
 proptest = "1.12.0"
 stateright = "0.31.0"
 transcribe-cpp = "0.4.1"

@@ -1,0 +1,17 @@
+[package]
+description = "Single-file recording of system audio and microphone"
+edition.workspace = true
+license.workspace = true
+name = "koe-record"
+version.workspace = true
+
+[dependencies]
+koe-capture-core.workspace = true
+koe-record-core.workspace = true
+opus.workspace = true
+
+[dev-dependencies]
+koe-capture = { path = "../koe-capture" }
+
+[lints]
+workspace = true
