@@ -1,0 +1,12 @@
+[package]
+description = "CoreAudio backend for koe-capture"
+edition.workspace = true
+license.workspace = true
+name = "koe-capture-macos"
+version.workspace = true
+
+[dependencies]
+koe-capture-core.workspace = true
+
+[lints]
+workspace = true

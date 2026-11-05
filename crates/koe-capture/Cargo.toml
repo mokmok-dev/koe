@@ -1,0 +1,21 @@
+[package]
+description = "Cross-platform microphone and system audio capture"
+edition.workspace = true
+license.workspace = true
+name = "koe-capture"
+version.workspace = true
+
+[dependencies]
+koe-capture-core.workspace = true
+koe-capture-linux = { workspace = true, optional = true }
+koe-capture-macos = { workspace = true, optional = true }
+koe-capture-windows = { workspace = true, optional = true }
+
+[features]
+default = []
+linux = ["dep:koe-capture-linux"]
+macos = ["dep:koe-capture-macos"]
+windows = ["dep:koe-capture-windows"]
+
+[lints]
+workspace = true

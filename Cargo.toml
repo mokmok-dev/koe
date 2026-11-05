@@ -1,8 +1,18 @@
 [workspace]
-members = ["crates/removeme"]
+members = [
+  "crates/koe-capture",
+  "crates/koe-capture-core",
+  "crates/koe-capture-linux",
+  "crates/koe-capture-macos",
+  "crates/koe-capture-windows",
+]
 resolver = "3"
 
 [workspace.dependencies]
+koe-capture-core = { path = "crates/koe-capture-core" }
+koe-capture-linux = { path = "crates/koe-capture-linux" }
+koe-capture-macos = { path = "crates/koe-capture-macos" }
+koe-capture-windows = { path = "crates/koe-capture-windows" }
 proptest = "1.12.0"
 
 [workspace.lints.clippy]

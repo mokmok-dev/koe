@@ -1,6 +1,8 @@
 [package]
+description = "Platform-independent capture types and pipeline"
 edition.workspace = true
-name = "removeme"
+license.workspace = true
+name = "koe-capture-core"
 version.workspace = true
 
 [dependencies]
