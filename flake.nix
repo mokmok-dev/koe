@@ -149,9 +149,7 @@
                 buildPhaseCargoCommand = "";
                 buildPhase = ''
                   runHook preBuild
-                  cargo mutants \
-                    --package koe-capture-core \
-                    --jobs 8
+                  cargo mutants --jobs 8
                   test ! -s mutants.out/missed.txt
                   test ! -s mutants.out/timeout.txt
                   runHook postBuild

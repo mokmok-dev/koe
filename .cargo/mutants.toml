@@ -1,0 +1,4 @@
+# Each backend's FFI adapter is gated on its own target OS, so a mutation run
+# on any one host never compiles the other two. Their mutants would report as
+# missed with no test on that host able to reach them.
+exclude_globs = ["crates/*/src/ffi.rs"]
