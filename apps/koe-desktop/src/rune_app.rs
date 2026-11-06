@@ -208,6 +208,9 @@ fn poll(state: &mut AppState, _seconds: f64, tx: &mut Tx) -> bool {
     } else if state.phase.is_active() {
         tx.wake_after(Duration::from_millis(100));
         changed = true;
+    } else {
+        // A menu pick can arrive while the shell sleeps; keep a tick that drains it.
+        tx.wake_after(Duration::from_millis(250));
     }
     changed
 }
@@ -412,6 +415,7 @@ fn quit(state: &mut AppState, tx: &mut Tx) {
 
 fn show_window() {
     with_app(|app| {
+        app.open();
         app.show();
         app.focus();
     });

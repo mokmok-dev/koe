@@ -113,6 +113,7 @@ fn platform_directory() -> Option<PathBuf> {
 ///
 /// Returns the spawn error when the platform opener is not installed.
 pub fn open_directory(path: &Path) -> Result<(), DesktopError> {
+    fs::create_dir_all(path).map_err(|error| DesktopError::io("create", path, error))?;
     #[cfg(target_os = "macos")]
     let mut command = Command::new("open");
     #[cfg(target_os = "windows")]

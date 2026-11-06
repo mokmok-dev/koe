@@ -72,6 +72,10 @@ impl Tray {
     /// Returns the platform error when no tray host accepts the icon, which
     /// happens on a desktop without a `StatusNotifier` watcher.
     pub fn new(repaint: Repaint, state: &TrayState) -> Result<Self, String> {
+        let menu_repaint = repaint.clone();
+        MenuEvent::set_event_handler(Some(move |_event| menu_repaint()));
+        TrayIconEvent::set_event_handler(Some(move |_event| repaint()));
+
         let header = MenuItem::with_id("status", label(state), false, None);
         let start = MenuItem::with_id("start", "Start recording", state.can_start, None);
         let stop = MenuItem::with_id("stop", "Stop recording", state.can_stop, None);
@@ -103,10 +107,6 @@ impl Tray {
             .with_menu_on_left_click(false)
             .build()
             .map_err(|error| error.to_string())?;
-
-        let menu_repaint = repaint.clone();
-        MenuEvent::set_event_handler(Some(move |_event| menu_repaint()));
-        TrayIconEvent::set_event_handler(Some(move |_event| repaint()));
 
         Ok(Self {
             icon,
