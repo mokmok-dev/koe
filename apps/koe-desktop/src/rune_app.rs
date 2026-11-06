@@ -74,7 +74,7 @@ impl Default for AppState {
             last_tray: None,
             last_hud: None,
             hud_visible: false,
-            hud_enabled: std::env::var_os("KOE_HUD").is_none_or(|value| value != "off"),
+            hud_enabled: hud_enabled(),
             quitting: false,
             quit_deadline: None,
         }
@@ -141,29 +141,38 @@ pub fn run() {
                 crate::rune_ui::view,
             )
         };
-        let mut app = App::new(spec).keep_running();
+        let app = App::new(spec);
+        #[cfg(target_os = "macos")]
+        let app = app.windowless();
+        let mut app = app.keep_running();
         app = app.on_close(|state, tx| {
             if state.tray.is_none() {
                 tx.quit();
             }
         });
         APP.with(|slot| *slot.borrow_mut() = Some(app.handle()));
-        let hud = app.overlay(
-            OverlaySpec {
-                name: "koe-hud",
-                size: (340.0, 88.0),
-                edge: ScreenEdge::Bottom,
-                margin: 24.0,
-                align: Align::Center,
-                inset: 0.0,
-                interactive: false,
-                view: crate::rune_hud::view,
-            },
-            HudState::default(),
-        );
-        HUD.with(|slot| *slot.borrow_mut() = Some(hud));
+        if hud_enabled() {
+            let hud = app.overlay(
+                OverlaySpec {
+                    name: "koe-hud",
+                    size: (340.0, 88.0),
+                    edge: ScreenEdge::Bottom,
+                    margin: 24.0,
+                    align: Align::Center,
+                    inset: 0.0,
+                    interactive: false,
+                    view: crate::rune_hud::view,
+                },
+                HudState::default(),
+            );
+            HUD.with(|slot| *slot.borrow_mut() = Some(hud));
+        }
         vec![WindowSpec::from_app("main", app)]
     });
+}
+
+fn hud_enabled() -> bool {
+    std::env::var_os("KOE_HUD").is_none_or(|value| value != "off")
 }
 
 fn poll(state: &mut AppState, _seconds: f64, tx: &mut Tx) -> bool {
@@ -180,6 +189,7 @@ fn poll(state: &mut AppState, _seconds: f64, tx: &mut Tx) -> bool {
             }
             Err(error) => {
                 state.tray_error = Some(error);
+                show_window();
                 changed = true;
             }
         }
