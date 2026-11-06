@@ -13,3 +13,19 @@ pub type Repaint = Arc<dyn Fn() + Send + Sync>;
 pub fn repaint(f: impl Fn() + Send + Sync + 'static) -> Repaint {
     Arc::new(f)
 }
+
+#[cfg(test)]
+mod tests {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    use super::*;
+
+    #[test]
+    fn the_callback_runs_when_called() {
+        let called = Arc::new(AtomicBool::new(false));
+        let flag = Arc::clone(&called);
+        let wake = repaint(move || flag.store(true, Ordering::Release));
+        wake();
+        assert!(called.load(Ordering::Acquire));
+    }
+}

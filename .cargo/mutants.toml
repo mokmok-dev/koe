@@ -2,7 +2,25 @@
 # Windows files are gated on their target OS, so a run elsewhere never compiles
 # them. The Linux file compiles here but needs a live PulseAudio server. Their
 # mutants would report as missed with no test able to run them.
-exclude_globs = ["crates/*/src/ffi.rs"]
+#
+# The desktop shell needs a window, a GPU, a tray host, audio devices, and the
+# platform file opener. Its state machine, error text, and wake-up callback stay
+# in scope; the UI and OS adapters would report untestable mutants.
+exclude_globs = [
+  "crates/*/src/ffi.rs",
+  "apps/koe-desktop/src/app.rs",
+  "apps/koe-desktop/src/ui.rs",
+  "apps/koe-desktop/src/hud.rs",
+  "apps/koe-desktop/src/rune_app.rs",
+  "apps/koe-desktop/src/rune_ui.rs",
+  "apps/koe-desktop/src/rune_hud.rs",
+  "apps/koe-desktop/src/main.rs",
+  "apps/koe-desktop/src/lib.rs",
+  "apps/koe-desktop/src/icon.rs",
+  "apps/koe-desktop/src/tray.rs",
+  "apps/koe-desktop/src/engine.rs",
+  "apps/koe-desktop/src/settings.rs",
+]
 
 # The CLI integration tests link the app and spawn its binary for every
 # mutant. On a loaded runner that link can outlast the 20-second floor even

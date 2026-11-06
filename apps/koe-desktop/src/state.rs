@@ -679,4 +679,100 @@ mod tests {
         assert_eq!(phase.label(), before);
         assert!(matches!(phase, Phase::Recording(_)));
     }
+
+    #[test]
+    fn source_sets_report_membership_and_size() {
+        assert!(Sources::MEETING.contains(Source::Microphone));
+        assert!(Sources::MEETING.contains(Source::SystemAudio));
+        assert!(!Sources::MICROPHONE.contains(Source::SystemAudio));
+        assert!(!Sources::SYSTEM_AUDIO.contains(Source::Microphone));
+        assert!(Sources::EMPTY.is_empty());
+        assert!(!Sources::MICROPHONE.is_empty());
+        assert_eq!(Sources::EMPTY.len(), 0);
+        assert_eq!(Sources::MICROPHONE.len(), 1);
+        assert_eq!(Sources::SYSTEM_AUDIO.len(), 1);
+        assert_eq!(Sources::MEETING.len(), 2);
+        assert_eq!(
+            Sources::MEETING.iter().collect::<Vec<_>>(),
+            vec![Source::Microphone, Source::SystemAudio]
+        );
+        assert_eq!(
+            Sources::SYSTEM_AUDIO.iter().collect::<Vec<_>>(),
+            vec![Source::SystemAudio]
+        );
+        assert_eq!(
+            Sources::MICROPHONE.with(Source::SystemAudio),
+            Sources::MEETING
+        );
+        assert_eq!(
+            Sources::MEETING.without(Source::Microphone),
+            Sources::SYSTEM_AUDIO
+        );
+        assert_eq!(Sources::from(Source::Microphone), Sources::MICROPHONE);
+        assert_eq!(Sources::from(Source::SystemAudio), Sources::SYSTEM_AUDIO);
+        assert_eq!(Sources::index(Source::Microphone), 0);
+        assert_eq!(Sources::index(Source::SystemAudio), 1);
+    }
+
+    #[test]
+    fn phase_states_report_capabilities() {
+        assert!(!Phase::Idle.is_active());
+        assert!(Phase::Idle.can_start());
+        assert!(!Phase::Idle.can_stop());
+
+        let arming = started();
+        assert!(arming.is_active());
+        assert!(!arming.can_start());
+        assert!(arming.can_stop());
+
+        let live = recording();
+        assert!(live.is_active());
+        assert!(!live.can_start());
+        assert!(live.can_stop());
+
+        let mut stopping = live;
+        stopping.reduce(Event::Stop, base());
+        assert!(stopping.is_active());
+        assert!(!stopping.can_start());
+        assert!(!stopping.can_stop());
+
+        let mut done = Phase::Recording(Live::new(base()));
+        done.reduce(Event::Finished(Box::new(completion(1))), base());
+        assert!(!done.is_active());
+        assert!(done.can_start());
+        assert!(!done.can_stop());
+    }
+
+    #[test]
+    fn done_failure_and_label_cover_empty_failed_and_saved() {
+        let saved = Phase::Done(Box::new(done(1, None)));
+        assert_eq!(saved.label(), "Saved");
+        assert!(!matches!(&saved, Phase::Done(done) if done.failed()));
+
+        let empty = Phase::Done(Box::new(done(0, None)));
+        assert_eq!(empty.label(), "Failed");
+        assert!(matches!(&empty, Phase::Done(done) if done.failed()));
+
+        let failed = Phase::Done(Box::new(done(1, Some(DesktopError::NoSources))));
+        assert_eq!(failed.label(), "Failed");
+        assert!(matches!(&failed, Phase::Done(done) if done.failed()));
+
+        let mut missing = done(1, None);
+        missing.summary = None;
+        assert!(missing.failed());
+    }
+
+    fn done(frames: u64, failure: Option<DesktopError>) -> Done {
+        Done {
+            output: PathBuf::from("take.ogg"),
+            summary: Some(Summary {
+                frames,
+                clipped_samples: 0,
+                duration: Duration::from_secs(1),
+            }),
+            failure,
+            duration: Duration::from_secs(1),
+            warning: None,
+        }
+    }
 }

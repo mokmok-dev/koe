@@ -102,3 +102,117 @@ impl From<koe_record::Error> for DesktopError {
         Self::Record(error)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::error::Error;
+    use std::io;
+
+    fn samples() -> Vec<DesktopError> {
+        vec![
+            DesktopError::Capture(koe_capture::Error::Unsupported),
+            DesktopError::Record(koe_record::Error::InvalidPacket),
+            DesktopError::Io {
+                operation: "create",
+                path: PathBuf::from("/tmp/koe"),
+                source: io::Error::from(io::ErrorKind::PermissionDenied),
+            },
+            DesktopError::NoSources,
+            DesktopError::OutputExists {
+                path: PathBuf::from("/tmp/koe.ogg"),
+            },
+            DesktopError::Tray("no host".to_owned()),
+            DesktopError::Thread("spawn failed".to_owned()),
+        ]
+    }
+
+    #[test]
+    fn every_kind_has_its_own_headline() {
+        let headlines: Vec<_> = samples().iter().map(DesktopError::headline).collect();
+        assert_eq!(
+            headlines,
+            [
+                "Audio capture failed",
+                "The recording could not be written",
+                "The recordings folder is not accessible",
+                "Select at least one source",
+                "The output file already exists",
+                "The menu bar icon is unavailable",
+                "The recorder did not start",
+            ]
+        );
+    }
+
+    #[test]
+    fn display_names_the_failure_and_its_path() {
+        for error in samples() {
+            assert_ne!(error.to_string(), "");
+        }
+        assert_eq!(
+            DesktopError::NoSources.to_string(),
+            "select at least one source"
+        );
+        assert_eq!(
+            DesktopError::OutputExists {
+                path: PathBuf::from("/tmp/koe.ogg")
+            }
+            .to_string(),
+            "/tmp/koe.ogg already exists"
+        );
+        assert_eq!(
+            DesktopError::Tray("no host".to_owned()).to_string(),
+            "menu bar icon unavailable: no host"
+        );
+        assert_eq!(
+            DesktopError::Thread("spawn failed".to_owned()).to_string(),
+            "recorder thread did not start: spawn failed"
+        );
+        let io_error = DesktopError::io(
+            "create",
+            "/tmp/koe",
+            io::Error::from(io::ErrorKind::PermissionDenied),
+        );
+        assert!(io_error.to_string().contains("create /tmp/koe failed"));
+    }
+
+    #[test]
+    fn only_wrapped_failures_have_a_source() {
+        for error in samples() {
+            let expected = matches!(
+                error,
+                DesktopError::Capture(_) | DesktopError::Record(_) | DesktopError::Io { .. }
+            );
+            assert_eq!(error.source().is_some(), expected);
+        }
+    }
+
+    #[test]
+    fn io_keeps_the_operation_and_path() {
+        let error = DesktopError::io(
+            "create",
+            "/tmp/koe",
+            io::Error::from(io::ErrorKind::PermissionDenied),
+        );
+        assert!(matches!(
+            &error,
+            DesktopError::Io {
+                operation,
+                path,
+                ..
+            } if *operation == "create" && path == &PathBuf::from("/tmp/koe")
+        ));
+    }
+
+    #[test]
+    fn wrapped_errors_keep_their_kind() {
+        assert!(matches!(
+            DesktopError::from(koe_capture::Error::Unsupported),
+            DesktopError::Capture(_)
+        ));
+        assert!(matches!(
+            DesktopError::from(koe_record::Error::InvalidPacket),
+            DesktopError::Record(_)
+        ));
+    }
+}
