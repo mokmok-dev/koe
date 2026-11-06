@@ -1,0 +1,47 @@
+[package]
+description = "Menu bar and overlay desktop recorder for koe"
+edition.workspace = true
+license.workspace = true
+name = "koe-desktop"
+version.workspace = true
+
+[lib]
+name = "koe_desktop"
+path = "src/lib.rs"
+
+[[bin]]
+name = "koe-desktop"
+path = "src/main.rs"
+
+[dependencies]
+eframe = { workspace = true, optional = true }
+egui = { workspace = true, optional = true }
+koe-capture.workspace = true
+koe-record.workspace = true
+rune = { git = "https://github.com/anomalyco/rune.git", rev = "781e2b6d87cd5f32d6f4365956fad4baaf24ee50", default-features = false, features = [
+  "embedded-fonts",
+  "metal-backend"
+], optional = true }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+tray-icon = { version = "0.26.1", default-features = false, features = ["ksni"] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+tray-icon = { version = "0.26.1", default-features = false }
+
+[target.'cfg(target_os = "windows")'.dependencies]
+tray-icon = { version = "0.26.1", default-features = false }
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[features]
+default = ["rune-ui"]
+egui = ["dep:eframe", "dep:egui"]
+rune-ui = ["dep:rune"]
+linux = ["koe-capture/linux"]
+macos = ["koe-capture/macos"]
+windows = ["koe-capture/windows"]
+
+[lints]
+workspace = true
