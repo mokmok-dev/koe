@@ -54,9 +54,12 @@ impl RecordPlan {
         let gain = gain_from_db(args.gain)?;
         let mut sources = Vec::with_capacity(args.source.sources().len());
         for source in args.source.sources() {
+            // The mixer converts each stream to the output layout. A system
+            // tap always delivers stereo, so asking it for the output layout
+            // fails whenever that layout is mono.
             let channels = match source {
                 Source::Microphone => 1,
-                Source::SystemAudio => args.channels.channels().count(),
+                Source::SystemAudio => 2,
             };
             let stream = StreamSpec::new(*source, args.rate, channels)
                 .map_err(|error| AppError::usage(error.to_string()))?;
@@ -548,13 +551,14 @@ mod tests {
     }
 
     #[test]
-    fn a_mono_plan_asks_system_audio_for_one_channel() {
+    fn a_mono_plan_still_asks_system_audio_for_the_stereo_tap() {
         let mut args = args("take.wav");
         args.source = SourceChoice::System;
         args.channels = ChannelChoice::Mono;
         let plan = RecordPlan::new(&args).unwrap();
+        assert_eq!(plan.spec.channels(), Channels::Mono);
         assert_eq!(plan.sources[0].0, Source::SystemAudio);
-        assert_eq!(plan.sources[0].1.channels(), 1);
+        assert_eq!(plan.sources[0].1.channels(), 2);
     }
 
     #[test]
