@@ -403,6 +403,8 @@ pub struct FakeLiveRecognizer {
     pub fail_feed: bool,
     /// Whether `poll` fails.
     pub fail_poll: bool,
+    /// Whether finishing before any feed returns an incomplete result.
+    pub fail_empty_finish: bool,
 }
 
 impl FakeLiveRecognizer {
@@ -414,6 +416,7 @@ impl FakeLiveRecognizer {
             result: Mutex::new(Some(result)),
             fail_feed: false,
             fail_poll: false,
+            fail_empty_finish: false,
         }
     }
 
@@ -442,6 +445,12 @@ impl LiveRecognizer for FakeLiveRecognizer {
     }
 
     fn finish(self: Box<Self>) -> Result<Transcript, Incomplete> {
+        if self.fail_empty_finish && self.feeds.lock().unwrap().is_empty() {
+            return Err(Incomplete::new(
+                koe_transcribe::Error::Unsupported,
+                Transcript::default(),
+            ));
+        }
         self.result
             .lock()
             .unwrap()

@@ -295,6 +295,7 @@ fn pump_source(
             None
         }
     };
+    let mut fed = false;
     if let Some(stream) = stream.as_mut() {
         let channels = usize::from(spec.channels());
         let mut buffer = vec![0.0_f32; channels * BLOCK_FRAMES];
@@ -310,17 +311,24 @@ fn pump_source(
                 Ok(0) => break,
                 Ok(frames) => {
                     let samples = &buffer[..frames * channels];
+                    let mut live_error = None;
                     if let Some(session) = live.as_ref() {
-                        if let Err(error) = session.feed(samples) {
-                            fail(context.failure, context.stop, error);
-                            break;
+                        match session.feed(samples) {
+                            Ok(()) => {
+                                fed = true;
+                                if let Some(writer) = context.writer
+                                    && let Err(error) =
+                                        drain_events(session.as_ref(), writer, source)
+                                {
+                                    live_error = Some(error);
+                                }
+                            }
+                            Err(error) => live_error = Some(error),
                         }
-                        if let Some(writer) = context.writer
-                            && let Err(error) = drain_events(session.as_ref(), writer, source)
-                        {
-                            fail(context.failure, context.stop, error);
-                            break;
-                        }
+                    }
+                    if let Some(error) = live_error {
+                        warn(context, format!("transcription stopped: {error}"));
+                        live = None;
                     }
                     let mut sink = context.sink.lock().unwrap_or_else(PoisonError::into_inner);
                     if let Err(error) = sink.write(source, samples) {
@@ -350,23 +358,34 @@ fn pump_source(
             fail(context.failure, context.stop, error);
         }
     }
-    let transcript = live.take().map(|session| match session.finish() {
-        Ok(transcript) => transcript,
-        Err(incomplete) => {
-            fail(
-                context.failure,
-                context.stop,
-                AppError::Transcribe(incomplete.error().clone()),
-            );
-            incomplete.into_transcript()
-        }
-    });
+    let transcript = if fed {
+        live.take().map(|session| match session.finish() {
+            Ok(transcript) => transcript,
+            Err(incomplete) => {
+                warn(
+                    context,
+                    format!("transcription incomplete: {}", incomplete.error()),
+                );
+                incomplete.into_transcript()
+            }
+        })
+    } else {
+        None
+    };
     if let (Some(writer), Some(transcript)) = (context.writer, transcript.as_ref()) {
         let mut writer = writer.lock().unwrap_or_else(PoisonError::into_inner);
         if let Err(error) = writer.finish_source(source, transcript) {
             fail(context.failure, context.stop, error);
         }
     }
+}
+
+fn warn(context: &Pump<'_>, message: String) {
+    context
+        .warnings
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .push(message);
 }
 
 fn recover_overflow(
@@ -380,13 +399,10 @@ fn recover_overflow(
             let other = other_source(source);
             sink.end(other)?;
             context.ended[source_index(other)].store(true, Ordering::Release);
-            context
-                .warnings
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner)
-                .push(format!(
-                    "{other} delivered no audio; the recording continues without it"
-                ));
+            warn(
+                context,
+                format!("{other} delivered no audio; the recording continues without it"),
+            );
             // The pair is gone, so this source can drain its backlog alone.
             sink.write(source, &[])?;
             Ok(())
@@ -1115,35 +1131,58 @@ mod tests {
     }
 
     #[test]
-    fn a_live_feed_failure_is_returned_and_the_final_text_is_written() {
+    fn a_live_feed_failure_warns_and_keeps_recording() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("take.txt");
         let mut session = FakeLiveRecognizer::new(Ok(recorded_transcript()));
         session.fail_feed = true;
         let (args, host) = live_host(path.clone(), session);
         let (result, _) = run(&args, &host);
-        match failure(result) {
-            AppError::Usage(message) => assert_eq!(message, "feed failed"),
-            other => panic!("expected the feed failure, got {other:?}"),
-        }
-        assert_eq!(
-            std::fs::read_to_string(&path).unwrap(),
-            "microphone: hello\nmicrophone: world\n"
+        let outcome = result.unwrap();
+        assert!(outcome.failure.is_none());
+        assert!(
+            outcome
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("transcription stopped: feed failed"))
         );
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "");
+        assert_eq!(host.sink.lock().unwrap().writes.len(), 1);
     }
 
     #[test]
-    fn a_live_poll_failure_is_returned_and_the_final_text_is_written() {
+    fn a_live_poll_failure_warns_and_keeps_recording() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("take.txt");
         let mut session = FakeLiveRecognizer::new(Ok(recorded_transcript()));
         session.fail_poll = true;
         let (args, host) = live_host(path.clone(), session);
         let (result, _) = run(&args, &host);
-        match failure(result) {
-            AppError::Usage(message) => assert_eq!(message, "poll failed"),
-            other => panic!("expected the poll failure, got {other:?}"),
-        }
+        let outcome = result.unwrap();
+        assert!(outcome.failure.is_none());
+        assert!(
+            outcome
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("transcription stopped: poll failed"))
+        );
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "");
+        assert_eq!(host.sink.lock().unwrap().writes.len(), 1);
+    }
+
+    #[test]
+    fn a_live_finish_failure_warns_and_keeps_the_committed_text() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("take.txt");
+        let incomplete = Incomplete::new(TranscribeError::Unsupported, recorded_transcript());
+        let session = FakeLiveRecognizer::new(Err(incomplete));
+        let (args, host) = live_host(path.clone(), session);
+        let (result, _) = run(&args, &host);
+        let outcome = result.unwrap();
+        assert!(outcome.failure.is_none());
+        assert!(outcome.warnings.iter().any(|warning| {
+            warning.contains("transcription incomplete: no speech-to-text backend is enabled")
+        }));
         assert_eq!(
             std::fs::read_to_string(&path).unwrap(),
             "microphone: hello\nmicrophone: world\n"
@@ -1151,20 +1190,41 @@ mod tests {
     }
 
     #[test]
-    fn a_live_finish_failure_is_returned_and_the_committed_text_is_written() {
+    fn a_session_that_never_received_audio_is_not_finished() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("take.txt");
-        let incomplete = Incomplete::new(TranscribeError::Unsupported, recorded_transcript());
-        let session = FakeLiveRecognizer::new(Err(incomplete));
-        let (args, host) = live_host(path.clone(), session);
+        let mic =
+            FakeLiveRecognizer::new(Ok(Transcript::new(vec![Segment::new(0, 100, "hello")], 0)));
+        let mut system = FakeLiveRecognizer::new(Ok(Transcript::default()));
+        system.fail_empty_finish = true;
+        let host = FakeHost::default()
+            .with_sink()
+            .with_stream(
+                Source::Microphone,
+                FakeStream::new(1, vec![Ok(vec![0.25; 960]), Ok(Vec::new())]),
+            )
+            .with_stream(
+                Source::SystemAudio,
+                FakeStream::new(2, vec![Ok(vec![0.5; 960]), Ok(Vec::new())])
+                    .with_delay(Duration::from_millis(100)),
+            )
+            .with_live_transcriber(Box::new(FakeLiveTranscriber::new(vec![mic, system])));
+        host.sink.lock().unwrap().overflow_write = true;
+        let mut args = transcribing_args("take.wav", path.clone());
+        args.source = SourceChoice::Both;
+        args.channels = ChannelChoice::Stereo;
         let (result, _) = run(&args, &host);
-        assert!(matches!(
-            failure(result),
-            AppError::Transcribe(TranscribeError::Unsupported)
-        ));
+        let outcome = result.unwrap();
+        assert!(outcome.failure.is_none());
+        assert!(
+            !outcome
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("transcription incomplete"))
+        );
         assert_eq!(
             std::fs::read_to_string(&path).unwrap(),
-            "microphone: hello\nmicrophone: world\n"
+            "microphone: hello\n"
         );
     }
 
