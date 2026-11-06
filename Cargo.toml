@@ -1,6 +1,7 @@
 [workspace]
 members = [
   "apps/koe-cli",
+  "apps/koe-desktop",
   "crates/koe-capture",
   "crates/koe-capture-core",
   "crates/koe-capture-linux",
@@ -27,6 +28,8 @@ clap = { version = "4.6.7", default-features = false, features = [
   "usage"
 ] }
 ctrlc = "3.5.2"
+eframe = "0.37.0"
+egui = "0.37.0"
 koe-capture = { path = "crates/koe-capture" }
 koe-capture-core = { path = "crates/koe-capture-core" }
 koe-capture-linux = { path = "crates/koe-capture-linux" }

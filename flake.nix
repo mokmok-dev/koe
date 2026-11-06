@@ -57,6 +57,22 @@
             export CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER="clang"
             export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER="clang"
           '';
+
+          guiPackages = with pkgs; [
+            dbus
+            fontconfig
+            freetype
+            libglvnd
+            libx11
+            libxcb
+            libxcursor
+            libxi
+            libxkbcommon
+            libxrandr
+            mesa
+            vulkan-loader
+            wayland
+          ];
         in
         {
           _module.args = {
@@ -98,14 +114,20 @@
                 ++ pkgs.lib.optional pkgs.stdenv.hostPlatform.isDarwin pkgs.swift;
               }
               // pkgs.lib.optionalAttrs pkgs.stdenv.hostPlatform.isLinux {
-                buildInputs = [ pkgs.libpulseaudio ];
-                LD_LIBRARY_PATH = pkgs.lib.makeLibraryPath [ pkgs.libpulseaudio ];
+                buildInputs = [
+                  pkgs.libpulseaudio
+                  pkgs.libxkbcommon
+                ];
+                LD_LIBRARY_PATH = pkgs.lib.makeLibraryPath [
+                  pkgs.libpulseaudio
+                  pkgs.libxkbcommon
+                ];
               };
               cargoArtifacts = craneLib.buildDepsOnly cargoCommonArgs;
 
               # The facades reject `--all-features` and accept exactly one
               # platform feature, so the host feature is named per package.
-              hostFeatures = "koe-capture/${platformFeature},koe-transcribe/${platformFeature},koe-cli/${platformFeature}";
+              hostFeatures = "koe-capture/${platformFeature},koe-transcribe/${platformFeature},koe-cli/${platformFeature},koe-desktop/${platformFeature},koe-desktop/egui";
               hostArgs = cargoCommonArgs // {
                 inherit cargoArtifacts;
                 cargoClippyExtraArgs = "--workspace --all-targets --features ${hostFeatures} -- --deny warnings";
@@ -186,11 +208,15 @@
                 sccache
               ]
               ++ pkgs.lib.optional pkgs.stdenv.hostPlatform.isLinux libpulseaudio
+              ++ pkgs.lib.optionals pkgs.stdenv.hostPlatform.isLinux guiPackages
               ++ pkgs.lib.optional pkgs.stdenv.hostPlatform.isDarwin swift;
 
             shellHook = ''
               export RUSTC_WRAPPER="${pkgs.sccache}/bin/sccache"
               ${linkerEnv}
+              ${pkgs.lib.optionalString pkgs.stdenv.hostPlatform.isLinux ''
+                export LD_LIBRARY_PATH="${pkgs.lib.makeLibraryPath guiPackages}:$LD_LIBRARY_PATH"
+              ''}
             '';
           };
 
