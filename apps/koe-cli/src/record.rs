@@ -153,11 +153,13 @@ pub fn execute(
     io: &mut Io<'_>,
 ) -> Result<(), AppError> {
     let plan = RecordPlan::new(args)?;
-    let stop = Stop::new(interrupt, args.duration);
+    // The transcription backend can take a while to start; the requested
+    // duration counts from the recording, not from the process launch.
     let live = match &plan.transcription {
         Some(transcription) => Some(live_sessions(&plan, transcription, host)?),
         None => None,
     };
+    let stop = Stop::new(interrupt, args.duration);
     let outcome = pump(&plan, host, &stop, live)?;
     io.line(format_args!(
         "recorded {} frames over {:.3} s to {}",
