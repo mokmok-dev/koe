@@ -153,7 +153,7 @@ pub fn run() {
         APP.with(|slot| *slot.borrow_mut() = Some(app.handle()));
         if hud_enabled() {
             let hud = app.overlay(
-                OverlaySpec {
+                rune::ConfiguredOverlay::from(OverlaySpec {
                     name: "koe-hud",
                     size: (340.0, 88.0),
                     edge: ScreenEdge::Bottom,
@@ -162,7 +162,8 @@ pub fn run() {
                     inset: 0.0,
                     interactive: false,
                     view: crate::rune_hud::view,
-                },
+                })
+                .release_gpu_when_hidden(),
                 HudState::default(),
             );
             HUD.with(|slot| *slot.borrow_mut() = Some(hud));
