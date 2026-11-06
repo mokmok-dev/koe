@@ -26,8 +26,6 @@ pub fn options(language: Option<&str>) -> Options {
 mod tests {
     #![allow(clippy::unwrap_used)]
 
-    use std::path::PathBuf;
-
     use super::*;
 
     #[test]
@@ -43,6 +41,7 @@ mod tests {
     fn a_non_utf8_model_path_is_a_usage_error() {
         use std::ffi::OsString;
         use std::os::unix::ffi::OsStringExt;
+        use std::path::PathBuf;
 
         let path = PathBuf::from(OsString::from_vec(vec![0xFF]));
         let error = model_from_path(&path).unwrap_err();
