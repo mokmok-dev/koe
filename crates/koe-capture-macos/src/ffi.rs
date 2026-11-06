@@ -57,7 +57,6 @@ const UNIT_INPUT_CALLBACK: u32 = 2_005;
 const AGGREGATE_UID_KEY: &str = "uid";
 const AGGREGATE_NAME_KEY: &str = "name";
 const AGGREGATE_TAP_LIST_KEY: &str = "taps";
-const AGGREGATE_TAP_START_KEY: &str = "tapautostart";
 const AGGREGATE_PRIVATE_KEY: &str = "private";
 const SUB_TAP_UID_KEY: &str = "uid";
 const SUB_TAP_DRIFT_KEY: &str = "drift";
@@ -484,8 +483,12 @@ fn create_aggregate(tap_uid: &str, name: &str) -> Result<AggregateDevice, Error>
     let label = cf_make(name)?;
     put(&device, AGGREGATE_UID_KEY, uid.raw())?;
     put(&device, AGGREGATE_NAME_KEY, label.raw())?;
+    // `kAudioAggregateDeviceTapAutoStartKey` is deliberately not set: it makes
+    // the aggregate wait for the first tapped audio, so an idle system tap
+    // delivers no frames and recording loses system audio. Without it the
+    // aggregate starts with the audio unit and the tap streams silence until a
+    // process plays something.
     put(&device, AGGREGATE_TAP_LIST_KEY, list.raw())?;
-    put(&device, AGGREGATE_TAP_START_KEY, unsafe { kCFBooleanTrue })?;
     put(&device, AGGREGATE_PRIVATE_KEY, unsafe { kCFBooleanTrue })?;
     let mut aggregate = 0;
     let status = unsafe { AudioHardwareCreateAggregateDevice(device.raw(), &raw mut aggregate) };

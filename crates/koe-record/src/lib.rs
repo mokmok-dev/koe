@@ -60,5 +60,5 @@ mod recorder;
 
 pub use format::Format;
 pub use koe_capture_core::StreamSpec;
-pub use koe_record_core::{Channels, Error, RecordingSpec, Source};
+pub use koe_record_core::{Channels, Error, MAX_GAIN, RecordingSpec, Source};
 pub use recorder::{Recorder, Summary};

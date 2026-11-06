@@ -1,0 +1,460 @@
+//! Scripted hosts, streams, sinks, and recognizers for the command tests.
+
+#![allow(clippy::unwrap_used, clippy::needless_pass_by_value)]
+
+use std::collections::{HashMap, VecDeque};
+use std::path::Path;
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+
+use koe_capture::{DeviceInfo, Source, StreamSpec};
+use koe_record::{Error as RecordError, RecordingSpec, Summary};
+use koe_transcribe::{AudioSpec, Event, Incomplete, Model, Options, Transcript};
+
+use crate::error::AppError;
+use crate::host::{BlockStream, Host, LiveRecognizer, LiveTranscriber, Recognizer, TrackSink};
+
+/// A host whose every reply is scripted by the test.
+#[derive(Default)]
+pub struct FakeHost {
+    devices: Mutex<Option<Result<Vec<DeviceInfo>, AppError>>>,
+    opens: Mutex<HashMap<Source, VecDeque<Result<FakeStream, AppError>>>>,
+    recorder: Mutex<Option<Result<FakeSink, AppError>>>,
+    recognizer: Mutex<Option<Result<Box<dyn Recognizer>, AppError>>>,
+    live: Mutex<Option<Result<Box<dyn LiveTranscriber>, AppError>>>,
+    /// The sink state the scripted recorder shares with the test.
+    pub sink: Arc<Mutex<SinkState>>,
+    /// Every stream spec the pump asked to open.
+    pub opens_seen: Mutex<Vec<StreamSpec>>,
+    /// Every model the transcribe command asked for.
+    pub models_seen: Mutex<Vec<Model>>,
+    /// Every model the record command asked to stream.
+    pub live_models_seen: Mutex<Vec<Model>>,
+    /// Every option set the record command asked to stream.
+    pub live_options_seen: Mutex<Vec<Options>>,
+}
+
+impl FakeHost {
+    /// A host whose device list is `devices`.
+    pub fn with_devices(devices: Vec<DeviceInfo>) -> Self {
+        let host = Self::default();
+        *host.devices.lock().unwrap() = Some(Ok(devices));
+        host
+    }
+
+    /// A host whose device list fails with `Unsupported`.
+    pub fn without_devices() -> Self {
+        let host = Self::default();
+        *host.devices.lock().unwrap() =
+            Some(Err(AppError::Capture(koe_capture::Error::Unsupported)));
+        host
+    }
+
+    /// Scripts a stream for `source`.
+    pub fn with_stream(self, source: Source, stream: FakeStream) -> Self {
+        self.opens
+            .lock()
+            .unwrap()
+            .entry(source)
+            .or_default()
+            .push_back(Ok(stream));
+        self
+    }
+
+    /// Scripts an open failure for `source`.
+    pub fn with_open_error(self, source: Source, error: AppError) -> Self {
+        self.opens
+            .lock()
+            .unwrap()
+            .entry(source)
+            .or_default()
+            .push_back(Err(error));
+        self
+    }
+
+    /// Scripts a recorder that shares `sink`.
+    pub fn with_sink(self) -> Self {
+        *self.recorder.lock().unwrap() = Some(Ok(FakeSink {
+            state: Arc::clone(&self.sink),
+        }));
+        self
+    }
+
+    /// Scripts a recorder creation failure.
+    pub fn with_create_error(self, error: AppError) -> Self {
+        *self.recorder.lock().unwrap() = Some(Err(error));
+        self
+    }
+
+    /// Scripts a recognizer.
+    pub fn with_recognizer(self, recognizer: Box<dyn Recognizer>) -> Self {
+        *self.recognizer.lock().unwrap() = Some(Ok(recognizer));
+        self
+    }
+
+    /// Scripts a recognizer creation failure.
+    pub fn with_recognizer_error(self, error: AppError) -> Self {
+        *self.recognizer.lock().unwrap() = Some(Err(error));
+        self
+    }
+
+    /// Scripts a streaming transcriber.
+    pub fn with_live_transcriber(self, transcriber: Box<dyn LiveTranscriber>) -> Self {
+        *self.live.lock().unwrap() = Some(Ok(transcriber));
+        self
+    }
+
+    /// Scripts a streaming transcriber creation failure.
+    pub fn with_live_error(self, error: AppError) -> Self {
+        *self.live.lock().unwrap() = Some(Err(error));
+        self
+    }
+}
+
+impl Host for FakeHost {
+    fn devices(&self) -> Result<Vec<DeviceInfo>, AppError> {
+        self.devices
+            .lock()
+            .unwrap()
+            .take()
+            .unwrap_or_else(|| Err(AppError::usage("no scripted devices")))
+    }
+
+    fn open_capture(&self, spec: StreamSpec) -> Result<Box<dyn BlockStream>, AppError> {
+        self.opens_seen.lock().unwrap().push(spec);
+        let next = self
+            .opens
+            .lock()
+            .unwrap()
+            .get_mut(&spec.source())
+            .and_then(VecDeque::pop_front);
+        match next {
+            Some(Ok(stream)) => Ok(Box::new(stream)),
+            Some(Err(error)) => Err(error),
+            None => Err(AppError::usage("no scripted stream")),
+        }
+    }
+
+    fn create_recorder(
+        &self,
+        _path: &Path,
+        _spec: RecordingSpec,
+    ) -> Result<Box<dyn TrackSink>, AppError> {
+        match self.recorder.lock().unwrap().take() {
+            Some(Ok(sink)) => Ok(Box::new(sink)),
+            Some(Err(error)) => Err(error),
+            None => Err(AppError::usage("no scripted recorder")),
+        }
+    }
+
+    fn recognizer(&self, model: &Model) -> Result<Box<dyn Recognizer>, AppError> {
+        self.models_seen.lock().unwrap().push(model.clone());
+        match self.recognizer.lock().unwrap().take() {
+            Some(Ok(recognizer)) => Ok(recognizer),
+            Some(Err(error)) => Err(error),
+            None => Err(AppError::usage("no scripted recognizer")),
+        }
+    }
+
+    fn live_transcriber(
+        &self,
+        model: &Model,
+        options: &Options,
+    ) -> Result<Box<dyn LiveTranscriber>, AppError> {
+        self.live_models_seen.lock().unwrap().push(model.clone());
+        self.live_options_seen.lock().unwrap().push(options.clone());
+        match self.live.lock().unwrap().take() {
+            Some(Ok(transcriber)) => Ok(transcriber),
+            Some(Err(error)) => Err(error),
+            None => Err(AppError::usage("no scripted live transcriber")),
+        }
+    }
+}
+
+/// A stream that returns its scripted reads in order.
+pub struct FakeStream {
+    script: Mutex<VecDeque<Result<Vec<f32>, AppError>>>,
+    channels: usize,
+    delay: Option<std::time::Duration>,
+    /// The buffer length of every read the pump made.
+    pub reads: Arc<Mutex<Vec<usize>>>,
+}
+
+impl FakeStream {
+    /// A stream with `channels` that returns `script`, then reports the stream
+    /// closed.
+    pub fn new(channels: usize, script: Vec<Result<Vec<f32>, AppError>>) -> Self {
+        Self {
+            script: Mutex::new(script.into()),
+            channels,
+            delay: None,
+            reads: Arc::new(Mutex::new(Vec::new())),
+        }
+    }
+
+    /// Sleeps for `delay` before the first read.
+    pub fn with_delay(mut self, delay: std::time::Duration) -> Self {
+        self.delay = Some(delay);
+        self
+    }
+}
+
+impl BlockStream for FakeStream {
+    fn read(&mut self, out: &mut [f32]) -> Result<usize, AppError> {
+        if let Some(delay) = self.delay.take() {
+            std::thread::sleep(delay);
+        }
+        self.reads.lock().unwrap().push(out.len());
+        let next = self
+            .script
+            .lock()
+            .unwrap()
+            .pop_front()
+            .unwrap_or(Err(AppError::Capture(koe_capture::Error::StreamClosed)));
+        match next {
+            Ok(samples) => {
+                out[..samples.len()].copy_from_slice(&samples);
+                Ok(samples.len() / self.channels)
+            }
+            Err(error) => Err(error),
+        }
+    }
+}
+
+/// What the scripted sink saw.
+pub struct SinkState {
+    /// Every registered source and its stream spec.
+    pub added: Vec<(Source, StreamSpec)>,
+    /// Every gain set.
+    pub gains: Vec<(Source, f32)>,
+    /// Every written block, keyed by source.
+    pub writes: Vec<(Source, Vec<f32>)>,
+    /// Every ended source.
+    pub ended: Vec<Source>,
+    /// Whether the sink was finished.
+    pub finished: bool,
+    /// Whether writes fail.
+    pub fail_write: bool,
+    /// Whether the next write reports an input overflow.
+    pub overflow_write: bool,
+    /// Whether ends fail.
+    pub fail_end: bool,
+    /// Whether finishing fails.
+    pub fail_finish: bool,
+    /// The summary finishing reports.
+    pub summary: Summary,
+}
+
+impl Default for SinkState {
+    fn default() -> Self {
+        Self {
+            added: Vec::new(),
+            gains: Vec::new(),
+            writes: Vec::new(),
+            ended: Vec::new(),
+            finished: false,
+            fail_write: false,
+            overflow_write: false,
+            fail_end: false,
+            fail_finish: false,
+            summary: Summary {
+                frames: 0,
+                clipped_samples: 0,
+                duration: std::time::Duration::ZERO,
+            },
+        }
+    }
+}
+
+/// A sink that records every call and fails where the state says.
+pub struct FakeSink {
+    /// The state shared with the test.
+    pub state: Arc<Mutex<SinkState>>,
+}
+
+impl FakeSink {
+    fn state(&self) -> MutexGuard<'_, SinkState> {
+        self.state.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+}
+
+impl TrackSink for FakeSink {
+    fn add_source(&mut self, source: Source, spec: StreamSpec) -> Result<(), AppError> {
+        self.state().added.push((source, spec));
+        Ok(())
+    }
+
+    fn set_gain(&mut self, source: Source, gain: f32) -> Result<(), AppError> {
+        self.state().gains.push((source, gain));
+        Ok(())
+    }
+
+    fn write(&mut self, source: Source, samples: &[f32]) -> Result<(), AppError> {
+        let mut state = self.state();
+        if state.ended.contains(&source) {
+            return Err(AppError::Record(RecordError::SourceEnded(source)));
+        }
+        if state.overflow_write {
+            state.overflow_write = false;
+            return Err(AppError::Record(RecordError::InputOverflow(source)));
+        }
+        if state.fail_write {
+            return Err(AppError::usage("write failed"));
+        }
+        state.writes.push((source, samples.to_vec()));
+        Ok(())
+    }
+
+    fn end(&mut self, source: Source) -> Result<(), AppError> {
+        let mut state = self.state();
+        if state.fail_end {
+            return Err(AppError::usage("end failed"));
+        }
+        state.ended.push(source);
+        Ok(())
+    }
+
+    fn finish(&mut self) -> Result<Summary, AppError> {
+        let mut state = self.state();
+        if state.fail_finish {
+            return Err(AppError::usage("finish failed"));
+        }
+        state.finished = true;
+        Ok(state.summary)
+    }
+}
+
+/// One recognizer call.
+pub struct Call {
+    /// The samples the command handed over.
+    pub pcm: Vec<f32>,
+    /// The format the command named.
+    pub spec: AudioSpec,
+    /// The requested language, if any.
+    pub language: Option<String>,
+}
+
+/// A recognizer that returns its scripted result once.
+pub struct FakeRecognizer {
+    result: Mutex<Option<Result<Transcript, Incomplete>>>,
+    /// Every call the command made.
+    pub calls: Arc<Mutex<Vec<Call>>>,
+}
+
+impl FakeRecognizer {
+    /// A recognizer that returns `result` on its first call.
+    pub fn new(result: Result<Transcript, Incomplete>) -> Self {
+        Self {
+            result: Mutex::new(Some(result)),
+            calls: Arc::new(Mutex::new(Vec::new())),
+        }
+    }
+}
+
+impl Recognizer for FakeRecognizer {
+    fn transcribe(
+        &self,
+        pcm: &[f32],
+        spec: AudioSpec,
+        options: &Options,
+    ) -> Result<Transcript, Incomplete> {
+        self.calls.lock().unwrap().push(Call {
+            pcm: pcm.to_vec(),
+            spec,
+            language: options.language_tag().map(str::to_owned),
+        });
+        self.result
+            .lock()
+            .unwrap()
+            .take()
+            .unwrap_or_else(|| Ok(Transcript::default()))
+    }
+}
+
+/// A streaming transcriber that returns its scripted sessions in order.
+pub struct FakeLiveTranscriber {
+    sessions: Mutex<VecDeque<FakeLiveRecognizer>>,
+}
+
+impl FakeLiveTranscriber {
+    /// A transcriber that opens `sessions` in order.
+    pub fn new(sessions: Vec<FakeLiveRecognizer>) -> Self {
+        Self {
+            sessions: Mutex::new(sessions.into()),
+        }
+    }
+}
+
+impl LiveTranscriber for FakeLiveTranscriber {
+    fn live(&self, _spec: AudioSpec) -> Result<Box<dyn LiveRecognizer>, AppError> {
+        self.sessions.lock().unwrap().pop_front().map_or_else(
+            || Err(AppError::usage("no scripted live session")),
+            |session| Ok(Box::new(session) as Box<dyn LiveRecognizer>),
+        )
+    }
+}
+
+/// A streaming recognizer that records feeds and returns scripted events.
+pub struct FakeLiveRecognizer {
+    /// Every block fed to the session.
+    pub feeds: Arc<Mutex<Vec<Vec<f32>>>>,
+    events: Mutex<VecDeque<Event>>,
+    result: Mutex<Option<Result<Transcript, Incomplete>>>,
+    /// Whether `feed` fails.
+    pub fail_feed: bool,
+    /// Whether `poll` fails.
+    pub fail_poll: bool,
+    /// Whether finishing before any feed returns an incomplete result.
+    pub fail_empty_finish: bool,
+}
+
+impl FakeLiveRecognizer {
+    /// A session that returns `result` from `finish`.
+    pub fn new(result: Result<Transcript, Incomplete>) -> Self {
+        Self {
+            feeds: Arc::new(Mutex::new(Vec::new())),
+            events: Mutex::new(VecDeque::new()),
+            result: Mutex::new(Some(result)),
+            fail_feed: false,
+            fail_poll: false,
+            fail_empty_finish: false,
+        }
+    }
+
+    /// Scripts the events `poll` returns, in order.
+    pub fn with_events(self, events: Vec<Event>) -> Self {
+        self.events.lock().unwrap().extend(events);
+        self
+    }
+}
+
+impl LiveRecognizer for FakeLiveRecognizer {
+    fn feed(&self, samples: &[f32]) -> Result<(), AppError> {
+        self.feeds.lock().unwrap().push(samples.to_vec());
+        if self.fail_feed {
+            Err(AppError::usage("feed failed"))
+        } else {
+            Ok(())
+        }
+    }
+
+    fn poll(&self) -> Result<Option<Event>, AppError> {
+        if self.fail_poll {
+            return Err(AppError::usage("poll failed"));
+        }
+        Ok(self.events.lock().unwrap().pop_front())
+    }
+
+    fn finish(self: Box<Self>) -> Result<Transcript, Incomplete> {
+        if self.fail_empty_finish && self.feeds.lock().unwrap().is_empty() {
+            return Err(Incomplete::new(
+                koe_transcribe::Error::Unsupported,
+                Transcript::default(),
+            ));
+        }
+        self.result
+            .lock()
+            .unwrap()
+            .take()
+            .unwrap_or_else(|| Ok(Transcript::default()))
+    }
+}

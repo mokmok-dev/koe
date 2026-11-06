@@ -4,6 +4,11 @@
 # mutants would report as missed with no test able to run them.
 exclude_globs = ["crates/*/src/ffi.rs"]
 
+# The CLI integration tests link the app and spawn its binary for every
+# mutant. On a loaded runner that link can outlast the 20-second floor even
+# when the test itself fails at once, which would report a false timeout.
+minimum_test_timeout = 60
+
 exclude_re = [
   # Equivalent mutant: the comparison differs only when a kernel row sums to
   # exactly f32::EPSILON, which no input can produce.

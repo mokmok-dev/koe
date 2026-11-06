@@ -105,7 +105,7 @@
 
               # The facades reject `--all-features` and accept exactly one
               # platform feature, so the host feature is named per package.
-              hostFeatures = "koe-capture/${platformFeature},koe-transcribe/${platformFeature}";
+              hostFeatures = "koe-capture/${platformFeature},koe-transcribe/${platformFeature},koe-cli/${platformFeature}";
               hostArgs = cargoCommonArgs // {
                 inherit cargoArtifacts;
                 cargoClippyExtraArgs = "--workspace --all-targets --features ${hostFeatures} -- --deny warnings";
