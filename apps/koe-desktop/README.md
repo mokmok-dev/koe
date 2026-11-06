@@ -18,7 +18,7 @@ The previous egui shell remains available for comparison.
 cargo run -p koe-desktop --no-default-features --features egui,linux
 ```
 
-The first window is the control surface. Use **Hide to menu bar** to keep only the tray icon. On macOS, the process runs as an accessory app, so it has no Dock icon. In the Rune shell, `KOE_HUD=off` hides the overlay if a compositor places it badly.
+The first window is the control surface. On macOS, the menu opens on a left click, and **Open koe** shows the window again. Use **Hide to menu bar** to keep only the tray icon. The process runs as an accessory app, so it has no Dock icon. In the Rune shell, `KOE_HUD=off` hides the overlay if a compositor places it badly. Set `KOE_TRAY_DEBUG=1` to print tray events while diagnosing a menu that does not act.
 
 The tray icon needs a StatusNotifier host on Linux. KDE, Sway, and most bars provide one. GNOME needs an AppIndicator extension. Without a host, the window is the only control. Hiding the window leaves the app running with no visible control, so relaunch it from the same binary.
 

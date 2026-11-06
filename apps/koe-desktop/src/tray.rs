@@ -1,9 +1,13 @@
 //! The menu bar icon, its menu, and the actions it reports.
 
+use std::collections::VecDeque;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use tray_icon::menu::{Menu, MenuEvent, MenuId, MenuItem, PredefinedMenuItem};
-use tray_icon::{MouseButton, MouseButtonState, TrayIcon, TrayIconBuilder, TrayIconEvent};
+#[cfg(not(target_os = "macos"))]
+use tray_icon::{MouseButton, MouseButtonState};
+use tray_icon::{TrayIcon, TrayIconBuilder, TrayIconEvent};
 
 use crate::icon;
 use crate::repaint::Repaint;
@@ -62,6 +66,7 @@ pub struct Tray {
     start: MenuItem,
     stop: MenuItem,
     last: TrayState,
+    actions: Arc<Mutex<VecDeque<TrayAction>>>,
 }
 
 impl Tray {
@@ -72,8 +77,18 @@ impl Tray {
     /// Returns the platform error when no tray host accepts the icon, which
     /// happens on a desktop without a `StatusNotifier` watcher.
     pub fn new(repaint: Repaint, state: &TrayState) -> Result<Self, String> {
+        let actions = Arc::new(Mutex::new(VecDeque::new()));
+        let menu_actions = Arc::clone(&actions);
         let menu_repaint = repaint.clone();
-        MenuEvent::set_event_handler(Some(move |_event| menu_repaint()));
+        MenuEvent::set_event_handler(Some(move |event: MenuEvent| {
+            debug(&format!("menu {:?}", event.id.0));
+            if let Some(action) = action_for(&event.id)
+                && let Ok(mut queue) = menu_actions.lock()
+            {
+                queue.push_back(action);
+            }
+            menu_repaint();
+        }));
         TrayIconEvent::set_event_handler(Some(move |_event| repaint()));
 
         let header = MenuItem::with_id("status", label(state), false, None);
@@ -104,9 +119,10 @@ impl Tray {
             .with_tooltip(tooltip(state))
             .with_icon(icon::status_icon(state.status)?)
             .with_menu(Box::new(menu))
-            .with_menu_on_left_click(false)
+            .with_menu_on_left_click(true)
             .build()
             .map_err(|error| error.to_string())?;
+        debug("installed");
 
         Ok(Self {
             icon,
@@ -114,6 +130,7 @@ impl Tray {
             start,
             stop,
             last: state.clone(),
+            actions,
         })
     }
 
@@ -143,11 +160,17 @@ impl Tray {
     #[must_use]
     pub fn poll(&self) -> Vec<TrayAction> {
         let mut actions = Vec::new();
-        while let Ok(event) = MenuEvent::receiver().try_recv() {
-            if let Some(action) = action_for(&event.id) {
-                actions.push(action);
+        if let Ok(mut queue) = self.actions.lock() {
+            for action in queue.drain(..) {
+                push_unique(&mut actions, action);
             }
         }
+        while let Ok(event) = MenuEvent::receiver().try_recv() {
+            if let Some(action) = action_for(&event.id) {
+                push_unique(&mut actions, action);
+            }
+        }
+        #[cfg(not(target_os = "macos"))]
         while let Ok(event) = TrayIconEvent::receiver().try_recv() {
             match event {
                 TrayIconEvent::Click {
@@ -158,11 +181,25 @@ impl Tray {
                 | TrayIconEvent::DoubleClick {
                     button: MouseButton::Left,
                     ..
-                } => actions.push(TrayAction::Show),
+                } => push_unique(&mut actions, TrayAction::Show),
                 _ => {}
             }
         }
+        #[cfg(target_os = "macos")]
+        while TrayIconEvent::receiver().try_recv().is_ok() {}
         actions
+    }
+}
+
+fn push_unique(actions: &mut Vec<TrayAction>, action: TrayAction) {
+    if !actions.contains(&action) {
+        actions.push(action);
+    }
+}
+
+fn debug(message: &str) {
+    if std::env::var_os("KOE_TRAY_DEBUG").is_some() {
+        eprintln!("koe tray: {message}");
     }
 }
 

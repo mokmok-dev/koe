@@ -186,6 +186,9 @@ fn poll(state: &mut AppState, _seconds: f64, tx: &mut Tx) -> bool {
     }
     let actions = state.tray.as_ref().map(Tray::poll).unwrap_or_default();
     for action in actions {
+        if std::env::var_os("KOE_TRAY_DEBUG").is_some() {
+            eprintln!("koe app: tray {action:?}");
+        }
         handle_tray(state, action, tx);
         changed = true;
     }
