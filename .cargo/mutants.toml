@@ -40,3 +40,6 @@ exclude_re = [
   # Equivalent mutant: a directory fsync has no effect a test can observe.
   "koe-session-store/src/record.rs:420:5: replace sync_directory with \\(\\)",
 ]
+
+# Nextest skips doctests, so their coverage is absent from this gate.
+test_tool = "nextest"
