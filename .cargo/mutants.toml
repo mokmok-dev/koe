@@ -39,6 +39,11 @@ exclude_re = [
 
   # Equivalent mutant: a directory fsync has no effect a test can observe.
   "koe-session-store/src/record.rs:420:5: replace sync_directory with \\(\\)",
+
+  # Equivalent mutant: with an empty pending buffer the padding loop writes the
+  # same silence packet, and a non-empty buffer short-circuits the `||` before
+  # the comparison runs.
+  "koe-record/src/file.rs:205:60: replace == with != in <impl AudioFile for OggOpusFile>::finish",
 ]
 
 # Nextest skips doctests, so their coverage is absent from this gate.

@@ -3772,6 +3772,7 @@ dependencies = [
  "koe-capture-core",
  "koe-record-core",
  "opus",
+ "tempfile",
 ]
 
 [[package]]
