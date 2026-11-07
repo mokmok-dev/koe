@@ -111,13 +111,15 @@
                 nativeBuildInputs = [
                   pkgs.cmake
                 ]
+                ++ pkgs.lib.optional pkgs.stdenv.hostPlatform.isLinux pkgs.pkg-config
                 ++ pkgs.lib.optional pkgs.stdenv.hostPlatform.isDarwin pkgs.swift;
               }
               // pkgs.lib.optionalAttrs pkgs.stdenv.hostPlatform.isLinux {
                 buildInputs = [
                   pkgs.libpulseaudio
                   pkgs.libxkbcommon
-                ];
+                ]
+                ++ guiPackages;
                 LD_LIBRARY_PATH = pkgs.lib.makeLibraryPath [
                   pkgs.libpulseaudio
                   pkgs.libxkbcommon
@@ -127,7 +129,7 @@
 
               # The facades reject `--all-features` and accept exactly one
               # platform feature, so the host feature is named per package.
-              hostFeatures = "koe-capture/${platformFeature},koe-transcribe/${platformFeature},koe-cli/${platformFeature},koe-desktop/${platformFeature},koe-desktop/egui";
+              hostFeatures = "koe-capture/${platformFeature},koe-transcribe/${platformFeature},koe-cli/${platformFeature},koe-desktop/${platformFeature},koe-desktop/gpui";
               hostArgs = cargoCommonArgs // {
                 inherit cargoArtifacts;
                 cargoClippyExtraArgs = "--workspace --all-targets --features ${hostFeatures} -- --deny warnings";
@@ -162,6 +164,7 @@
                   pname = "koe-mutants";
                   nativeBuildInputs = [
                     pkgs.cargo-mutants
+                    pkgs.cargo-nextest
                     pkgs.cmake
                   ];
                   doCheck = false;
@@ -202,12 +205,14 @@
               with pkgs;
               [
                 cargo-mutants
+                cargo-nextest
                 cmake
                 linkerPackages
                 rustToolchain
                 sccache
               ]
               ++ pkgs.lib.optional pkgs.stdenv.hostPlatform.isLinux libpulseaudio
+              ++ pkgs.lib.optional pkgs.stdenv.hostPlatform.isLinux pkg-config
               ++ pkgs.lib.optionals pkgs.stdenv.hostPlatform.isLinux guiPackages
               ++ pkgs.lib.optional pkgs.stdenv.hostPlatform.isDarwin swift;
 
