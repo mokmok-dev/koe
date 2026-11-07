@@ -8,8 +8,9 @@
 # in scope; the UI and OS adapters would report untestable mutants.
 exclude_globs = [
   "crates/*/src/ffi.rs",
-  "apps/koe-desktop/src/app.rs",
-  "apps/koe-desktop/src/ui.rs",
+  "apps/koe-desktop/src/gpui_app.rs",
+  "apps/koe-desktop/src/gpui_hud.rs",
+  "apps/koe-desktop/src/gpui_ui.rs",
   "apps/koe-desktop/src/hud.rs",
   "apps/koe-desktop/src/rune_app.rs",
   "apps/koe-desktop/src/rune_ui.rs",
