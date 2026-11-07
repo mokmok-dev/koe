@@ -111,11 +111,11 @@
                 nativeBuildInputs = [
                   pkgs.cmake
                 ]
+                ++ pkgs.lib.optional pkgs.stdenv.hostPlatform.isLinux pkgs.pkg-config
                 ++ pkgs.lib.optional pkgs.stdenv.hostPlatform.isDarwin pkgs.swift;
               }
               // pkgs.lib.optionalAttrs pkgs.stdenv.hostPlatform.isLinux {
                 buildInputs = [
-                  pkgs.pkg-config
                   pkgs.libpulseaudio
                   pkgs.libxkbcommon
                 ]
