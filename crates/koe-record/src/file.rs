@@ -209,9 +209,31 @@ impl AudioFile for OggOpusFile {
             self.pending.clear();
             self.encode_frame()?;
         }
-        while self.encoded_frames * u64::from(PACKET_SAMPLES_48K) < final_granule {
+        if !self.pending.is_empty() {
+            return Err(Error::ContainerInvariant {
+                operation: "finish",
+            });
+        }
+
+        // A granule that needs more padding than the lookahead accounts for
+        // means the packet count and the duration disagree. The upper bound
+        // also stops a bad granule from making this loop run for hours.
+        let target_packets = final_granule.div_ceil(u64::from(PACKET_SAMPLES_48K));
+        let padding = self.pre_skip_48k.div_ceil(u64::from(PACKET_SAMPLES_48K)) + 2;
+        if target_packets > self.encoded_frames.saturating_add(padding) {
+            return Err(Error::ContainerInvariant {
+                operation: "finish",
+            });
+        }
+        while self.encoded_frames < target_packets {
+            let before = self.encoded_frames;
             self.frame.fill(0.0);
             self.encode_frame()?;
+            if self.encoded_frames == before {
+                return Err(Error::ContainerInvariant {
+                    operation: "encode frame",
+                });
+            }
         }
 
         let Self { writer, .. } = *self;
@@ -303,5 +325,193 @@ fn serial() -> u32 {
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or(0, |value| value.as_nanos());
+    serial_at(nanos)
+}
+
+/// Keeps the low 32 bits of `nanos` and forces the result odd.
+fn serial_at(nanos: u128) -> u32 {
     u32::try_from(nanos & u128::from(u32::MAX)).unwrap_or(1) | 1
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used, clippy::float_cmp)]
+
+    use std::collections::HashSet;
+
+    use super::*;
+
+    struct Page {
+        header_type: u8,
+        granule: u64,
+        packets: Vec<Vec<u8>>,
+    }
+
+    /// Parses the page headers and packet payloads the writer produced.
+    fn pages(bytes: &[u8]) -> Vec<Page> {
+        let mut pages = Vec::new();
+        let mut offset = 0;
+        while offset < bytes.len() {
+            assert_eq!(&bytes[offset..offset + 4], b"OggS");
+            let header_type = bytes[offset + 5];
+            let granule = u64::from_le_bytes(bytes[offset + 6..offset + 14].try_into().unwrap());
+            let segments = usize::from(bytes[offset + 26]);
+            let lacing = &bytes[offset + 27..offset + 27 + segments];
+            let body_start = offset + 27 + segments;
+            let body_len: usize = lacing.iter().map(|value| usize::from(*value)).sum();
+            let body = &bytes[body_start..body_start + body_len];
+
+            let mut packets = Vec::new();
+            let mut start = 0;
+            let mut length = 0;
+            for value in lacing {
+                length += usize::from(*value);
+                if *value < 255 {
+                    packets.push(body[start..start + length].to_vec());
+                    start += length;
+                    length = 0;
+                }
+            }
+            pages.push(Page {
+                header_type,
+                granule,
+                packets,
+            });
+            offset = body_start + body_len;
+        }
+        pages
+    }
+
+    fn audio_packets(pages: &[Page]) -> usize {
+        pages.iter().skip(2).map(|page| page.packets.len()).sum()
+    }
+
+    fn create(
+        dir: &tempfile::TempDir,
+        name: &str,
+        spec: RecordingSpec,
+    ) -> (std::path::PathBuf, OggOpusFile) {
+        let path = dir.path().join(name);
+        (path.clone(), OggOpusFile::create(&path, spec).unwrap())
+    }
+
+    #[test]
+    fn the_opus_head_uses_the_encoder_lookahead_as_pre_skip() {
+        let dir = tempfile::tempdir().unwrap();
+        let spec = RecordingSpec::new(48_000, Channels::Stereo).unwrap();
+        let (path, file) = create(&dir, "head.ogg", spec);
+        Box::new(file).finish().unwrap();
+
+        let bytes = std::fs::read(path).unwrap();
+        let pages = pages(&bytes);
+        let head = &pages[0].packets[0];
+        assert_eq!(&head[..8], b"OpusHead");
+        let pre_skip = u16::from_le_bytes(head[10..12].try_into().unwrap());
+
+        let mut encoder =
+            opus::Encoder::new(48_000, opus::Channels::Stereo, Application::Audio).unwrap();
+        let expected = u16::try_from(encoder.get_lookahead().unwrap()).unwrap();
+        assert_eq!(pre_skip, expected);
+    }
+
+    #[test]
+    fn a_partial_frame_is_encoded_and_trimmed_by_the_final_granule() {
+        let dir = tempfile::tempdir().unwrap();
+        let spec = RecordingSpec::new(48_000, Channels::Mono).unwrap();
+        let (path, mut file) = create(&dir, "partial.ogg", spec);
+        file.write(&[0.25; 100]).unwrap();
+        let pre_skip = file.pre_skip_48k;
+        Box::new(file).finish().unwrap();
+
+        let pages = pages(&std::fs::read(path).unwrap());
+        let eos = pages.last().unwrap();
+        assert_ne!(eos.header_type & 0x04, 0);
+        assert_eq!(eos.granule, pre_skip + 100);
+    }
+
+    #[test]
+    fn exact_packets_do_not_gain_an_extra_padding_packet() {
+        let dir = tempfile::tempdir().unwrap();
+        let spec = RecordingSpec::new(48_000, Channels::Mono).unwrap();
+        let (path, mut file) = create(&dir, "exact.ogg", spec);
+        let samples = vec![0.0; usize::try_from(PACKET_SAMPLES_48K).unwrap()];
+        file.write(&samples).unwrap();
+        let pre_skip = file.pre_skip_48k;
+        Box::new(file).finish().unwrap();
+
+        let pages = pages(&std::fs::read(path).unwrap());
+        assert_eq!(audio_packets(&pages), 2);
+        assert_eq!(pages.last().unwrap().granule, pre_skip + 960);
+    }
+
+    #[test]
+    fn a_partial_frame_after_a_full_packet_is_written() {
+        let dir = tempfile::tempdir().unwrap();
+        let spec = RecordingSpec::new(48_000, Channels::Mono).unwrap();
+        let (path, mut file) = create(&dir, "tail.ogg", spec);
+        // One full packet first, so the partial frame is the second packet.
+        file.write(&vec![0.5; 1060]).unwrap();
+        let pre_skip = file.pre_skip_48k;
+        Box::new(file).finish().unwrap();
+
+        let pages = pages(&std::fs::read(path).unwrap());
+        assert_eq!(pages.last().unwrap().granule, pre_skip + 1060);
+    }
+
+    #[test]
+    fn finish_accepts_padding_at_the_guard_boundary() {
+        let dir = tempfile::tempdir().unwrap();
+        let spec = RecordingSpec::new(48_000, Channels::Mono).unwrap();
+        let (path, mut file) = create(&dir, "boundary.ogg", spec);
+        // The packet count is behind the duration; the guard should still
+        // accept the padding this needs and stop there.
+        file.input_frames = 2_880;
+        file.encoded_frames = 0;
+        file.pending = vec![0.0];
+        Box::new(file).finish().unwrap();
+        let pages = pages(&std::fs::read(path).unwrap());
+        assert_ne!(pages.last().unwrap().header_type & 0x04, 0);
+    }
+
+    #[test]
+    fn an_empty_take_still_writes_one_packet() {
+        let dir = tempfile::tempdir().unwrap();
+        let spec = RecordingSpec::new(48_000, Channels::Mono).unwrap();
+        let (path, file) = create(&dir, "empty.ogg", spec);
+        let pre_skip = file.pre_skip_48k;
+        Box::new(file).finish().unwrap();
+
+        let pages = pages(&std::fs::read(path).unwrap());
+        assert_eq!(audio_packets(&pages), 1);
+        assert_eq!(pages.last().unwrap().granule, pre_skip);
+    }
+
+    #[test]
+    fn serials_keep_the_low_bits_and_stay_odd() {
+        assert_eq!(serial_at(0x1_0000_0002), 3);
+        assert_eq!(serial_at(2), 3);
+        assert_eq!(serial_at(3), 3);
+        assert_eq!(serial_at(0), 1);
+        assert_eq!(serial_at(u128::MAX), u32::MAX);
+    }
+
+    #[test]
+    fn serials_vary_between_calls() {
+        let serials: HashSet<u32> = (0..256).map(|_| serial()).collect();
+        assert!(
+            serials.len() > 1,
+            "the clock must produce different serials"
+        );
+        assert!(serials.iter().all(|serial| serial & 1 == 1));
+    }
+
+    #[test]
+    fn a_failed_flush_is_reported() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("readonly");
+        std::fs::write(&path, b"x").unwrap();
+        let mut sink = FileSink::new(File::open(path).unwrap());
+        sink.write_all(b"buffered").unwrap();
+        assert!(sink.finish().is_err());
+    }
 }

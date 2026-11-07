@@ -12,6 +12,7 @@ opus.workspace = true
 
 [dev-dependencies]
 koe-capture = { path = "../koe-capture" }
+tempfile.workspace = true
 
 [lints]
 workspace = true
