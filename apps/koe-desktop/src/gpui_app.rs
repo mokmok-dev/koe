@@ -46,6 +46,7 @@ pub struct Shell {
     pending_show: bool,
     pending_hide: bool,
     pending_quit: bool,
+    pending_hud_close: Option<AnyWindowHandle>,
 }
 
 /// What the tick loop must run after the shell lease is released.
@@ -58,6 +59,8 @@ pub struct Tick {
     pub hide: bool,
     /// Whether to exit the application.
     pub quit: bool,
+    /// The HUD window to close once the shell lease is released.
+    pub hud_close: Option<AnyWindowHandle>,
 }
 
 impl Default for Shell {
@@ -89,6 +92,7 @@ impl Shell {
             pending_show: false,
             pending_hide: false,
             pending_quit: false,
+            pending_hud_close: None,
         }
     }
 
@@ -116,6 +120,7 @@ impl Shell {
             show: false,
             hide: false,
             quit: false,
+            hud_close: self.pending_hud_close.take(),
         };
         if self.quitting {
             let deadline_passed = self
@@ -359,7 +364,7 @@ impl Shell {
         }
         if !self.phase.is_active() {
             if let Some(handle) = self.hud.take() {
-                gpui_hud::close(cx, handle);
+                self.pending_hud_close = Some(handle);
             }
             self.hud_view = None;
             return self.last_hud.take().is_some();
@@ -498,7 +503,12 @@ pub fn run() {
             cx.on_window_closed({
                 let shell = shell.clone();
                 move |cx, id| {
-                    shell.update(cx, |shell, cx| shell.window_closed(id, cx));
+                    let shell = shell.clone();
+                    // A window can close while its owner is being updated, so
+                    // run the bookkeeping after that update finishes.
+                    cx.defer(move |cx| {
+                        shell.update(cx, |shell, cx| shell.window_closed(id, cx));
+                    });
                 }
             })
             .detach();
@@ -514,6 +524,9 @@ pub fn run() {
                     }
                     if tick.hide {
                         cx.update(|cx| hide_main_window(cx, &shell));
+                    }
+                    if let Some(handle) = tick.hud_close {
+                        cx.update(|cx| gpui_hud::close(cx, handle));
                     }
                     if tick.quit {
                         cx.update(|cx| cx.quit());
