@@ -28,8 +28,7 @@ clap = { version = "4.6.7", default-features = false, features = [
   "usage"
 ] }
 ctrlc = "3.5.2"
-eframe = "0.37.0"
-egui = "0.37.0"
+gpui-kit = "0.9.0"
 koe-capture = { path = "crates/koe-capture" }
 koe-capture-core = { path = "crates/koe-capture-core" }
 koe-capture-linux = { path = "crates/koe-capture-linux" }
