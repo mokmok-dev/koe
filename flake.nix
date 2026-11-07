@@ -164,6 +164,7 @@
                   pname = "koe-mutants";
                   nativeBuildInputs = [
                     pkgs.cargo-mutants
+                    pkgs.cargo-nextest
                     pkgs.cmake
                   ];
                   doCheck = false;
@@ -204,6 +205,7 @@
               with pkgs;
               [
                 cargo-mutants
+                cargo-nextest
                 cmake
                 linkerPackages
                 rustToolchain

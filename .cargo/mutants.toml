@@ -8,8 +8,9 @@
 # in scope; the UI and OS adapters would report untestable mutants.
 exclude_globs = [
   "crates/*/src/ffi.rs",
-  "apps/koe-desktop/src/app.rs",
-  "apps/koe-desktop/src/ui.rs",
+  "apps/koe-desktop/src/gpui_app.rs",
+  "apps/koe-desktop/src/gpui_hud.rs",
+  "apps/koe-desktop/src/gpui_ui.rs",
   "apps/koe-desktop/src/hud.rs",
   "apps/koe-desktop/src/rune_app.rs",
   "apps/koe-desktop/src/rune_ui.rs",
@@ -39,3 +40,6 @@ exclude_re = [
   # Equivalent mutant: a directory fsync has no effect a test can observe.
   "koe-session-store/src/record.rs:420:5: replace sync_directory with \\(\\)",
 ]
+
+# Nextest skips doctests, so their coverage is absent from this gate.
+test_tool = "nextest"
