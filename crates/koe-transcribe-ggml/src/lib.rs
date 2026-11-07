@@ -43,4 +43,13 @@ mod tests {
             })
         );
     }
+
+    #[test]
+    fn a_missing_gguf_file_is_reported() {
+        let path = "/nonexistent/koe-model.gguf";
+        assert_eq!(
+            engine(&Model::gguf(path)).err(),
+            Some(Error::ModelNotFound { path: path.into() })
+        );
+    }
 }

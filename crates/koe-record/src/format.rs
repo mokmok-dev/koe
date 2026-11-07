@@ -39,20 +39,15 @@ impl Format {
     ///
     /// `oga` and `opus` name Ogg too, because players accept all three.
     #[must_use]
-    pub const fn from_extension(extension: &str) -> Option<Self> {
-        let mut row = 0;
-        while row < EXTENSIONS.len() {
-            let (format, names) = EXTENSIONS[row];
-            let mut name = 0;
-            while name < names.len() {
-                if extension.eq_ignore_ascii_case(names[name]) {
-                    return Some(format);
-                }
-                name += 1;
-            }
-            row += 1;
-        }
-        None
+    pub fn from_extension(extension: &str) -> Option<Self> {
+        EXTENSIONS
+            .iter()
+            .find(|(_, names)| {
+                names
+                    .iter()
+                    .any(|name| extension.eq_ignore_ascii_case(name))
+            })
+            .map(|(format, _)| *format)
     }
 
     /// Resolves the format a path names.

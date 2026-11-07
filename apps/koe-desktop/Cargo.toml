@@ -14,8 +14,7 @@ name = "koe-desktop"
 path = "src/main.rs"
 
 [dependencies]
-eframe = { workspace = true, optional = true }
-egui = { workspace = true, optional = true }
+gpui-kit = { workspace = true, optional = true }
 koe-capture.workspace = true
 koe-record.workspace = true
 rune = { git = "https://github.com/anomalyco/rune.git", rev = "781e2b6d87cd5f32d6f4365956fad4baaf24ee50", default-features = false, features = [
@@ -37,7 +36,7 @@ tempfile.workspace = true
 
 [features]
 default = ["rune-ui"]
-egui = ["dep:eframe", "dep:egui"]
+gpui = ["dep:gpui-kit"]
 rune-ui = ["dep:rune"]
 linux = ["koe-capture/linux"]
 macos = ["koe-capture/macos"]
