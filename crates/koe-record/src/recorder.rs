@@ -256,12 +256,21 @@ impl Recorder {
                 (None, None) => return Ok(()),
             }
             .min(MAX_BLOCK_FRAMES);
-            if frames == 0 {
+            let Some(frames) = std::num::NonZeroUsize::new(frames) else {
                 return Ok(());
-            }
+            };
+            let frames = frames.get();
 
-            let microphone = self.pop(Source::Microphone, frames)?;
-            let system_audio = self.pop(Source::SystemAudio, frames)?;
+            let microphone = if microphone.is_some() {
+                Some(self.pop(Source::Microphone, frames)?)
+            } else {
+                None
+            };
+            let system_audio = if system_audio.is_some() {
+                Some(self.pop(Source::SystemAudio, frames)?)
+            } else {
+                None
+            };
             let microphone = microphone.map(|channels| Input {
                 channels,
                 samples: &self.microphone[..frames * usize::from(channels.count())],
@@ -299,13 +308,13 @@ impl Recorder {
         }
     }
 
-    fn pop(&mut self, source: Source, frames: usize) -> Result<Option<Channels>, Error> {
+    fn pop(&mut self, source: Source, frames: usize) -> Result<Channels, Error> {
         let slot = &mut self.sources[index(source)];
         if slot.ended {
-            return Ok(None);
+            return Err(Error::ContainerInvariant { operation: "queue" });
         }
         let Some(registration) = slot.registration.as_mut() else {
-            return Ok(None);
+            return Err(Error::ContainerInvariant { operation: "queue" });
         };
         let channels = usize::from(registration.channels.count());
         let buffer = match source {
@@ -318,7 +327,7 @@ impl Recorder {
         if popped != frames {
             return Err(Error::ContainerInvariant { operation: "queue" });
         }
-        Ok(Some(registration.channels))
+        Ok(registration.channels)
     }
 }
 
@@ -420,5 +429,107 @@ mod tests {
             finished.load(Ordering::SeqCst),
             "the file closes even when the last mix fails"
         );
+    }
+
+    fn recording(extension: &str, spec: RecordingSpec) -> (tempfile::TempDir, Recorder) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(format!("take.{extension}"));
+        let recorder = Recorder::create(&path, spec).unwrap();
+        (dir, recorder)
+    }
+
+    #[test]
+    fn block_buffers_hold_every_output_channel() {
+        for (channels, width) in [
+            (Channels::Mono, MAX_BLOCK_FRAMES),
+            (Channels::Stereo, MAX_BLOCK_FRAMES * 2),
+        ] {
+            let spec = RecordingSpec::new(48_000, channels).unwrap();
+            let (_dir, recorder) = recording("wav", spec);
+            assert_eq!(recorder.microphone.len(), width);
+            assert_eq!(recorder.system_audio.len(), width);
+            assert_eq!(recorder.mixed.len(), width);
+        }
+    }
+
+    #[test]
+    fn set_gain_rejects_values_outside_the_range() {
+        let spec = RecordingSpec::new(48_000, Channels::Stereo).unwrap();
+        let (_dir, mut recorder) = recording("wav", spec);
+        for gain in [f32::NAN, f32::INFINITY, -0.1, crate::MAX_GAIN + 0.1] {
+            assert!(
+                recorder.set_gain(Source::Microphone, gain).is_err(),
+                "{gain} must be rejected"
+            );
+        }
+        for gain in [0.0, 1.0, crate::MAX_GAIN] {
+            assert!(
+                recorder.set_gain(Source::Microphone, gain).is_ok(),
+                "{gain} must be accepted"
+            );
+        }
+    }
+
+    #[test]
+    fn a_stereo_system_source_is_mixed_in_full() {
+        let spec = RecordingSpec::new(48_000, Channels::Stereo).unwrap();
+        let (_dir, mut recorder) = recording("wav", spec);
+        recorder
+            .add_source(
+                Source::SystemAudio,
+                &StreamSpec::new(Source::SystemAudio, 48_000, 2).unwrap(),
+            )
+            .unwrap();
+        recorder
+            .write(Source::SystemAudio, &[0.5, 0.5, 0.5, 0.5])
+            .unwrap();
+        let summary = recorder.finish().unwrap();
+        assert_eq!(summary.frames, 2);
+    }
+
+    #[test]
+    fn a_stereo_microphone_source_is_mixed_in_full() {
+        let spec = RecordingSpec::new(48_000, Channels::Stereo).unwrap();
+        let (_dir, mut recorder) = recording("wav", spec);
+        recorder
+            .add_source(
+                Source::Microphone,
+                &StreamSpec::new(Source::Microphone, 48_000, 2).unwrap(),
+            )
+            .unwrap();
+        recorder
+            .write(Source::Microphone, &[0.5, 0.5, 0.5, 0.5])
+            .unwrap();
+        let summary = recorder.finish().unwrap();
+        assert_eq!(summary.frames, 2);
+    }
+
+    #[test]
+    fn a_registered_source_without_samples_finishes_empty() {
+        let spec = RecordingSpec::new(48_000, Channels::Stereo).unwrap();
+        let (_dir, mut recorder) = recording("wav", spec);
+        recorder
+            .add_source(
+                Source::Microphone,
+                &StreamSpec::new(Source::Microphone, 48_000, 1).unwrap(),
+            )
+            .unwrap();
+        let summary = recorder.finish().unwrap();
+        assert_eq!(summary.frames, 0);
+    }
+
+    #[test]
+    fn queued_frames_are_drained() {
+        let spec = RecordingSpec::new(48_000, Channels::Stereo).unwrap();
+        let (_dir, mut recorder) = recording("wav", spec);
+        recorder
+            .add_source(
+                Source::Microphone,
+                &StreamSpec::new(Source::Microphone, 48_000, 1).unwrap(),
+            )
+            .unwrap();
+        recorder.write(Source::Microphone, &[0.25; 10]).unwrap();
+        let summary = recorder.finish().unwrap();
+        assert_eq!(summary.frames, 10);
     }
 }
