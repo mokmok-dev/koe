@@ -83,7 +83,7 @@ cargo test -p koe-capture-core
 # Facade and the host backend.
 cargo test -p koe-capture --features linux
 
-# Every Linux gate: clippy, tests, macOS check, Windows check.
+# Every Linux gate: clippy, tests, doctests, macOS check, Windows check.
 nix flake check
 
 # Mutation testing: the whole workspace, or only the lines a branch changed.

@@ -128,10 +128,11 @@
               # The facades reject `--all-features` and accept exactly one
               # platform feature, so the host feature is named per package.
               hostFeatures = "koe-capture/${platformFeature},koe-transcribe/${platformFeature},koe-cli/${platformFeature},koe-desktop/${platformFeature}";
+              # `clippy`, `test`, and `doctest` share this so a narrower set
+              # cannot `cfg` platform code out while the gate stays green.
+              hostWorkspaceArgs = "--workspace --features ${hostFeatures}";
               hostArgs = cargoCommonArgs // {
                 inherit cargoArtifacts;
-                cargoClippyExtraArgs = "--workspace --all-targets --features ${hostFeatures} -- --deny warnings";
-                cargoTestExtraArgs = "--workspace --features ${hostFeatures}";
               };
 
               crossCheck =
@@ -151,8 +152,31 @@
                 };
             in
             {
-              clippy = craneLib.cargoClippy hostArgs;
-              test = craneLib.cargoTest hostArgs;
+              clippy = craneLib.cargoClippy (
+                hostArgs
+                // {
+                  cargoClippyExtraArgs = "--all-targets ${hostWorkspaceArgs} -- --deny warnings";
+                }
+              );
+              test = craneLib.cargoNextest (
+                hostArgs
+                // {
+                  # crane's nextest default leaves out `--locked`, so a stale
+                  # Cargo.lock would pass this gate.
+                  cargoExtraArgs = "--locked";
+                  # One red gate should name every failure; nextest ignores the
+                  # RUST_TEST_THREADS crane derives from NIX_BUILD_CORES.
+                  cargoNextestExtraArgs = "${hostWorkspaceArgs} --no-fail-fast --test-threads $NIX_BUILD_CORES";
+                }
+              );
+              # Nextest does not run doctests, and the crate docs carry runnable
+              # examples.
+              doctest = craneLib.cargoDocTest (
+                hostArgs
+                // {
+                  cargoTestExtraArgs = hostWorkspaceArgs;
+                }
+              );
             }
             // pkgs.lib.optionalAttrs (system == "x86_64-linux") {
               crossMacos = crossCheck "aarch64-apple-darwin" "koe-capture-macos";
