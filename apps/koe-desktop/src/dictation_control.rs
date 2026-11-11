@@ -15,6 +15,15 @@ use crate::error::DesktopError;
 use crate::hotkey::{self, Hotkeys};
 use crate::settings::{self, DictationSettings};
 
+/// What a hotkey press left to tell the user.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Press {
+    /// The press was refused; nothing started.
+    Refused(String),
+    /// The press was accepted, but the dictation thread did not start.
+    Failed(String),
+}
+
 /// The dictation machine, thread, settings, and hotkey of one shell.
 pub struct DictationControl {
     /// The dictation state machine.
@@ -101,9 +110,11 @@ impl DictationControl {
     ///
     /// # Errors
     ///
-    /// Returns the refusal or failure to show as a notice, when the press
-    /// does not start or stop a dictation.
-    pub fn toggle(&mut self, meeting_active: bool) -> Option<String> {
+    /// Returns the refusal or the start failure to show, when the press does
+    /// not start or stop a dictation. A refusal is the hotkey's own answer and
+    /// belongs in the HUD; a failure is the dictation thread's, and the window
+    /// notice is enough for it.
+    pub fn toggle(&mut self, meeting_active: bool) -> Option<Press> {
         let context = DictationContext {
             meeting_active,
             model: settings::dictation_model(&self.settings),
@@ -114,7 +125,14 @@ impl DictationControl {
                 .map(|language| language.as_str().into()),
         };
         let action = self.dictation.toggle(context, Instant::now())?;
-        self.run(action)
+        let refused = matches!(&action, dictation::DictationAction::Refuse(_));
+        self.run(action).map(|message| {
+            if refused {
+                Press::Refused(message)
+            } else {
+                Press::Failed(message)
+            }
+        })
     }
 
     /// Takes the dictation thread's report, if it has one.
@@ -338,7 +356,7 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let mut control = control(root.path());
         let message = control.toggle(false).unwrap();
-        assert_eq!(message, dictation::MODEL_MISSING);
+        assert_eq!(message, Press::Refused(dictation::MODEL_MISSING.to_owned()));
         assert!(control.session.is_none());
         assert!(matches!(control.dictation, Dictation::Idle));
     }
@@ -349,7 +367,10 @@ mod tests {
         let mut control = control(root.path());
         control.settings.model = Some(PathBuf::from("tiny.gguf"));
         let message = control.toggle(true).unwrap();
-        assert_eq!(message, dictation::MEETING_ACTIVE);
+        assert_eq!(
+            message,
+            Press::Refused(dictation::MEETING_ACTIVE.to_owned())
+        );
         assert!(control.session.is_none());
     }
 

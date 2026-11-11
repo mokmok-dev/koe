@@ -1,4 +1,5 @@
-//! The always-on-top overlay window that shows what a take is doing.
+//! The always-on-top overlay window that shows what a take or a dictation is
+//! doing.
 
 use gpui::{
     AnyWindowHandle, App, AppContext as _, Bounds, Context, Entity, FontWeight, IntoElement,
@@ -12,6 +13,9 @@ const TRACK: u32 = 0x002C_2C34;
 const LIVE: u32 = 0x007E_E787;
 const IDLE: u32 = 0x005A_5A62;
 const AMBER: u32 = 0x00F0_B429;
+const TRANSCRIPT_TEXT: u32 = 0x00E6_E6EA;
+/// The tray icon's colour for a dictation.
+const DICTATING: u32 = 0x00AF_52DE;
 
 /// The HUD view drawn inside the overlay window.
 pub struct HudView {
@@ -61,9 +65,10 @@ pub fn close(cx: &mut App, handle: AnyWindowHandle) {
 
 const fn phase_color(phase: HudPhase) -> u32 {
     match phase {
-        HudPhase::Starting => AMBER,
+        HudPhase::Starting | HudPhase::Refused => AMBER,
         HudPhase::Recording => 0x00FF_5A5F,
-        HudPhase::Saving => 0x0058_A6FF,
+        HudPhase::Saving | HudPhase::Transcribing => 0x0058_A6FF,
+        HudPhase::Listening => DICTATING,
     }
 }
 
@@ -111,7 +116,7 @@ impl Render for HudView {
                 )
         };
 
-        div()
+        let frame = div()
             .size_full()
             .rounded(px(18.0))
             .bg(rgba(0x1616_1AEE))
@@ -142,20 +147,46 @@ impl Render for HudView {
                     .text_size(px(24.0))
                     .text_color(rgb(0x00FF_FFFF))
                     .child(elapsed_text(state.elapsed)),
-            )
-            .child(meter(0, 48.0))
-            .child(meter(1, 58.0))
-            .children(state.warning.as_ref().map(|warning| {
-                div()
-                    .absolute()
-                    .left(px(EDGE_MARGIN))
-                    .bottom(px(6.0))
-                    .w(px(EDGE_MARGIN.mul_add(-2.0, HUD_WIDTH)))
-                    .overflow_hidden()
-                    .whitespace_nowrap()
-                    .text_size(px(11.0))
-                    .text_color(rgb(AMBER))
-                    .child(warning.clone())
-            }))
+            );
+        match state.phase {
+            HudPhase::Starting | HudPhase::Recording | HudPhase::Saving => frame
+                .child(meter(0, 48.0))
+                .child(meter(1, 58.0))
+                .children(state.warning.as_ref().map(|warning| {
+                    div()
+                        .absolute()
+                        .left(px(EDGE_MARGIN))
+                        .bottom(px(6.0))
+                        .w(px(EDGE_MARGIN.mul_add(-2.0, HUD_WIDTH)))
+                        .overflow_hidden()
+                        .whitespace_nowrap()
+                        .text_size(px(11.0))
+                        .text_color(rgb(AMBER))
+                        .child(warning.clone())
+                })),
+            HudPhase::Listening | HudPhase::Transcribing | HudPhase::Refused => {
+                // A refused press has no transcript, so its reason takes the
+                // transcript box rather than a second line beside it.
+                let (text, text_color) = state
+                    .warning
+                    .as_ref()
+                    .map_or((state.transcript.as_str(), TRANSCRIPT_TEXT), |warning| {
+                        (warning.as_str(), AMBER)
+                    });
+                frame.child(
+                    div()
+                        .absolute()
+                        .left(px(EDGE_MARGIN))
+                        .top(px(48.0))
+                        .w(px(EDGE_MARGIN.mul_add(-2.0, HUD_WIDTH)))
+                        .h(px(32.0))
+                        .line_clamp(2)
+                        .line_height(px(16.0))
+                        .text_size(px(12.0))
+                        .text_color(rgb(text_color))
+                        .child(text.to_owned()),
+                )
+            }
+        }
     }
 }

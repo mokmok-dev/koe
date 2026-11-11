@@ -20,7 +20,8 @@ pub const MEETING_ACTIVE: &str =
 ///
 /// The settings live in a file both shells read, so the sentence names the
 /// file rather than a window only one shell has.
-pub const MODEL_MISSING: &str = "Dictation needs a transcription model. Set one in the settings file or in the window's Dictation section.";
+pub const MODEL_MISSING: &str =
+    "Dictation needs a transcription model. Set one in the settings file.";
 
 /// A meeting start was refused because a dictation holds the microphone.
 pub const MEETING_BLOCKED: &str =
