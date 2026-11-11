@@ -20,7 +20,7 @@ use gpui_kit::component::{
 use koe_capture::Source;
 use koe_record::Format;
 
-use crate::gpui_app::Shell;
+use crate::app::Shell;
 use crate::hud;
 use crate::state::{Done, Phase, Sources};
 

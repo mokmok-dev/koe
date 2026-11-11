@@ -15,8 +15,8 @@ A privacy-first recording & transcription app.
 ## Desktop app
 
 The desktop app shows the recording state in the menu bar and an overlay HUD
-while a take runs. The Rune shell owns the window and the overlay, and
-`tray-icon` owns the menu bar item. Build it with the host feature:
+while a take runs. GPUI owns the window and the overlay, and `tray-icon` owns
+the menu bar item. Build it with the host feature:
 
 ```console
 cargo run -p koe-desktop --features linux
@@ -24,8 +24,7 @@ cargo run -p koe-desktop --features linux
 
 Use `--features macos` or `--features windows` on those platforms. The window
 holds the source, format, and folder controls. The tray icon and the overlay
-show the state while the window is hidden. The previous egui shell is still
-available with `--no-default-features --features egui,linux`. See
+show the state while the window is hidden. See
 [`apps/koe-desktop/README.md`](apps/koe-desktop/README.md) for the framework
 choice and the platform limits.
 

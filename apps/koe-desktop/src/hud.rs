@@ -1,7 +1,8 @@
-//! The state the overlay HUD draws.
+//! The HUD geometry, the take state it draws, and the text it shares with the
+//! window.
 //!
-//! Every pixel comes from [`HudState`], so a take in progress never reacts to
-//! a click that was meant for the app underneath.
+//! Every HUD pixel comes from [`HudState`], so a take in progress never
+//! reacts to a click that was meant for the app underneath.
 
 /// Width of the HUD window in points.
 pub const HUD_WIDTH: f32 = 340.0;

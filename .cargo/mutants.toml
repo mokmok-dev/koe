@@ -4,17 +4,14 @@
 # mutants would report as missed with no test able to run them.
 #
 # The desktop shell needs a window, a GPU, a tray host, audio devices, and the
-# platform file opener. Its state machine, error text, and wake-up callback stay
-# in scope; the UI and OS adapters would report untestable mutants.
+# platform file opener. Its state machine and error text stay in scope; the UI
+# and OS adapters would report untestable mutants.
 exclude_globs = [
   "crates/*/src/ffi.rs",
-  "apps/koe-desktop/src/gpui_app.rs",
-  "apps/koe-desktop/src/gpui_hud.rs",
-  "apps/koe-desktop/src/gpui_ui.rs",
+  "apps/koe-desktop/src/app.rs",
+  "apps/koe-desktop/src/overlay.rs",
+  "apps/koe-desktop/src/ui.rs",
   "apps/koe-desktop/src/hud.rs",
-  "apps/koe-desktop/src/rune_app.rs",
-  "apps/koe-desktop/src/rune_ui.rs",
-  "apps/koe-desktop/src/rune_hud.rs",
   "apps/koe-desktop/src/main.rs",
   "apps/koe-desktop/src/lib.rs",
   "apps/koe-desktop/src/icon.rs",
