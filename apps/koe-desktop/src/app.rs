@@ -30,6 +30,21 @@ use crate::ui::MainView;
 /// only needs to hold the sentence long enough to read it.
 const REFUSAL_HOLD: Duration = Duration::from_secs(5);
 
+/// How often the shell looks at a running dictation.
+///
+/// The dictation thread publishes a new transcript once per 20 ms audio block,
+/// and the speech models report tentative phrases between blocks. A tick
+/// slower than that samples the transcript instead of following it, which
+/// reads as words arriving a beat late.
+const DICTATION_TICK: Duration = Duration::from_millis(20);
+
+/// How often the shell looks at a running take or a dictation whose transcript
+/// nothing draws.
+///
+/// The take HUD redraws its meters from smoothed levels, and `KOE_HUD=off`
+/// leaves the transcript with no reader, so neither needs the dictation tick.
+const ACTIVE_TICK: Duration = Duration::from_millis(100);
+
 /// Which of the window's two screens is showing.
 ///
 /// The settings page selected inside gpui-kit's `Settings` is not part of this:
@@ -182,9 +197,17 @@ impl Shell {
             {
                 tick.quit = true;
             }
-            tick.delay = Duration::from_millis(100);
-        } else if self.phase.is_active() || self.dictation_control.dictation.is_active() {
-            tick.delay = Duration::from_millis(100);
+            tick.delay = ACTIVE_TICK;
+        } else if self.phase.is_active() {
+            tick.delay = ACTIVE_TICK;
+        } else if self.dictation_control.dictation.is_active() {
+            // Only the HUD reads the transcript; with `KOE_HUD=off` the slower
+            // tick keeps the tray and the state machine current for less work.
+            tick.delay = if self.hud_enabled {
+                DICTATION_TICK
+            } else {
+                ACTIVE_TICK
+            };
         } else if self.dictation_control.hotkeys.is_some() {
             // A press waits in the queue until the next tick. A dictation
             // start is where the lost audio is speech, so the idle tick that
