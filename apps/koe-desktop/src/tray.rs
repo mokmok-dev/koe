@@ -5,12 +5,9 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use tray_icon::menu::{Menu, MenuEvent, MenuId, MenuItem, PredefinedMenuItem};
-#[cfg(not(target_os = "macos"))]
-use tray_icon::{MouseButton, MouseButtonState};
 use tray_icon::{TrayIcon, TrayIconBuilder, TrayIconEvent};
 
 use crate::icon;
-use crate::repaint::Repaint;
 
 /// What the icon and menu show.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -70,16 +67,15 @@ pub struct Tray {
 }
 
 impl Tray {
-    /// Creates the icon and menu, and routes menu events to the UI repaint callback.
+    /// Creates the icon and menu, and queues the actions the user chooses.
     ///
     /// # Errors
     ///
     /// Returns the platform error when no tray host accepts the icon, which
     /// happens on a desktop without a `StatusNotifier` watcher.
-    pub fn new(repaint: Repaint, state: &TrayState) -> Result<Self, String> {
+    pub fn new(state: &TrayState) -> Result<Self, String> {
         let actions = Arc::new(Mutex::new(VecDeque::new()));
         let menu_actions = Arc::clone(&actions);
-        let menu_repaint = repaint.clone();
         MenuEvent::set_event_handler(Some(move |event: MenuEvent| {
             debug(&format!("menu {:?}", event.id.0));
             if let Some(action) = action_for(&event.id)
@@ -87,9 +83,13 @@ impl Tray {
             {
                 queue.push_back(action);
             }
-            menu_repaint();
         }));
-        TrayIconEvent::set_event_handler(Some(move |_event| repaint()));
+        // The app reads no icon events. Leaving the handler unset would queue
+        // them in a channel nothing drains, and on macOS and Windows Move
+        // arrives continuously as the pointer crosses the icon. On those same
+        // platforms a left click already opens the menu, so opening the window
+        // on that click would stack it under the menu.
+        TrayIconEvent::set_event_handler(Some(|_event| {}));
 
         let header = MenuItem::with_id("status", label(state), false, None);
         let start = MenuItem::with_id("start", "Start recording", state.can_start, None);
@@ -156,7 +156,7 @@ impl Tray {
         Ok(())
     }
 
-    /// Takes every menu and icon event that arrived.
+    /// Takes every action the user chose since the last call.
     #[must_use]
     pub fn poll(&self) -> Vec<TrayAction> {
         let mut actions = Vec::new();
@@ -165,28 +165,6 @@ impl Tray {
                 push_unique(&mut actions, action);
             }
         }
-        while let Ok(event) = MenuEvent::receiver().try_recv() {
-            if let Some(action) = action_for(&event.id) {
-                push_unique(&mut actions, action);
-            }
-        }
-        #[cfg(not(target_os = "macos"))]
-        while let Ok(event) = TrayIconEvent::receiver().try_recv() {
-            match event {
-                TrayIconEvent::Click {
-                    button: MouseButton::Left,
-                    button_state: MouseButtonState::Up,
-                    ..
-                }
-                | TrayIconEvent::DoubleClick {
-                    button: MouseButton::Left,
-                    ..
-                } => push_unique(&mut actions, TrayAction::Show),
-                _ => {}
-            }
-        }
-        #[cfg(target_os = "macos")]
-        while TrayIconEvent::receiver().try_recv().is_ok() {}
         actions
     }
 }

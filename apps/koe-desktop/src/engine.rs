@@ -15,7 +15,6 @@ use koe_capture::{Source, StreamSpec};
 use koe_record::{Channels, Recorder, RecordingSpec, Summary};
 
 use crate::error::DesktopError;
-use crate::repaint::Repaint;
 use crate::state::Sources;
 
 /// Sample rate every take uses.
@@ -118,14 +117,14 @@ impl Session {
     /// # Errors
     ///
     /// Returns [`DesktopError::Thread`] when the thread cannot be spawned.
-    pub fn start(plan: SessionPlan, repaint: Repaint) -> Result<Self, DesktopError> {
+    pub fn start(plan: SessionPlan) -> Result<Self, DesktopError> {
         let output = plan.output.clone();
         let (sender, events) = mpsc::channel();
         let stop = Arc::new(AtomicBool::new(false));
         let thread_stop = Arc::clone(&stop);
         thread::Builder::new()
             .name("koe-recorder".to_owned())
-            .spawn(move || run(&plan, &thread_stop, &sender, &repaint))
+            .spawn(move || run(&plan, &thread_stop, &sender))
             .map_err(|error| DesktopError::Thread(error.to_string()))?;
         Ok(Self {
             output,
@@ -158,17 +157,12 @@ impl Drop for Session {
     }
 }
 
-fn run(
-    plan: &SessionPlan,
-    stop: &Arc<AtomicBool>,
-    sender: &Sender<EngineEvent>,
-    repaint: &Repaint,
-) {
+fn run(plan: &SessionPlan, stop: &Arc<AtomicBool>, sender: &Sender<EngineEvent>) {
     let output = plan.output.clone();
     let mut recorder = match Recorder::create(&plan.output, plan.spec) {
         Ok(recorder) => recorder,
         Err(error) => {
-            finish(sender, repaint, output, None, Some(error.into()));
+            finish(sender, output, None, Some(error.into()));
             return;
         }
     };
@@ -176,7 +170,7 @@ fn run(
         if let Err(error) = recorder.add_source(*source, spec) {
             let failure = Some(error.into());
             let closed = recorder.finish();
-            finish(sender, repaint, output, closed.ok(), failure);
+            finish(sender, output, closed.ok(), failure);
             return;
         }
     }
@@ -187,9 +181,8 @@ fn run(
             let spec = *spec;
             let sender = sender.clone();
             let stop = Arc::clone(stop);
-            let repaint = Arc::clone(repaint);
             let recorder = &recorder;
-            scope.spawn(move || pump(source, spec, &sender, &stop, recorder, &repaint));
+            scope.spawn(move || pump(source, spec, &sender, &stop, recorder));
         }
     });
     let recorder = recorder
@@ -197,8 +190,8 @@ fn run(
         .unwrap_or_else(PoisonError::into_inner);
     let summary = recorder.finish();
     match summary {
-        Ok(summary) => finish(sender, repaint, output, Some(summary), None),
-        Err(error) => finish(sender, repaint, output, None, Some(error.into())),
+        Ok(summary) => finish(sender, output, Some(summary), None),
+        Err(error) => finish(sender, output, None, Some(error.into())),
     }
 }
 
@@ -208,22 +201,17 @@ fn pump(
     sender: &Sender<EngineEvent>,
     stop: &AtomicBool,
     recorder: &Mutex<Recorder>,
-    repaint: &Repaint,
 ) {
     let mut stream = match koe_capture::open(&spec) {
         Ok(stream) => {
-            send(sender, repaint, EngineEvent::Opened(source));
+            let _ = sender.send(EngineEvent::Opened(source));
             Some(stream)
         }
         Err(error) => {
-            send(
-                sender,
-                repaint,
-                EngineEvent::Lost {
-                    source,
-                    message: error.to_string(),
-                },
-            );
+            let _ = sender.send(EngineEvent::Lost {
+                source,
+                message: error.to_string(),
+            });
             None
         }
     };
@@ -238,14 +226,10 @@ fn pump(
             match stream.read(&mut buffer) {
                 Ok(0) => {
                     if !stop.load(Ordering::Acquire) {
-                        send(
-                            sender,
-                            repaint,
-                            EngineEvent::Lost {
-                                source,
-                                message: "the capture stream ended".to_owned(),
-                            },
-                        );
+                        let _ = sender.send(EngineEvent::Lost {
+                            source,
+                            message: "the capture stream ended".to_owned(),
+                        });
                     }
                     break;
                 }
@@ -253,39 +237,27 @@ fn pump(
                     let samples = &buffer[..frames * channels];
                     if last_level.elapsed() >= LEVEL_INTERVAL {
                         last_level = Instant::now();
-                        send(
-                            sender,
-                            repaint,
-                            EngineEvent::Level {
-                                source,
-                                level: peak(samples),
-                            },
-                        );
+                        let _ = sender.send(EngineEvent::Level {
+                            source,
+                            level: peak(samples),
+                        });
                     }
                     let mut guard = recorder.lock().unwrap_or_else(PoisonError::into_inner);
                     let written = guard.write(source, samples);
                     drop(guard);
                     if let Err(error) = written {
-                        send(
-                            sender,
-                            repaint,
-                            EngineEvent::Lost {
-                                source,
-                                message: error.to_string(),
-                            },
-                        );
+                        let _ = sender.send(EngineEvent::Lost {
+                            source,
+                            message: error.to_string(),
+                        });
                         break;
                     }
                 }
                 Err(error) => {
-                    send(
-                        sender,
-                        repaint,
-                        EngineEvent::Lost {
-                            source,
-                            message: error.to_string(),
-                        },
-                    );
+                    let _ = sender.send(EngineEvent::Lost {
+                        source,
+                        message: error.to_string(),
+                    });
                     break;
                 }
             }
@@ -295,7 +267,7 @@ fn pump(
     let ended = guard.end(source);
     drop(guard);
     if let Err(error) = ended {
-        send(sender, repaint, EngineEvent::Warning(error.to_string()));
+        let _ = sender.send(EngineEvent::Warning(error.to_string()));
     }
 }
 
@@ -308,26 +280,15 @@ fn peak(samples: &[f32]) -> f32 {
 
 fn finish(
     sender: &Sender<EngineEvent>,
-    repaint: &Repaint,
     output: PathBuf,
     summary: Option<Summary>,
     failure: Option<DesktopError>,
 ) {
-    send(
-        sender,
-        repaint,
-        EngineEvent::Finished(Box::new(Completion {
-            output,
-            summary,
-            failure,
-        })),
-    );
-}
-
-fn send(sender: &Sender<EngineEvent>, repaint: &Repaint, event: EngineEvent) {
-    if sender.send(event).is_ok() {
-        repaint();
-    }
+    let _ = sender.send(EngineEvent::Finished(Box::new(Completion {
+        output,
+        summary,
+        failure,
+    })));
 }
 
 #[cfg(test)]

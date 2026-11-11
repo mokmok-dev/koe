@@ -1,7 +1,6 @@
 //! The GPUI shell: window, overlay HUD, and the menu bar item.
 //!
-//! GPUI owns the application loop. The tray is `tray-icon`, and both shells
-//! share the recording state machine, the recorder thread, and the settings.
+//! GPUI owns the application loop and the tray is `tray-icon`.
 
 use std::time::{Duration, Instant};
 
@@ -14,13 +13,12 @@ use gpui::{
 use gpui_kit::component::{Theme, ThemeMode, TitleBar};
 
 use crate::engine::{self, Completion, EngineEvent};
-use crate::gpui_hud;
-use crate::gpui_ui::MainView;
 use crate::hud::{HudPhase, HudState};
-use crate::repaint::repaint;
+use crate::overlay;
 use crate::settings::{self, Settings};
 use crate::state::{Action, Event, Phase, Sources};
 use crate::tray::{Tray, TrayAction, TrayState, TrayStatus};
+use crate::ui::MainView;
 
 /// The shell's state, shared by the window, the tray, and the tick loop.
 #[allow(
@@ -40,7 +38,7 @@ pub struct Shell {
     quit_deadline: Option<Instant>,
     window: Option<AnyWindowHandle>,
     hud: Option<AnyWindowHandle>,
-    hud_view: Option<Entity<gpui_hud::HudView>>,
+    hud_view: Option<Entity<overlay::HudView>>,
     last_hud: Option<HudState>,
     hud_enabled: bool,
     pending_show: bool,
@@ -162,7 +160,7 @@ impl Shell {
         if self.tray.is_some() || self.tray_error.is_some() {
             return false;
         }
-        match Tray::new(repaint(|| {}), &self.tray_state()) {
+        match Tray::new(&self.tray_state()) {
             Ok(tray) => {
                 self.tray = Some(tray);
                 self.last_tray = Some(self.tray_state());
@@ -219,7 +217,7 @@ impl Shell {
         match action {
             Action::Start(plan) => {
                 let output = plan.output.clone();
-                match engine::Session::start(plan, repaint(|| {})) {
+                match engine::Session::start(plan) {
                     Ok(session) => {
                         self.session = Some(session);
                         self.levels = [0.0; 2];
@@ -376,7 +374,7 @@ impl Shell {
             return false;
         }
         if self.hud.is_none() {
-            let Some((handle, view)) = gpui_hud::open(cx, next.clone()) else {
+            let Some((handle, view)) = overlay::open(cx, next.clone()) else {
                 return false;
             };
             self.hud = Some(handle);
@@ -526,7 +524,7 @@ pub fn run() {
                         cx.update(|cx| hide_main_window(cx, &shell));
                     }
                     if let Some(handle) = tick.hud_close {
-                        cx.update(|cx| gpui_hud::close(cx, handle));
+                        cx.update(|cx| overlay::close(cx, handle));
                     }
                     if tick.quit {
                         cx.update(|cx| cx.quit());
