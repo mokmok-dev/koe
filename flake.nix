@@ -162,10 +162,9 @@
                 // {
                   inherit cargoArtifacts;
                   pname = "koe-mutants";
-                  nativeBuildInputs = [
+                  nativeBuildInputs = cargoCommonArgs.nativeBuildInputs ++ [
                     pkgs.cargo-mutants
                     pkgs.cargo-nextest
-                    pkgs.cmake
                   ];
                   doCheck = false;
                   buildPhaseCargoCommand = "";
