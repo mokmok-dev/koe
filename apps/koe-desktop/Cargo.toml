@@ -14,12 +14,17 @@ name = "koe-desktop"
 path = "src/main.rs"
 
 [dependencies]
+enigo = "0.6"
+global-hotkey = "0.10"
 gpui-kit.workspace = true
 koe-capture.workspace = true
 koe-record.workspace = true
+koe-transcribe.workspace = true
 
 [target.'cfg(target_os = "linux")'.dependencies]
+arboard = "3"
 tray-icon = { version = "0.26.1", default-features = false, features = ["ksni"] }
+x11rb = "0.13"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 tray-icon = { version = "0.26.1", default-features = false }
@@ -31,9 +36,9 @@ tray-icon = { version = "0.26.1", default-features = false }
 tempfile.workspace = true
 
 [features]
-linux = ["koe-capture/linux"]
-macos = ["koe-capture/macos"]
-windows = ["koe-capture/windows"]
+linux = ["koe-capture/linux", "koe-transcribe/linux"]
+macos = ["koe-capture/macos", "koe-transcribe/macos"]
+windows = ["koe-capture/windows", "koe-transcribe/windows"]
 
 [lints]
 workspace = true

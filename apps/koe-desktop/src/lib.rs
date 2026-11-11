@@ -3,8 +3,13 @@
 //! The recorder and the tray are UI-independent.
 
 pub mod app;
+pub mod dictation;
+
+pub mod dictation_control;
+pub mod dictation_worker;
 pub mod engine;
 pub mod error;
+pub mod hotkey;
 pub mod hud;
 pub mod icon;
 pub mod overlay;

@@ -39,6 +39,7 @@ const fn colour(status: TrayStatus) -> [u8; 3] {
         TrayStatus::Saving => [88, 166, 255],
         TrayStatus::Saved => [126, 231, 135],
         TrayStatus::Failed => [255, 123, 114],
+        TrayStatus::Dictating => [175, 82, 222],
     }
 }
 

@@ -28,6 +28,10 @@ pub enum DesktopError {
         /// Path that already exists.
         path: PathBuf,
     },
+    /// The transcription backend refused a call.
+    Transcribe(koe_transcribe::Error),
+    /// A dictation could not run to typed text.
+    Dictation(String),
     /// The menu bar icon could not be created.
     Tray(String),
     /// The recorder thread could not start.
@@ -44,6 +48,8 @@ impl DesktopError {
             Self::Io { .. } => "The recordings folder is not accessible",
             Self::NoSources => "Select at least one source",
             Self::OutputExists { .. } => "The output file already exists",
+            Self::Transcribe(_) => "Transcription failed",
+            Self::Dictation(_) => "Dictation failed",
             Self::Tray(_) => "The menu bar icon is unavailable",
             Self::Thread(_) => "The recorder did not start",
         }
@@ -74,6 +80,10 @@ impl fmt::Display for DesktopError {
             Self::OutputExists { path } => {
                 write!(formatter, "{} already exists", path.display())
             }
+            Self::Transcribe(error) => write!(formatter, "transcription failed: {error}"),
+            Self::Dictation(message) => {
+                write!(formatter, "dictation failed: {message}")
+            }
             Self::Tray(message) => write!(formatter, "menu bar icon unavailable: {message}"),
             Self::Thread(message) => write!(formatter, "recorder thread did not start: {message}"),
         }
@@ -86,7 +96,12 @@ impl std::error::Error for DesktopError {
             Self::Capture(error) => Some(error),
             Self::Record(error) => Some(error),
             Self::Io { source, .. } => Some(source),
-            Self::NoSources | Self::OutputExists { .. } | Self::Tray(_) | Self::Thread(_) => None,
+            Self::Transcribe(error) => Some(error),
+            Self::NoSources
+            | Self::OutputExists { .. }
+            | Self::Dictation(_)
+            | Self::Tray(_)
+            | Self::Thread(_) => None,
         }
     }
 }
@@ -122,6 +137,8 @@ mod tests {
             DesktopError::OutputExists {
                 path: PathBuf::from("/tmp/koe.ogg"),
             },
+            DesktopError::Transcribe(koe_transcribe::Error::Unsupported),
+            DesktopError::Dictation("no display".to_owned()),
             DesktopError::Tray("no host".to_owned()),
             DesktopError::Thread("spawn failed".to_owned()),
         ]
@@ -138,6 +155,8 @@ mod tests {
                 "The recordings folder is not accessible",
                 "Select at least one source",
                 "The output file already exists",
+                "Transcription failed",
+                "Dictation failed",
                 "The menu bar icon is unavailable",
                 "The recorder did not start",
             ]
@@ -168,6 +187,14 @@ mod tests {
             DesktopError::Thread("spawn failed".to_owned()).to_string(),
             "recorder thread did not start: spawn failed"
         );
+        assert_eq!(
+            DesktopError::Dictation("no display".to_owned()).to_string(),
+            "dictation failed: no display"
+        );
+        assert_eq!(
+            DesktopError::Transcribe(koe_transcribe::Error::Unsupported).to_string(),
+            "transcription failed: no speech-to-text backend is enabled"
+        );
         let io_error = DesktopError::io(
             "create",
             "/tmp/koe",
@@ -181,7 +208,10 @@ mod tests {
         for error in samples() {
             let expected = matches!(
                 error,
-                DesktopError::Capture(_) | DesktopError::Record(_) | DesktopError::Io { .. }
+                DesktopError::Capture(_)
+                    | DesktopError::Record(_)
+                    | DesktopError::Io { .. }
+                    | DesktopError::Transcribe(_)
             );
             assert_eq!(error.source().is_some(), expected);
         }

@@ -2,6 +2,7 @@
 //!
 //! GPUI owns the application loop and the tray is `tray-icon`.
 
+use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 #[cfg(target_os = "macos")]
@@ -12,6 +13,8 @@ use gpui::{
 };
 use gpui_kit::component::{Theme, ThemeMode, TitleBar};
 
+use crate::dictation;
+use crate::dictation_control::DictationControl;
 use crate::engine::{self, Completion, EngineEvent};
 use crate::hud::{HudPhase, HudState};
 use crate::overlay;
@@ -19,6 +22,16 @@ use crate::settings::{self, Settings};
 use crate::state::{Action, Event, Phase, Sources};
 use crate::tray::{Tray, TrayAction, TrayState, TrayStatus};
 use crate::ui::MainView;
+
+/// Which of the window's two screens is showing.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum Screen {
+    /// The take status, the start and stop control, and the last take.
+    #[default]
+    Recorder,
+    /// The dictation settings, the sources, the format, and the folder.
+    Settings,
+}
 
 /// The shell's state, shared by the window, the tray, and the tick loop.
 #[allow(
@@ -28,11 +41,13 @@ use crate::ui::MainView;
 pub struct Shell {
     pub(crate) phase: Phase,
     pub(crate) settings: Settings,
+    pub(crate) screen: Screen,
     pub(crate) session: Option<engine::Session>,
     pub(crate) levels: [f32; 2],
     pub(crate) tray: Option<Tray>,
     pub(crate) tray_error: Option<String>,
     pub(crate) notice: Option<String>,
+    pub(crate) dictation_control: DictationControl,
     last_tray: Option<TrayState>,
     quitting: bool,
     quit_deadline: Option<Instant>,
@@ -71,14 +86,17 @@ impl Shell {
     /// Builds the shell with the tray unmounted; the first tick mounts it.
     #[must_use]
     pub fn new() -> Self {
+        let (dictation_control, warning) = DictationControl::load();
         Self {
             phase: Phase::Idle,
             settings: Settings::default(),
+            screen: Screen::Recorder,
             session: None,
             levels: [0.0; 2],
             tray: None,
             tray_error: None,
-            notice: None,
+            notice: warning,
+            dictation_control,
             last_tray: None,
             quitting: false,
             quit_deadline: None,
@@ -98,6 +116,7 @@ impl Shell {
     pub fn tick(&mut self, cx: &mut Context<Self>) -> Tick {
         let mut changed = false;
         changed |= self.ensure_tray();
+        changed |= self.ensure_dictation();
         let actions = self.tray.as_ref().map(Tray::poll).unwrap_or_default();
         for action in actions {
             if std::env::var_os("KOE_TRAY_DEBUG").is_some() {
@@ -106,7 +125,19 @@ impl Shell {
             self.handle_tray(action, cx);
             changed = true;
         }
+        let presses = self.dictation_control.presses();
+        for _ in 0..presses {
+            if let Some(message) = self.dictation_control.toggle(self.phase.is_active()) {
+                self.notice = Some(message);
+                self.show_window();
+            }
+        }
+        changed |= presses > 0;
         changed |= self.poll_engine();
+        if let Some(message) = self.dictation_control.poll() {
+            self.notice = Some(message);
+            changed = true;
+        }
         changed |= self.sync_tray();
         changed |= self.sync_hud(cx);
         if changed {
@@ -124,12 +155,19 @@ impl Shell {
             let deadline_passed = self
                 .quit_deadline
                 .is_some_and(|deadline| Instant::now() >= deadline);
-            if self.session.is_none() || deadline_passed {
+            if (self.session.is_none() && self.dictation_control.session.is_none())
+                || deadline_passed
+            {
                 tick.quit = true;
             }
             tick.delay = Duration::from_millis(100);
-        } else if self.phase.is_active() {
+        } else if self.phase.is_active() || self.dictation_control.dictation.is_active() {
             tick.delay = Duration::from_millis(100);
+        } else if self.dictation_control.hotkeys.is_some() {
+            // A press waits in the queue until the next tick. A dictation
+            // start is where the lost audio is speech, so the idle tick that
+            // polls for presses is five times faster than the tray's.
+            tick.delay = Duration::from_millis(50);
         }
         tick.show = self.pending_show;
         tick.hide = self.pending_hide;
@@ -172,6 +210,17 @@ impl Shell {
                 true
             }
         }
+    }
+
+    /// Mounts the dictation side: the binding and its failure banner.
+    fn ensure_dictation(&mut self) -> bool {
+        let message = self.dictation_control.mount();
+        if let Some(message) = message {
+            self.notice = Some(message);
+            self.show_window();
+            return true;
+        }
+        false
     }
 
     fn poll_engine(&mut self) -> bool {
@@ -256,6 +305,12 @@ impl Shell {
         if !self.phase.can_start() {
             return;
         }
+        if let Err(message) = dictation::meeting_start_allowed(&self.dictation_control.dictation) {
+            self.notice = Some(message.to_owned());
+            self.show_window();
+            cx.notify();
+            return;
+        }
         self.notice = None;
         let plan = match self.settings.plan() {
             Ok(plan) => plan,
@@ -290,6 +345,49 @@ impl Shell {
         cx.notify();
     }
 
+    /// Clears a finished dictation's result.
+    pub fn dismiss_dictation(&mut self, cx: &mut Context<Self>) {
+        self.notice = None;
+        self.dictation_control.dismiss();
+        cx.notify();
+    }
+
+    /// Switches to the settings screen.
+    pub fn show_settings(&mut self, cx: &mut Context<Self>) {
+        self.screen = Screen::Settings;
+        cx.notify();
+    }
+
+    /// Switches to the recorder screen.
+    pub fn show_recorder(&mut self, cx: &mut Context<Self>) {
+        self.screen = Screen::Recorder;
+        cx.notify();
+    }
+
+    /// Commits the hotkey field's draft on Enter.
+    ///
+    /// The binding is committed here rather than while the user types,
+    /// because every valid intermediate prefix of a binding is a real
+    /// shortcut: typing toward `Ctrl+Shift+Space` passes through `Ctrl+S`,
+    /// which a live rebind would grab system-wide.
+    pub fn apply_hotkey(&mut self, draft: &str, cx: &mut Context<Self>) {
+        self.notice = self.dictation_control.apply_hotkey(draft);
+        cx.notify();
+    }
+
+    /// Persists the model and language fields.
+    pub fn apply_dictation_settings(
+        &mut self,
+        model: Option<PathBuf>,
+        language: Option<String>,
+        cx: &mut Context<Self>,
+    ) {
+        if let Err(error) = self.dictation_control.apply_settings(model, language) {
+            self.notice = Some(error.to_string());
+        }
+        cx.notify();
+    }
+
     /// Opens the recordings folder.
     pub fn open_folder(&mut self, cx: &mut Context<Self>) {
         if let Err(error) = settings::open_directory(&self.settings.directory) {
@@ -312,11 +410,17 @@ impl Shell {
         cx.notify();
     }
 
-    /// Stops the take, waits up to two seconds for the file, then quits.
+    /// Stops the take and the dictation, waits up to two seconds for their
+    /// work, then quits.
     pub fn quit(&mut self, cx: &mut Context<Self>) {
         self.quitting = true;
+        // A dictation stops and commits like a take: both get the same
+        // bounded wait for their text or their file.
+        self.dictation_control.stop();
         if let Some(session) = &self.session {
             session.stop();
+        }
+        if self.session.is_some() || self.dictation_control.session.is_some() {
             self.quit_deadline = Some(Instant::now() + Duration::from_secs(2));
         } else {
             self.pending_quit = true;
@@ -328,7 +432,17 @@ impl Shell {
         match action {
             TrayAction::Start => self.start_recording(cx),
             TrayAction::Stop => self.stop_recording(cx),
+            TrayAction::CancelDictation => {
+                if self.dictation_control.cancel() {
+                    self.notice = None;
+                }
+            }
+            // The menu item opens the window on its settings screen.
             TrayAction::Show => self.show_window(),
+            TrayAction::ShowSettings => {
+                self.screen = Screen::Settings;
+                self.show_window();
+            }
             TrayAction::OpenFolder => self.open_folder(cx),
             TrayAction::Quit => self.quit(cx),
         }
@@ -391,26 +505,34 @@ impl Shell {
     }
 
     fn tray_state(&self) -> TrayState {
-        let status = match &self.phase {
-            Phase::Idle => TrayStatus::Ready,
-            Phase::Arming { .. } => TrayStatus::Starting,
-            Phase::Recording(_) => TrayStatus::Recording,
-            Phase::Stopping { .. } => TrayStatus::Saving,
-            Phase::Done(done) if done.failed() => TrayStatus::Failed,
-            Phase::Done(_) => TrayStatus::Saved,
+        let active = self.dictation_control.dictation.is_active();
+        let status = if active {
+            TrayStatus::Dictating
+        } else {
+            match &self.phase {
+                Phase::Idle => TrayStatus::Ready,
+                Phase::Arming { .. } => TrayStatus::Starting,
+                Phase::Recording(_) => TrayStatus::Recording,
+                Phase::Stopping { .. } => TrayStatus::Saving,
+                Phase::Done(done) if done.failed() => TrayStatus::Failed,
+                Phase::Done(_) => TrayStatus::Saved,
+            }
+        };
+        let elapsed = if active {
+            self.dictation_control.dictation.elapsed(Instant::now())
+        } else {
+            self.phase.elapsed(Instant::now())
         };
         TrayState {
             status,
-            elapsed: self
-                .phase
-                .elapsed(Instant::now())
-                .map(|elapsed| Duration::from_secs(elapsed.as_secs())),
+            elapsed: elapsed.map(|elapsed| Duration::from_secs(elapsed.as_secs())),
             detail: self
                 .notice
                 .clone()
                 .or_else(|| self.phase.warning().map(str::to_owned)),
-            can_start: self.phase.can_start() && !self.settings.sources.is_empty(),
+            can_start: self.phase.can_start() && !self.settings.sources.is_empty() && !active,
             can_stop: self.phase.can_stop(),
+            can_cancel: active,
         }
     }
 
@@ -462,8 +584,8 @@ fn open_main_window(cx: &mut App, shell: &Entity<Shell>) {
     }
     let options = main_window_options(cx);
     let view = shell.clone();
-    match gpui_kit::open_window(options, cx, move |_, cx| {
-        cx.new(move |cx| MainView::new(view, cx))
+    match gpui_kit::open_window(options, cx, move |window, cx| {
+        cx.new(move |cx| MainView::new(view, window, cx))
     }) {
         Ok((handle, _)) => {
             shell.update(cx, |shell, _| shell.window = Some(handle));
