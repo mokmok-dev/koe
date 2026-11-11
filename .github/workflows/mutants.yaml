@@ -45,7 +45,9 @@ jobs:
         run: git diff --no-color "origin/$BASE_REF...HEAD" > "$RUNNER_TEMP/changed.diff"
       - name: Run mutants
         env:
-          DIFF: ${{ github.event_name == 'pull_request' && format('{0}/changed.diff', runner.temp) }}
+          # Without the `|| ''` a non-pull_request event yields the boolean
+          # false, which GitHub passes as the literal string "false".
+          DIFF: ${{ github.event_name == 'pull_request' && format('{0}/changed.diff', runner.temp) || '' }}
         run: |
           # The ggml backend rebuilds its C++ library per mutant, and the bundled
           # libopus rebuild dwarfs the recording crate's run.
