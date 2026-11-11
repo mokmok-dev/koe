@@ -1,9 +1,8 @@
-//! The dictation side of a shell, shared by both UIs.
+//! The dictation side of a shell.
 //!
-//! The Rune and GPUI shells embed one [`DictationControl`] and hand it their
-//! repaint callback; mounting the hotkey, driving the machine, and running
-//! the worker are written once. What stays with the shells is theirs: their
-//! notice slot, their window, and their meeting take.
+//! The shell embeds one [`DictationControl`]; mounting the hotkey, driving
+//! the machine, and running the worker are written once. What stays with the
+//! shell is its own: the notice slot, the window, and the meeting take.
 
 use std::path::{Path, PathBuf};
 use std::time::Instant;
@@ -14,7 +13,6 @@ use crate::dictation::{self, Dictation, DictationContext, DictationEvent, Dictat
 use crate::dictation_worker;
 use crate::error::DesktopError;
 use crate::hotkey::{self, Hotkeys};
-use crate::repaint::{Repaint, repaint};
 use crate::settings::{self, DictationSettings};
 
 /// The dictation machine, thread, settings, and hotkey of one shell.
@@ -30,7 +28,6 @@ pub struct DictationControl {
     /// Why no binding is registered, when none is.
     pub hotkey_error: Option<String>,
     settings_path: PathBuf,
-    repaint: Option<Repaint>,
 }
 
 impl DictationControl {
@@ -62,7 +59,6 @@ impl DictationControl {
                 hotkeys: None,
                 hotkey_error: None,
                 settings_path: path.to_path_buf(),
-                repaint: None,
             },
             warning,
         )
@@ -76,12 +72,11 @@ impl DictationControl {
     /// # Errors
     ///
     /// Returns the failure to show as a notice, when registration fails.
-    pub fn mount(&mut self, repaint: &Repaint) -> Option<String> {
+    pub fn mount(&mut self) -> Option<String> {
         if self.hotkeys.is_some() || self.hotkey_error.is_some() {
             return None;
         }
-        self.repaint = Some(repaint.clone());
-        match Hotkeys::new(self.settings.hotkey, repaint.clone()) {
+        match Hotkeys::new(self.settings.hotkey) {
             Ok(hotkeys) => {
                 self.hotkeys = Some(hotkeys);
                 None
@@ -251,7 +246,7 @@ impl DictationControl {
 
     /// Registers `hotkey` as a mount or a retry of a failed one.
     fn remount(&mut self, hotkey: HotKey) -> Option<String> {
-        match Hotkeys::new(hotkey, self.repaint()) {
+        match Hotkeys::new(hotkey) {
             Ok(hotkeys) => {
                 self.hotkeys = Some(hotkeys);
                 self.hotkey_error = None;
@@ -265,7 +260,7 @@ impl DictationControl {
     fn run(&mut self, action: dictation::DictationAction) -> Option<String> {
         match action {
             dictation::DictationAction::Start(plan) => {
-                match dictation_worker::Session::start(plan, self.repaint()) {
+                match dictation_worker::Session::start(plan) {
                     Ok(session) => {
                         self.session = Some(session);
                         None
@@ -299,11 +294,6 @@ impl DictationControl {
             }
             dictation::DictationAction::Refuse(message) => Some(message.to_owned()),
         }
-    }
-
-    /// The repaint callback the shell handed over, or a no-op.
-    fn repaint(&self) -> Repaint {
-        self.repaint.clone().unwrap_or_else(|| repaint(|| {}))
     }
 }
 
@@ -431,9 +421,8 @@ mod tests {
     fn a_second_mount_does_nothing_after_the_first() {
         let root = tempfile::tempdir().unwrap();
         let mut control = control(root.path());
-        let waker = repaint(|| {});
-        let _ = control.mount(&waker);
-        assert_eq!(control.mount(&waker), None);
+        let _ = control.mount();
+        assert_eq!(control.mount(), None);
     }
 
     // The microphone opens before the model loads, and a headless macOS

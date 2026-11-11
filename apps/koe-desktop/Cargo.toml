@@ -16,14 +16,10 @@ path = "src/main.rs"
 [dependencies]
 enigo = "0.6"
 global-hotkey = "0.10"
-gpui-kit = { workspace = true, optional = true }
+gpui-kit.workspace = true
 koe-capture.workspace = true
 koe-record.workspace = true
 koe-transcribe.workspace = true
-rune = { git = "https://github.com/anomalyco/rune.git", rev = "781e2b6d87cd5f32d6f4365956fad4baaf24ee50", default-features = false, features = [
-  "embedded-fonts",
-  "metal-backend"
-], optional = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 arboard = "3"
@@ -40,9 +36,6 @@ tray-icon = { version = "0.26.1", default-features = false }
 tempfile.workspace = true
 
 [features]
-default = ["rune-ui"]
-gpui = ["dep:gpui-kit"]
-rune-ui = ["dep:rune"]
 linux = ["koe-capture/linux", "koe-transcribe/linux"]
 macos = ["koe-capture/macos", "koe-transcribe/macos"]
 windows = ["koe-capture/windows", "koe-transcribe/windows"]

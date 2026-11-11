@@ -26,7 +26,6 @@ use koe_transcribe::{AudioSpec, LiveSession, Options, Transcriber};
 use crate::dictation::{DictationOutcome, DictationPlan};
 use crate::engine::SAMPLE_RATE;
 use crate::error::DesktopError;
-use crate::repaint::Repaint;
 
 /// Frames each microphone read delivers, one mono channel wide.
 const BLOCK_FRAMES: usize = 960;
@@ -67,7 +66,7 @@ impl Session {
     /// # Errors
     ///
     /// Returns [`DesktopError::Thread`] when the thread cannot be spawned.
-    pub fn start(plan: DictationPlan, repaint: Repaint) -> Result<Self, DesktopError> {
+    pub fn start(plan: DictationPlan) -> Result<Self, DesktopError> {
         let (sender, events) = mpsc::channel();
         let stop = Arc::new(AtomicBool::new(false));
         let cancel = Arc::new(AtomicBool::new(false));
@@ -75,7 +74,7 @@ impl Session {
         let thread_cancel = Arc::clone(&cancel);
         thread::Builder::new()
             .name("koe-dictation".to_owned())
-            .spawn(move || run(&plan, &thread_stop, &thread_cancel, &sender, &repaint))
+            .spawn(move || run(&plan, &thread_stop, &thread_cancel, &sender))
             .map_err(|error| DesktopError::Thread(error.to_string()))?;
         Ok(Self {
             stop,
@@ -129,12 +128,9 @@ fn run(
     stop: &Arc<AtomicBool>,
     cancel: &Arc<AtomicBool>,
     sender: &Sender<Box<DictationOutcome>>,
-    repaint: &Repaint,
 ) {
     let outcome = capture(plan, stop, cancel);
-    if sender.send(Box::new(outcome)).is_ok() {
-        repaint();
-    }
+    let _ = sender.send(Box::new(outcome));
 }
 
 /// Captures the microphone, transcribes it, and inserts the result.

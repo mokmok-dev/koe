@@ -129,7 +129,7 @@
 
               # The facades reject `--all-features` and accept exactly one
               # platform feature, so the host feature is named per package.
-              hostFeatures = "koe-capture/${platformFeature},koe-transcribe/${platformFeature},koe-cli/${platformFeature},koe-desktop/${platformFeature},koe-desktop/gpui";
+              hostFeatures = "koe-capture/${platformFeature},koe-transcribe/${platformFeature},koe-cli/${platformFeature},koe-desktop/${platformFeature}";
               hostArgs = cargoCommonArgs // {
                 inherit cargoArtifacts;
                 cargoClippyExtraArgs = "--workspace --all-targets --features ${hostFeatures} -- --deny warnings";
@@ -162,10 +162,9 @@
                 // {
                   inherit cargoArtifacts;
                   pname = "koe-mutants";
-                  nativeBuildInputs = [
+                  nativeBuildInputs = cargoCommonArgs.nativeBuildInputs ++ [
                     pkgs.cargo-mutants
                     pkgs.cargo-nextest
-                    pkgs.cmake
                   ];
                   doCheck = false;
                   buildPhaseCargoCommand = "";

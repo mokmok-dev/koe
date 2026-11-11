@@ -17,8 +17,6 @@ use std::sync::{Arc, Mutex};
 use global_hotkey::hotkey::{Code, HotKey, Modifiers};
 use global_hotkey::{GlobalHotKeyEvent, GlobalHotKeyManager, HotKeyState};
 
-use crate::repaint::Repaint;
-
 /// The binding a fresh install uses.
 ///
 /// `Ctrl+Shift+Space` is free at the OS level on Windows, macOS, and the
@@ -133,7 +131,7 @@ pub struct Hotkeys {
 static PRESSES: std::sync::OnceLock<Arc<Mutex<VecDeque<u32>>>> = std::sync::OnceLock::new();
 
 /// Installs the handler once and returns the queue it feeds.
-fn press_queue(repaint: Repaint) -> Arc<Mutex<VecDeque<u32>>> {
+fn press_queue() -> Arc<Mutex<VecDeque<u32>>> {
     PRESSES
         .get_or_init(move || {
             let presses = Arc::new(Mutex::new(VecDeque::new()));
@@ -144,7 +142,6 @@ fn press_queue(repaint: Repaint) -> Arc<Mutex<VecDeque<u32>>> {
                 {
                     queue.push_back(event.id);
                 }
-                repaint();
             }));
             presses
         })
@@ -152,10 +149,11 @@ fn press_queue(repaint: Repaint) -> Arc<Mutex<VecDeque<u32>>> {
 }
 
 impl Hotkeys {
-    /// Registers `hotkey` system-wide and routes presses to the UI repaint.
+    /// Registers `hotkey` system-wide and queues its presses for the tick
+    /// loop to drain.
     ///
     /// On macOS and Windows the manager must live on the thread that runs the
-    /// event loop, which every koe shell does.
+    /// event loop, which the koe shell does.
     ///
     /// # Errors
     ///
@@ -164,7 +162,7 @@ impl Hotkeys {
     /// `global-hotkey` swallows registration failures, returns the
     /// reachability probe's error: a session without an X server (Wayland
     /// without `XWayland`, or no display at all) cannot fire the grab.
-    pub fn new(hotkey: HotKey, repaint: Repaint) -> Result<Self, String> {
+    pub fn new(hotkey: HotKey) -> Result<Self, String> {
         // The Linux manager returns Ok even when its X connection dies, so
         // the connection is proven here before the grab is believed armed.
         #[cfg(target_os = "linux")]
@@ -173,7 +171,7 @@ impl Hotkeys {
         manager
             .register(hotkey)
             .map_err(|error| error.to_string())?;
-        let presses = press_queue(repaint);
+        let presses = press_queue();
         Ok(Self {
             manager,
             hotkey,

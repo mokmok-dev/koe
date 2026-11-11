@@ -1,8 +1,8 @@
 //! The GPUI shell: window, overlay HUD, and the menu bar item.
 //!
-//! GPUI owns the application loop. The tray is `tray-icon`, and both shells
-//! share the recording state machine, the recorder thread, and the settings.
+//! GPUI owns the application loop and the tray is `tray-icon`.
 
+use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 #[cfg(target_os = "macos")]
@@ -16,13 +16,22 @@ use gpui_kit::component::{Theme, ThemeMode, TitleBar};
 use crate::dictation;
 use crate::dictation_control::DictationControl;
 use crate::engine::{self, Completion, EngineEvent};
-use crate::gpui_hud;
-use crate::gpui_ui::MainView;
 use crate::hud::{HudPhase, HudState};
-use crate::repaint::repaint;
+use crate::overlay;
 use crate::settings::{self, Settings};
 use crate::state::{Action, Event, Phase, Sources};
 use crate::tray::{Tray, TrayAction, TrayState, TrayStatus};
+use crate::ui::MainView;
+
+/// Which of the window's two screens is showing.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum Screen {
+    /// The take status, the start and stop control, and the last take.
+    #[default]
+    Recorder,
+    /// The dictation settings, the sources, the format, and the folder.
+    Settings,
+}
 
 /// The shell's state, shared by the window, the tray, and the tick loop.
 #[allow(
@@ -32,6 +41,7 @@ use crate::tray::{Tray, TrayAction, TrayState, TrayStatus};
 pub struct Shell {
     pub(crate) phase: Phase,
     pub(crate) settings: Settings,
+    pub(crate) screen: Screen,
     pub(crate) session: Option<engine::Session>,
     pub(crate) levels: [f32; 2],
     pub(crate) tray: Option<Tray>,
@@ -43,7 +53,7 @@ pub struct Shell {
     quit_deadline: Option<Instant>,
     window: Option<AnyWindowHandle>,
     hud: Option<AnyWindowHandle>,
-    hud_view: Option<Entity<gpui_hud::HudView>>,
+    hud_view: Option<Entity<overlay::HudView>>,
     last_hud: Option<HudState>,
     hud_enabled: bool,
     pending_show: bool,
@@ -74,15 +84,13 @@ impl Default for Shell {
 
 impl Shell {
     /// Builds the shell with the tray unmounted; the first tick mounts it.
-    ///
-    /// The dictation settings come from the file the Rune shell edits; the
-    /// GPUI window has no settings fields.
     #[must_use]
     pub fn new() -> Self {
         let (dictation_control, warning) = DictationControl::load();
         Self {
             phase: Phase::Idle,
             settings: Settings::default(),
+            screen: Screen::Recorder,
             session: None,
             levels: [0.0; 2],
             tray: None,
@@ -156,8 +164,7 @@ impl Shell {
         } else if self.phase.is_active() || self.dictation_control.dictation.is_active() {
             tick.delay = Duration::from_millis(100);
         } else if self.dictation_control.hotkeys.is_some() {
-            // This shell has no repaint the hotkey handler could wake, so a
-            // press waits in the queue until the next tick. A dictation
+            // A press waits in the queue until the next tick. A dictation
             // start is where the lost audio is speech, so the idle tick that
             // polls for presses is five times faster than the tray's.
             tick.delay = Duration::from_millis(50);
@@ -191,7 +198,7 @@ impl Shell {
         if self.tray.is_some() || self.tray_error.is_some() {
             return false;
         }
-        match Tray::new(repaint(|| {}), &self.tray_state()) {
+        match Tray::new(&self.tray_state()) {
             Ok(tray) => {
                 self.tray = Some(tray);
                 self.last_tray = Some(self.tray_state());
@@ -207,7 +214,7 @@ impl Shell {
 
     /// Mounts the dictation side: the binding and its failure banner.
     fn ensure_dictation(&mut self) -> bool {
-        let message = self.dictation_control.mount(&repaint(|| {}));
+        let message = self.dictation_control.mount();
         if let Some(message) = message {
             self.notice = Some(message);
             self.show_window();
@@ -259,7 +266,7 @@ impl Shell {
         match action {
             Action::Start(plan) => {
                 let output = plan.output.clone();
-                match engine::Session::start(plan, repaint(|| {})) {
+                match engine::Session::start(plan) {
                     Ok(session) => {
                         self.session = Some(session);
                         self.levels = [0.0; 2];
@@ -338,6 +345,49 @@ impl Shell {
         cx.notify();
     }
 
+    /// Clears a finished dictation's result.
+    pub fn dismiss_dictation(&mut self, cx: &mut Context<Self>) {
+        self.notice = None;
+        self.dictation_control.dismiss();
+        cx.notify();
+    }
+
+    /// Switches to the settings screen.
+    pub fn show_settings(&mut self, cx: &mut Context<Self>) {
+        self.screen = Screen::Settings;
+        cx.notify();
+    }
+
+    /// Switches to the recorder screen.
+    pub fn show_recorder(&mut self, cx: &mut Context<Self>) {
+        self.screen = Screen::Recorder;
+        cx.notify();
+    }
+
+    /// Commits the hotkey field's draft on Enter.
+    ///
+    /// The binding is committed here rather than while the user types,
+    /// because every valid intermediate prefix of a binding is a real
+    /// shortcut: typing toward `Ctrl+Shift+Space` passes through `Ctrl+S`,
+    /// which a live rebind would grab system-wide.
+    pub fn apply_hotkey(&mut self, draft: &str, cx: &mut Context<Self>) {
+        self.notice = self.dictation_control.apply_hotkey(draft);
+        cx.notify();
+    }
+
+    /// Persists the model and language fields.
+    pub fn apply_dictation_settings(
+        &mut self,
+        model: Option<PathBuf>,
+        language: Option<String>,
+        cx: &mut Context<Self>,
+    ) {
+        if let Err(error) = self.dictation_control.apply_settings(model, language) {
+            self.notice = Some(error.to_string());
+        }
+        cx.notify();
+    }
+
     /// Opens the recordings folder.
     pub fn open_folder(&mut self, cx: &mut Context<Self>) {
         if let Err(error) = settings::open_directory(&self.settings.directory) {
@@ -387,9 +437,12 @@ impl Shell {
                     self.notice = None;
                 }
             }
-            // This shell has no settings screen, so both menu items open
-            // the window.
-            TrayAction::Show | TrayAction::ShowSettings => self.show_window(),
+            // The menu item opens the window on its settings screen.
+            TrayAction::Show => self.show_window(),
+            TrayAction::ShowSettings => {
+                self.screen = Screen::Settings;
+                self.show_window();
+            }
             TrayAction::OpenFolder => self.open_folder(cx),
             TrayAction::Quit => self.quit(cx),
         }
@@ -435,7 +488,7 @@ impl Shell {
             return false;
         }
         if self.hud.is_none() {
-            let Some((handle, view)) = gpui_hud::open(cx, next.clone()) else {
+            let Some((handle, view)) = overlay::open(cx, next.clone()) else {
                 return false;
             };
             self.hud = Some(handle);
@@ -531,8 +584,8 @@ fn open_main_window(cx: &mut App, shell: &Entity<Shell>) {
     }
     let options = main_window_options(cx);
     let view = shell.clone();
-    match gpui_kit::open_window(options, cx, move |_, cx| {
-        cx.new(move |cx| MainView::new(view, cx))
+    match gpui_kit::open_window(options, cx, move |window, cx| {
+        cx.new(move |cx| MainView::new(view, window, cx))
     }) {
         Ok((handle, _)) => {
             shell.update(cx, |shell, _| shell.window = Some(handle));
@@ -593,7 +646,7 @@ pub fn run() {
                         cx.update(|cx| hide_main_window(cx, &shell));
                     }
                     if let Some(handle) = tick.hud_close {
-                        cx.update(|cx| gpui_hud::close(cx, handle));
+                        cx.update(|cx| overlay::close(cx, handle));
                     }
                     if tick.quit {
                         cx.update(|cx| cx.quit());
