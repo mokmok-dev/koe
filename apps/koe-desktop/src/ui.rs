@@ -3,19 +3,21 @@
 use std::time::Instant;
 
 use gpui::{
-    App, AppContext as _, Context, Entity, FontWeight, IntoElement, ParentElement, Render,
-    Styled as _, Subscription, Window, div, px, rgb,
+    AnyElement, App, AppContext as _, Context, Entity, FontWeight, IntoElement, ParentElement,
+    Render, Styled as _, Subscription, Window, div, px, rgb,
 };
 use gpui_kit::component::{
-    ActiveTheme as _, Disableable as _, Sizable as _, TitleBar,
+    ActiveTheme as _, Disableable as _, Icon, IconName, Sizable as _, TitleBar,
     alert::Alert,
     button::{Button, ButtonVariants as _},
-    checkbox::Checkbox,
-    group_box::{GroupBox, GroupBoxVariants as _},
+    group_box::{GroupBox, GroupBoxVariant, GroupBoxVariants as _},
     h_flex,
     input::{Input, InputEvent, InputState},
     progress::Progress,
     scroll::ScrollableElement as _,
+    setting::{SettingField, SettingGroup, SettingItem, SettingPage, Settings},
+    sidebar::{Sidebar, SidebarHeader, SidebarMenuItem, SidebarToggleButton},
+    status_bar::StatusBar,
     v_flex,
 };
 use koe_capture::Source;
@@ -33,6 +35,17 @@ const IDLE: u32 = 0x005A_5A62;
 const RED: u32 = 0x00FF_5A5F;
 const AMBER: u32 = 0x00F0_B429;
 const BLUE: u32 = 0x0058_A6FF;
+
+/// Builds a click handler that applies a shell mutation. It is `Clone` so that
+/// setting renderers, which run as `Fn`, can copy it before a control takes one.
+fn click(
+    shell: Entity<Shell>,
+    apply: impl Fn(&mut Shell, &mut Context<Shell>) + Clone + 'static,
+) -> impl Fn(&gpui::ClickEvent, &mut Window, &mut App) + Clone + 'static {
+    move |_: &gpui::ClickEvent, _: &mut Window, cx: &mut App| {
+        shell.update(cx, |shell, cx| apply(shell, cx));
+    }
+}
 
 /// The main window's root view.
 pub struct MainView {
@@ -131,16 +144,11 @@ impl MainView {
     }
 }
 
-impl Render for MainView {
-    #[allow(
-        clippy::too_many_lines,
-        reason = "the window is one element tree; splitting it scatters the layout"
-    )]
-    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+impl MainView {
+    /// The take controls: the phase card, the meters, and the start or stop button.
+    fn recorder_screen(&self, shell: &Shell, cx: &Context<Self>) -> AnyElement {
         let entity = self.shell.clone();
-        let shell = entity.read(cx);
         let theme = cx.theme();
-
         let phase = &shell.phase;
         let active = phase.is_active();
         let can_start = phase.can_start();
@@ -150,36 +158,6 @@ impl Render for MainView {
         let levels = shell.levels;
         let detail = detail(phase);
         let tone = phase_tone(phase);
-        let badge = if shell.dictation_control.dictation.is_active() {
-            "DICTATING".to_owned()
-        } else {
-            phase.label().to_uppercase()
-        };
-
-        let mic = shell.settings.sources.contains(Source::Microphone);
-        let system = shell.settings.sources.contains(Source::SystemAudio);
-        let format = shell.settings.format;
-        let directory = shell.settings.directory.display().to_string();
-        let notice = shell.notice.clone();
-        let tray_available = shell.tray.is_some();
-        let tray_error = shell.tray_error.clone();
-        let hotkey_error = shell
-            .dictation_control
-            .hotkeys
-            .is_none()
-            .then(|| shell.dictation_control.hotkey_error.clone())
-            .flatten();
-        let dictation_status = dictation_status(shell);
-        let hotkey_text = self.hotkey_input.read(cx).value().to_string();
-        let model_text = self.model_input.read(cx).value().to_string();
-        let hotkey_hint = hotkey_hint(&hotkey_text, shell);
-        let model_hint = model_hint(&model_text, shell);
-        let dictation_done = matches!(shell.dictation_control.dictation, Dictation::Done(_));
-        let screen = shell.screen;
-        let done = match phase {
-            Phase::Done(done) => Some(done_view(done)),
-            _ => None,
-        };
 
         let (primary_label, primary_enabled, primary_stop) = if can_stop {
             ("Stop recording", true, true)
@@ -189,82 +167,13 @@ impl Render for MainView {
             ("Saving...", false, false)
         };
 
-        let start_shell = entity.clone();
-        let on_primary = move |_: &gpui::ClickEvent, _: &mut Window, cx: &mut App| {
-            start_shell.update(cx, |shell, cx| {
-                if primary_stop {
-                    shell.stop_recording(cx);
-                } else {
-                    shell.start_recording(cx);
-                }
-            });
-        };
-
-        let mic_shell = entity.clone();
-        let on_mic = move |checked: &bool, _: &mut Window, cx: &mut App| {
-            let checked = *checked;
-            mic_shell.update(cx, |shell, cx| {
-                shell.settings.sources = if checked {
-                    shell.settings.sources.with(Source::Microphone)
-                } else {
-                    shell.settings.sources.without(Source::Microphone)
-                };
-                cx.notify();
-            });
-        };
-
-        let system_shell = entity.clone();
-        let on_system = move |checked: &bool, _: &mut Window, cx: &mut App| {
-            let checked = *checked;
-            system_shell.update(cx, |shell, cx| {
-                shell.settings.sources = if checked {
-                    shell.settings.sources.with(Source::SystemAudio)
-                } else {
-                    shell.settings.sources.without(Source::SystemAudio)
-                };
-                cx.notify();
-            });
-        };
-
-        let format_shell = entity.clone();
-        let on_ogg = move |_: &gpui::ClickEvent, _: &mut Window, cx: &mut App| {
-            format_shell.update(cx, |shell, cx| {
-                shell.settings.format = Format::Ogg;
-                cx.notify();
-            });
-        };
-        let format_shell = entity.clone();
-        let on_wav = move |_: &gpui::ClickEvent, _: &mut Window, cx: &mut App| {
-            format_shell.update(cx, |shell, cx| {
-                shell.settings.format = Format::Wav;
-                cx.notify();
-            });
-        };
-
-        let open_shell = entity.clone();
-        let on_open = move |_: &gpui::ClickEvent, _: &mut Window, cx: &mut App| {
-            open_shell.update(cx, Shell::open_folder);
-        };
-
-        let hide_shell = entity.clone();
-        let on_hide = move |_: &gpui::ClickEvent, _: &mut Window, cx: &mut App| {
-            hide_shell.update(cx, Shell::hide_window);
-        };
-
-        let quit_shell = entity.clone();
-        let on_quit = move |_: &gpui::ClickEvent, _: &mut Window, cx: &mut App| {
-            quit_shell.update(cx, Shell::quit);
-        };
-
-        let dismiss_shell = entity.clone();
-        let on_dismiss = move |_: &gpui::ClickEvent, _: &mut Window, cx: &mut App| {
-            dismiss_shell.update(cx, Shell::dismiss);
-        };
-
-        let clear_shell = entity.clone();
-        let on_clear_dictation = move |_: &gpui::ClickEvent, _: &mut Window, cx: &mut App| {
-            clear_shell.update(cx, Shell::dismiss_dictation);
-        };
+        let on_primary = click(entity, move |shell, cx| {
+            if primary_stop {
+                shell.stop_recording(cx);
+            } else {
+                shell.start_recording(cx);
+            }
+        });
 
         let primary = Button::new("primary")
             .label(primary_label)
@@ -278,317 +187,436 @@ impl Render for MainView {
             primary.primary()
         };
 
-        let screen_content = match screen {
-            Screen::Recorder => v_flex()
-                .gap(px(14.0))
-                .child(
-                    GroupBox::new().outline().child(
-                        v_flex()
-                            .gap(px(10.0))
-                            .child(
-                                h_flex()
-                                    .items_center()
-                                    .gap(px(10.0))
-                                    .child(div().size(px(14.0)).rounded_full().bg(tone))
-                                    .child(
-                                        v_flex()
-                                            .flex_1()
-                                            .child(
-                                                div()
-                                                    .text_base()
-                                                    .font_weight(FontWeight::SEMIBOLD)
-                                                    .child(phase.label()),
-                                            )
-                                            .child(
-                                                div()
-                                                    .text_xs()
-                                                    .text_color(theme.muted_foreground)
-                                                    .child(detail),
-                                            ),
-                                    )
-                                    .children(elapsed.map(|elapsed| {
-                                        div()
-                                            .text_2xl()
-                                            .font_family("monospace")
-                                            .child(hud::elapsed_text(elapsed))
-                                    })),
-                            )
-                            .children(active.then(|| {
-                                v_flex()
-                                    .gap_2()
-                                    .child(meter("Mic", Source::Microphone, levels, live))
-                                    .child(meter("System", Source::SystemAudio, levels, live))
-                            })),
-                    ),
-                )
-                .child(primary)
-                .into_any_element(),
-            Screen::Settings => v_flex()
-                .gap(px(14.0))
-                .child(
-                    GroupBox::new().outline().child(
-                        v_flex()
-                            .gap(px(8.0))
-                            .child(section("Dictation", cx))
-                            .child(div().text_sm().child(dictation_status))
-                            .child(field("Hotkey", Input::new(&self.hotkey_input).w_full(), cx))
-                            .children(hotkey_hint.map(|(message, error)| {
-                                let hint = div().text_xs().child(message);
-                                if error {
-                                    hint.text_color(rgb(RED)).into_any_element()
-                                } else {
-                                    hint.text_color(theme.muted_foreground).into_any_element()
-                                }
-                            }))
-                            .child(field("Model", Input::new(&self.model_input).w_full(), cx))
-                            .child(
-                                div()
-                                    .text_xs()
-                                    .text_color(theme.muted_foreground)
-                                    .child(model_hint),
-                            )
-                            .child(field(
-                                "Language",
-                                Input::new(&self.language_input).w_full(),
-                                cx,
-                            ))
-                            .children(dictation_done.then(|| {
-                                Button::new("clear-dictation")
-                                    .label("Clear")
-                                    .small()
-                                    .on_click(on_clear_dictation)
-                            })),
-                    ),
-                )
-                .child(
-                    v_flex()
-                        .gap_2()
-                        .child(section("Sources", cx))
-                        .child(
-                            Checkbox::new("source-microphone")
-                                .label("Microphone")
-                                .checked(mic)
-                                .disabled(!can_start)
-                                .on_change(on_mic),
-                        )
-                        .child(
-                            Checkbox::new("source-system")
-                                .label("System audio")
-                                .checked(system)
-                                .disabled(!can_start)
-                                .on_change(on_system),
-                        ),
-                )
-                .child(
-                    v_flex().gap_2().child(section("Format", cx)).child(
-                        h_flex()
-                            .gap_2()
-                            .child(
-                                if format == Format::Ogg {
-                                    Button::new("format-ogg").primary()
-                                } else {
-                                    Button::new("format-ogg").ghost()
-                                }
-                                .label("Ogg Opus")
-                                .small()
-                                .disabled(!can_start)
-                                .on_click(on_ogg),
-                            )
-                            .child(
-                                if format == Format::Wav {
-                                    Button::new("format-wav").primary()
-                                } else {
-                                    Button::new("format-wav").ghost()
-                                }
-                                .label("WAV")
-                                .small()
-                                .disabled(!can_start)
-                                .on_click(on_wav),
-                            ),
-                    ),
-                )
-                .child(
-                    v_flex().gap_2().child(section("Recordings", cx)).child(
-                        h_flex()
-                            .items_center()
-                            .gap_2()
-                            .child(
-                                div()
-                                    .flex_1()
-                                    .min_w(px(0.0))
-                                    .overflow_hidden()
-                                    .whitespace_nowrap()
-                                    .text_sm()
-                                    .font_family("monospace")
-                                    .text_color(theme.muted_foreground)
-                                    .child(directory),
-                            )
-                            .child(
-                                Button::new("open-folder")
-                                    .label("Open")
-                                    .small()
-                                    .on_click(on_open),
-                            ),
-                    ),
-                )
-                .into_any_element(),
-        };
-
         v_flex()
-            .size_full()
-            .bg(theme.background)
-            .text_color(theme.foreground)
+            .gap(px(14.0))
             .child(
-                TitleBar::new().child(
-                    h_flex()
-                        .items_center()
-                        .gap_2()
-                        .px_3()
+                GroupBox::new().outline().child(
+                    v_flex()
+                        .gap(px(10.0))
                         .child(
-                            div()
-                                .text_lg()
-                                .font_weight(FontWeight::SEMIBOLD)
-                                .child("koe"),
+                            h_flex()
+                                .items_center()
+                                .gap(px(10.0))
+                                .child(div().size(px(14.0)).rounded_full().bg(tone))
+                                .child(
+                                    v_flex()
+                                        .flex_1()
+                                        .child(
+                                            div()
+                                                .text_base()
+                                                .font_weight(FontWeight::SEMIBOLD)
+                                                .child(phase.label()),
+                                        )
+                                        .child(
+                                            div()
+                                                .text_xs()
+                                                .text_color(theme.muted_foreground)
+                                                .child(detail),
+                                        ),
+                                )
+                                .children(elapsed.map(|elapsed| {
+                                    div()
+                                        .text_2xl()
+                                        .font_family("monospace")
+                                        .child(hud::elapsed_text(elapsed))
+                                })),
                         )
-                        .child(
-                            div()
-                                .text_xs()
-                                .text_color(theme.muted_foreground)
-                                .child("private recording"),
-                        )
-                        .child(div().flex_1())
-                        .child(screen_button(&entity, screen, cx))
-                        .child(
-                            div()
-                                .text_xs()
-                                .font_weight(FontWeight::SEMIBOLD)
-                                .text_color(tone)
-                                .child(badge),
-                        ),
+                        .children(active.then(|| {
+                            v_flex()
+                                .gap_2()
+                                .child(meter("Mic", Source::Microphone, levels, live))
+                                .child(meter("System", Source::SystemAudio, levels, live))
+                        })),
                 ),
             )
-            .child(
-                v_flex()
-                    .flex_1()
-                    .min_h(px(0.0))
-                    .overflow_y_scrollbar()
-                    .p(px(22.0))
-                    .gap(px(14.0))
-                    .child(screen_content)
-                    .children(notice.map(|notice| {
-                        Alert::warning("notice", notice).banner().into_any_element()
-                    }))
-                    .children(hotkey_error.map(|error| {
-                        v_flex()
-                            .gap_1()
-                            .child(
-                                Alert::warning(
-                                    "hotkey-missing",
-                                    "No global hotkey. Dictation needs a desktop that lets apps register shortcuts; on Linux that means X11. Press Enter in the Hotkey field to retry.",
-                                )
-                                .banner(),
-                            )
-                            .child(
-                                div()
-                                    .text_xs()
-                                    .text_color(theme.muted_foreground)
-                                    .child(error),
-                            )
-                            .into_any_element()
-                    }))
-                    .children((!tray_available).then(|| {
-                        v_flex()
-                            .gap_1()
-                            .child(
-                                Alert::warning(
-                                    "tray-missing",
-                                    "No menu bar icon. Keep this window open to control recordings.",
-                                )
-                                .banner(),
-                            )
-                            .children(tray_error.map(|error| {
-                                div()
-                                    .text_xs()
-                                    .text_color(theme.muted_foreground)
-                                    .child(error)
-                            }))
-                            .into_any_element()
-                    }))
-                    .children(done.map(|done| done_card(done, on_dismiss, cx))),
+            .child(primary)
+            .into_any_element()
+    }
+
+    /// The settings pages.
+    ///
+    /// Rows that own an `InputState` render through `SettingField::render`
+    /// rather than `SettingField::input`: an input field commits on every
+    /// keystroke, and the hotkey must commit only on Enter.
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the two pages are one declarative tree; splitting off a row would separate it from the page that owns it"
+    )]
+    fn settings_screen(&self, shell: &Shell, cx: &Context<Self>) -> AnyElement {
+        let entity = self.shell.clone();
+        let can_start = shell.phase.can_start();
+        let format = shell.settings.format;
+        let directory = shell.settings.directory.display().to_string();
+        let dictation_done = matches!(shell.dictation_control.dictation, Dictation::Done(_));
+        let status = dictation_status(shell);
+        let hotkey_text = self.hotkey_input.read(cx).value().to_string();
+        let model_text = self.model_input.read(cx).value().to_string();
+        let hotkey_hint = hotkey_hint(&hotkey_text, shell);
+        let model_hint = model_hint(&model_text, shell);
+
+        let on_ogg = click(entity.clone(), |shell, cx| {
+            shell.settings.format = Format::Ogg;
+            cx.notify();
+        });
+        let on_wav = click(entity.clone(), |shell, cx| {
+            shell.settings.format = Format::Wav;
+            cx.notify();
+        });
+        let on_open = click(entity.clone(), Shell::open_folder);
+        let on_clear = click(entity.clone(), Shell::dismiss_dictation);
+
+        let status_item = SettingItem::render(move |_, _, _| {
+            v_flex()
+                .gap_2()
+                .child(div().text_sm().child(status.clone()))
+                .children(dictation_done.then(|| {
+                    Button::new("clear-dictation")
+                        .label("Clear")
+                        .small()
+                        .on_click(on_clear.clone())
+                }))
+        })
+        .keywords(["dictation", "status", "clear"]);
+
+        let hotkey_item = SettingItem::new(
+            "Hotkey",
+            SettingField::render({
+                let input = self.hotkey_input.clone();
+                move |_, _, cx| {
+                    v_flex()
+                        .gap_1()
+                        .child(Input::new(&input).aria_label("Hotkey").w(px(240.0)))
+                        .children(hotkey_hint.clone().map(|(message, error)| {
+                            let hint = div().text_xs().child(message);
+                            if error {
+                                hint.text_color(rgb(RED)).into_any_element()
+                            } else {
+                                hint.text_color(cx.theme().muted_foreground)
+                                    .into_any_element()
+                            }
+                        }))
+                }
+            }),
+        );
+
+        let model_item = SettingItem::new(
+            "Model",
+            SettingField::render({
+                let input = self.model_input.clone();
+                move |_, _, cx| {
+                    v_flex()
+                        .gap_1()
+                        .child(Input::new(&input).aria_label("Model").w(px(240.0)))
+                        .child(
+                            div()
+                                .text_xs()
+                                .text_color(cx.theme().muted_foreground)
+                                .child(model_hint.clone()),
+                        )
+                }
+            }),
+        );
+
+        let language_item = SettingItem::new(
+            "Language",
+            SettingField::render({
+                let input = self.language_input.clone();
+                move |_, _, _| Input::new(&input).aria_label("Language").w(px(240.0))
+            }),
+        );
+
+        let source_item = |source: Source, title: &'static str| {
+            SettingItem::new(
+                title,
+                SettingField::checkbox(
+                    {
+                        let shell = entity.clone();
+                        move |cx: &App| shell.read(cx).settings.sources.contains(source)
+                    },
+                    {
+                        let shell = entity.clone();
+                        move |checked: bool, cx: &mut App| {
+                            shell.update(cx, |shell, cx| {
+                                shell.settings.sources = if checked {
+                                    shell.settings.sources.with(source)
+                                } else {
+                                    shell.settings.sources.without(source)
+                                };
+                                cx.notify();
+                            });
+                        }
+                    },
+                ),
             )
-            .child(
+            .disabled(!can_start)
+        };
+
+        let format_item = SettingItem::new(
+            "File",
+            SettingField::render(move |options, _, _| {
+                h_flex()
+                    .gap_2()
+                    .child(
+                        if format == Format::Ogg {
+                            Button::new("format-ogg").primary()
+                        } else {
+                            Button::new("format-ogg").ghost()
+                        }
+                        .label("Ogg Opus")
+                        .small()
+                        .disabled(options.is_disabled())
+                        .on_click(on_ogg.clone()),
+                    )
+                    .child(
+                        if format == Format::Wav {
+                            Button::new("format-wav").primary()
+                        } else {
+                            Button::new("format-wav").ghost()
+                        }
+                        .label("WAV")
+                        .small()
+                        .disabled(options.is_disabled())
+                        .on_click(on_wav.clone()),
+                    )
+            }),
+        )
+        .keywords(["format", "ogg", "wav", "opus"])
+        .disabled(!can_start);
+
+        let folder_item = SettingItem::new(
+            "Location",
+            SettingField::render(move |_, _, cx| {
                 h_flex()
                     .items_center()
-                    .justify_between()
-                    .px(px(22.0))
-                    .py_3()
-                    .border_t_1()
-                    .border_color(theme.border)
+                    .gap_2()
                     .child(
-                        h_flex()
-                            .gap_2()
-                            .children(tray_available.then(|| {
-                                Button::new("hide")
-                                    .label("Hide to menu bar")
-                                    .small()
-                                    .on_click(on_hide)
-                            }))
-                            .child(
-                                Button::new("quit")
-                                    .label("Quit")
-                                    .small()
-                                    .ghost()
-                                    .on_click(on_quit),
-                            ),
+                        div()
+                            .max_w(px(200.0))
+                            .overflow_hidden()
+                            .whitespace_nowrap()
+                            .text_sm()
+                            .font_family("monospace")
+                            .text_color(cx.theme().muted_foreground)
+                            .child(directory.clone()),
+                    )
+                    .child(
+                        Button::new("open-folder")
+                            .label("Open")
+                            .small()
+                            .on_click(on_open.clone()),
+                    )
+            }),
+        )
+        .keywords(["folder", "directory", "path", "recordings"]);
+
+        Settings::new("koe-settings")
+            .with_group_variant(GroupBoxVariant::Outline)
+            .sidebar_width(px(180.0))
+            .sidebar_size_range(px(150.0)..px(260.0))
+            .page(
+                SettingPage::new("Dictation")
+                    .icon(Icon::new(IconName::Mic))
+                    .description("The global binding and the speech model the dictation uses.")
+                    .resettable(false)
+                    .group(SettingGroup::new().title("Status").item(status_item))
+                    .group(SettingGroup::new().title("Binding").item(hotkey_item))
+                    .group(
+                        SettingGroup::new()
+                            .title("Speech model")
+                            .item(model_item)
+                            .item(language_item),
+                    ),
+            )
+            .page(
+                SettingPage::new("Recording")
+                    .icon(Icon::new(IconName::FolderOpen))
+                    .description("What a take captures, how it is written, and where it goes.")
+                    .resettable(false)
+                    .group(
+                        SettingGroup::new()
+                            .title("Sources")
+                            .item(source_item(Source::Microphone, "Microphone"))
+                            .item(source_item(Source::SystemAudio, "System audio")),
+                    )
+                    .group(SettingGroup::new().title("Format").item(format_item))
+                    .group(SettingGroup::new().title("Folder").item(folder_item)),
+            )
+            .into_any_element()
+    }
+}
+
+impl Render for MainView {
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the window chrome is one element tree; splitting the title bar, body and footer scatters the layout"
+    )]
+    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let entity = self.shell.clone();
+        let shell = entity.read(cx);
+        let theme = cx.theme();
+
+        let phase = &shell.phase;
+        let tone = phase_tone(phase);
+        let badge = if shell.dictation_control.dictation.is_active() {
+            "DICTATING".to_owned()
+        } else {
+            phase.label().to_uppercase()
+        };
+        let screen = shell.screen;
+        let sidebar_collapsed = shell.sidebar_collapsed;
+        let notice = shell.notice.clone();
+        let tray_available = shell.tray.is_some();
+        let tray_error = shell.tray_error.clone();
+        let hotkey_error = shell
+            .dictation_control
+            .hotkeys
+            .is_none()
+            .then(|| shell.dictation_control.hotkey_error.clone())
+            .flatten();
+        let done = match phase {
+            Phase::Done(done) => Some(done_view(done)),
+            _ => None,
+        };
+
+        let on_toggle_sidebar = click(entity.clone(), Shell::toggle_sidebar);
+        let on_recorder = click(entity.clone(), Shell::show_recorder);
+        let on_settings = click(entity.clone(), Shell::show_settings);
+        let on_dismiss = click(entity.clone(), Shell::dismiss);
+
+        let mut alerts: Vec<AnyElement> = Vec::new();
+        if let Some(notice) = notice {
+            alerts.push(Alert::warning("notice", notice).banner().into_any_element());
+        }
+        if let Some(error) = hotkey_error {
+            alerts.push(
+                v_flex()
+                    .gap_1()
+                    .child(
+                        Alert::warning(
+                            "hotkey-missing",
+                            "No global hotkey. Dictation needs a desktop that lets apps register shortcuts; on Linux that means X11. Press Enter in the Hotkey field to retry.",
+                        )
+                        .banner(),
                     )
                     .child(
                         div()
                             .text_xs()
                             .text_color(theme.muted_foreground)
-                            .child("koe"),
+                            .child(error),
+                    )
+                    .into_any_element(),
+            );
+        }
+        if !tray_available {
+            alerts.push(
+                v_flex()
+                    .gap_1()
+                    .child(
+                        Alert::warning(
+                            "tray-missing",
+                            "No menu bar icon. Keep this window open to control recordings.",
+                        )
+                        .banner(),
+                    )
+                    .children(tray_error.map(|error| {
+                        div()
+                            .text_xs()
+                            .text_color(theme.muted_foreground)
+                            .child(error)
+                    }))
+                    .into_any_element(),
+            );
+        }
+
+        let done_element = done.map(|done| done_card(done, on_dismiss, cx));
+
+        let content = match screen {
+            Screen::Recorder => v_flex()
+                .flex_1()
+                .min_w(px(0.0))
+                .min_h(px(0.0))
+                .overflow_y_scrollbar()
+                .p(px(22.0))
+                .gap(px(14.0))
+                .child(self.recorder_screen(shell, cx))
+                .children(alerts)
+                .children(done_element)
+                .into_any_element(),
+            Screen::Settings => v_flex()
+                .flex_1()
+                .min_w(px(0.0))
+                .min_h(px(0.0))
+                .p(px(22.0))
+                .gap(px(14.0))
+                .children(alerts)
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w(px(0.0))
+                        .min_h(px(0.0))
+                        .child(self.settings_screen(shell, cx)),
+                )
+                .children(done_element)
+                .into_any_element(),
+        };
+
+        let sidebar = Sidebar::new("screens")
+            .collapsed(sidebar_collapsed)
+            .w(px(200.0))
+            .header(
+                SidebarHeader::new().child(
+                    h_flex()
+                        .items_center()
+                        .gap_2()
+                        .child(Icon::new(IconName::Mic))
+                        .children((!sidebar_collapsed).then_some("koe")),
+                ),
+            )
+            .child(
+                SidebarMenuItem::new("Recorder")
+                    .icon(Icon::new(IconName::Mic))
+                    .active(screen == Screen::Recorder)
+                    .on_click(on_recorder),
+            )
+            .child(
+                SidebarMenuItem::new("Settings")
+                    .icon(Icon::new(IconName::Settings))
+                    .active(screen == Screen::Settings)
+                    .on_click(on_settings),
+            );
+
+        v_flex()
+            .size_full()
+            .bg(theme.background)
+            .text_color(theme.foreground)
+            .child(TitleBar::new().child("koe"))
+            .child(
+                h_flex()
+                    .flex_1()
+                    .min_h(px(0.0))
+                    .child(sidebar)
+                    .child(content),
+            )
+            .child(
+                StatusBar::new()
+                    .left(
+                        SidebarToggleButton::new()
+                            .collapsed(sidebar_collapsed)
+                            .accessibility_label(if sidebar_collapsed {
+                                "Expand the sidebar"
+                            } else {
+                                "Collapse the sidebar"
+                            })
+                            .on_click(on_toggle_sidebar),
+                    )
+                    .right(
+                        div()
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(tone)
+                            .child(badge),
                     ),
             )
     }
-}
-
-/// The header button that flips the window between the two screens.
-fn screen_button(
-    entity: &Entity<Shell>,
-    screen: Screen,
-    cx: &Context<MainView>,
-) -> impl IntoElement {
-    let (label, target) = match screen {
-        Screen::Recorder => ("Settings", Screen::Settings),
-        Screen::Settings => ("Back", Screen::Recorder),
-    };
-    let shell = entity.clone();
-    let on_click = move |_: &gpui::ClickEvent, _: &mut Window, cx: &mut App| {
-        shell.update(cx, |shell, cx| match target {
-            Screen::Recorder => shell.show_recorder(cx),
-            Screen::Settings => shell.show_settings(cx),
-        });
-    };
-    Button::new("screen-toggle")
-        .label(label)
-        .small()
-        .ghost()
-        .on_click(on_click)
-        .text_color(cx.theme().foreground)
-}
-
-/// One settings field: a label and the input beside it.
-fn field(label: &str, input: impl IntoElement, cx: &Context<MainView>) -> impl IntoElement {
-    h_flex()
-        .items_center()
-        .gap_2()
-        .child(
-            div()
-                .w(px(64.0))
-                .text_xs()
-                .text_color(cx.theme().muted_foreground)
-                .child(label.to_owned()),
-        )
-        .child(div().flex_1().min_w(px(0.0)).child(input))
 }
 
 /// The status sentence the dictation section shows.
@@ -642,14 +670,6 @@ fn model_hint(text: &str, shell: &Shell) -> String {
         }
     }
     "The GGUF file a dictation transcribes with".to_owned()
-}
-
-fn section(title: &str, cx: &Context<MainView>) -> impl IntoElement {
-    div()
-        .text_xs()
-        .font_weight(FontWeight::SEMIBOLD)
-        .text_color(cx.theme().muted_foreground)
-        .child(title.to_owned())
 }
 
 fn meter(name: &str, source: Source, levels: [f32; 2], live: Sources) -> impl IntoElement {
