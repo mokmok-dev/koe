@@ -629,6 +629,7 @@ fn hotkey_hint(text: &str, shell: &Shell) -> Option<(String, bool)> {
 fn model_hint(text: &str, shell: &Shell) -> String {
     #[cfg(target_os = "macos")]
     {
+        let _ = shell;
         if settings::value_or_none(text).is_none() {
             return "Leave the model empty to use the system speech model".to_owned();
         }
