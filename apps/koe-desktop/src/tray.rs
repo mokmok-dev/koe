@@ -27,6 +27,8 @@ pub enum TrayStatus {
     Saved,
     /// A take ended with an error.
     Failed,
+    /// A dictation is capturing or transcribing.
+    Dictating,
 }
 
 /// The value the app hands the tray each frame.
@@ -42,6 +44,8 @@ pub struct TrayState {
     pub can_start: bool,
     /// Whether Stop applies.
     pub can_stop: bool,
+    /// Whether Cancel dictation applies.
+    pub can_cancel: bool,
 }
 
 /// A command the user chose in the menu or with a click.
@@ -51,6 +55,8 @@ pub enum TrayAction {
     Start,
     /// Stop the current take.
     Stop,
+    /// Discard the running dictation without typing it.
+    CancelDictation,
     /// Show the main window.
     Show,
     /// Open the recordings folder.
@@ -65,6 +71,7 @@ pub struct Tray {
     header: MenuItem,
     start: MenuItem,
     stop: MenuItem,
+    cancel: MenuItem,
     last: TrayState,
     actions: Arc<Mutex<VecDeque<TrayAction>>>,
 }
@@ -94,6 +101,7 @@ impl Tray {
         let header = MenuItem::with_id("status", label(state), false, None);
         let start = MenuItem::with_id("start", "Start recording", state.can_start, None);
         let stop = MenuItem::with_id("stop", "Stop recording", state.can_stop, None);
+        let cancel = MenuItem::with_id("cancel", "Cancel dictation", state.can_cancel, None);
         let show = MenuItem::with_id("show", "Open koe", true, None);
         let folder = MenuItem::with_id("folder", "Open recordings folder", true, None);
         let quit = MenuItem::with_id("quit", "Quit koe", true, None);
@@ -106,6 +114,7 @@ impl Tray {
             &first_separator,
             &start,
             &stop,
+            &cancel,
             &second_separator,
             &show,
             &folder,
@@ -129,6 +138,7 @@ impl Tray {
             header,
             start,
             stop,
+            cancel,
             last: state.clone(),
             actions,
         })
@@ -146,6 +156,7 @@ impl Tray {
         self.header.set_text(label(state));
         self.start.set_enabled(state.can_start);
         self.stop.set_enabled(state.can_stop);
+        self.cancel.set_enabled(state.can_cancel);
         self.icon
             .set_tooltip(Some(tooltip(state)))
             .map_err(|error| error.to_string())?;
@@ -216,6 +227,10 @@ pub fn label(state: &TrayState) -> String {
         TrayStatus::Saving => "Saving...".to_owned(),
         TrayStatus::Saved => "Saved".to_owned(),
         TrayStatus::Failed => "Recording failed".to_owned(),
+        TrayStatus::Dictating => state.elapsed.map_or_else(
+            || "Dictating".to_owned(),
+            |elapsed| format!("Dictating {}", elapsed_text(elapsed)),
+        ),
     }
 }
 
@@ -234,6 +249,7 @@ pub fn action_for(id: &MenuId) -> Option<TrayAction> {
     match id.0.as_str() {
         "start" => Some(TrayAction::Start),
         "stop" => Some(TrayAction::Stop),
+        "cancel" => Some(TrayAction::CancelDictation),
         "show" => Some(TrayAction::Show),
         "folder" => Some(TrayAction::OpenFolder),
         "quit" => Some(TrayAction::Quit),
@@ -259,6 +275,7 @@ mod tests {
             detail: None,
             can_start: true,
             can_stop: false,
+            can_cancel: false,
         }
     }
 
@@ -270,6 +287,15 @@ mod tests {
         assert_eq!(label(&state(TrayStatus::Saving)), "Saving...");
         assert_eq!(label(&state(TrayStatus::Saved)), "Saved");
         assert_eq!(label(&state(TrayStatus::Failed)), "Recording failed");
+        assert_eq!(label(&state(TrayStatus::Dictating)), "Dictating");
+    }
+
+    #[test]
+    fn dictating_shows_whole_seconds() {
+        let mut state = state(TrayStatus::Dictating);
+        state.elapsed = Some(Duration::from_secs(30));
+        assert_eq!(label(&state), "Dictating 00:30");
+        assert_eq!(tooltip(&state), "koe · Dictating 00:30");
     }
 
     #[test]
@@ -292,6 +318,7 @@ mod tests {
         for (id, expected) in [
             ("start", TrayAction::Start),
             ("stop", TrayAction::Stop),
+            ("cancel", TrayAction::CancelDictation),
             ("show", TrayAction::Show),
             ("folder", TrayAction::OpenFolder),
             ("quit", TrayAction::Quit),

@@ -4,8 +4,12 @@
 //! default `rune-ui` feature, or the GPUI shell with `--no-default-features
 //! --features gpui`.
 
+pub mod dictation;
+pub mod dictation_control;
+pub mod dictation_worker;
 pub mod engine;
 pub mod error;
+pub mod hotkey;
 pub mod hud;
 pub mod icon;
 pub mod repaint;

@@ -7,11 +7,14 @@ use std::cell::RefCell;
 use std::time::{Duration, Instant};
 
 use rune::{
-    Align, App, AppHandle, AppSpec, OverlayHandle, OverlaySpec, RunOptions, ScreenEdge, Tx, Waker,
-    WindowSpec,
+    Align, App, AppHandle, AppSpec, OverlayHandle, OverlaySpec, RunOptions, ScreenEdge, TextEdit,
+    Tx, Waker, WindowSpec,
 };
 
+use crate::dictation;
+use crate::dictation_control::DictationControl;
 use crate::engine::{self, Completion, EngineEvent};
+use crate::hotkey;
 use crate::repaint::repaint;
 use crate::rune_hud::{HudPhase, HudState};
 use crate::settings::{self, Settings};
@@ -38,6 +41,10 @@ pub enum UiIntent {
     Quit,
     /// Clear the finished take.
     Dismiss,
+    /// Clear the finished dictation.
+    DismissDictation,
+    /// Commit the hotkey field.
+    ApplyHotkey,
 }
 
 /// The shell's state.
@@ -50,6 +57,10 @@ pub struct AppState {
     pub(crate) tray_error: Option<String>,
     pub(crate) notice: Option<String>,
     pub(crate) pending: Option<UiIntent>,
+    pub(crate) dictation_control: DictationControl,
+    pub(crate) hotkey_draft: TextEdit,
+    pub(crate) model_draft: TextEdit,
+    pub(crate) language_draft: TextEdit,
     waker: Option<Waker>,
     last_tray: Option<TrayState>,
     last_hud: Option<HudState>,
@@ -61,6 +72,23 @@ pub struct AppState {
 
 impl Default for AppState {
     fn default() -> Self {
+        let (dictation_control, warning) = DictationControl::load();
+        let hotkey_draft = draft(hotkey::display(&dictation_control.settings.hotkey));
+        let model_draft = draft(
+            dictation_control
+                .settings
+                .model
+                .as_ref()
+                .map_or_else(String::new, |model| model.display().to_string()),
+        );
+        let language_draft = draft(
+            dictation_control
+                .settings
+                .language
+                .as_deref()
+                .unwrap_or_default()
+                .to_owned(),
+        );
         Self {
             phase: Phase::Idle,
             settings: Settings::default(),
@@ -68,8 +96,12 @@ impl Default for AppState {
             levels: [0.0; 2],
             tray: None,
             tray_error: None,
-            notice: None,
+            notice: warning,
             pending: None,
+            dictation_control,
+            hotkey_draft,
+            model_draft,
+            language_draft,
             waker: None,
             last_tray: None,
             last_hud: None,
@@ -81,28 +113,43 @@ impl Default for AppState {
     }
 }
 
+/// An editable field pre-filled with `text`.
+fn draft(text: String) -> TextEdit {
+    let mut edit = TextEdit::default();
+    edit.replace_text(text);
+    edit
+}
+
 impl AppState {
     fn tray_state(&self) -> TrayState {
-        let status = match &self.phase {
-            Phase::Idle => TrayStatus::Ready,
-            Phase::Arming { .. } => TrayStatus::Starting,
-            Phase::Recording(_) => TrayStatus::Recording,
-            Phase::Stopping { .. } => TrayStatus::Saving,
-            Phase::Done(done) if done.failed() => TrayStatus::Failed,
-            Phase::Done(_) => TrayStatus::Saved,
+        let active = self.dictation_control.dictation.is_active();
+        let status = if active {
+            TrayStatus::Dictating
+        } else {
+            match &self.phase {
+                Phase::Idle => TrayStatus::Ready,
+                Phase::Arming { .. } => TrayStatus::Starting,
+                Phase::Recording(_) => TrayStatus::Recording,
+                Phase::Stopping { .. } => TrayStatus::Saving,
+                Phase::Done(done) if done.failed() => TrayStatus::Failed,
+                Phase::Done(_) => TrayStatus::Saved,
+            }
+        };
+        let elapsed = if active {
+            self.dictation_control.dictation.elapsed(Instant::now())
+        } else {
+            self.phase.elapsed(Instant::now())
         };
         TrayState {
             status,
-            elapsed: self
-                .phase
-                .elapsed(Instant::now())
-                .map(|elapsed| Duration::from_secs(elapsed.as_secs())),
+            elapsed: elapsed.map(|elapsed| Duration::from_secs(elapsed.as_secs())),
             detail: self
                 .notice
                 .clone()
                 .or_else(|| self.phase.warning().map(str::to_owned)),
-            can_start: self.phase.can_start() && !self.settings.sources.is_empty(),
+            can_start: self.phase.can_start() && !self.settings.sources.is_empty() && !active,
             can_stop: self.phase.can_stop(),
+            can_cancel: active,
         }
     }
 
@@ -195,6 +242,14 @@ fn poll(state: &mut AppState, _seconds: f64, tx: &mut Tx) -> bool {
             }
         }
     }
+    if state.dictation_control.hotkeys.is_none() && state.dictation_control.hotkey_error.is_none() {
+        let repaint = state.waker.clone().unwrap_or_else(|| repaint(|| {}));
+        if let Some(message) = state.dictation_control.mount(&repaint) {
+            state.notice = Some(message);
+            show_window();
+            changed = true;
+        }
+    }
     let actions = state.tray.as_ref().map(Tray::poll).unwrap_or_default();
     for action in actions {
         if std::env::var_os("KOE_TRAY_DEBUG").is_some() {
@@ -203,7 +258,20 @@ fn poll(state: &mut AppState, _seconds: f64, tx: &mut Tx) -> bool {
         handle_tray(state, action, tx);
         changed = true;
     }
+    let presses = state.dictation_control.presses();
+    for _ in 0..presses {
+        if let Some(message) = state.dictation_control.toggle(state.phase.is_active()) {
+            state.notice = Some(message);
+            show_window();
+        }
+    }
+    changed |= presses > 0;
     changed |= poll_engine(state);
+    if let Some(message) = state.dictation_control.poll() {
+        state.notice = Some(message);
+        changed = true;
+    }
+    changed |= sync_dictation_settings(state);
     if let Some(intent) = state.pending.take() {
         handle_intent(state, intent, tx);
         changed = true;
@@ -214,12 +282,13 @@ fn poll(state: &mut AppState, _seconds: f64, tx: &mut Tx) -> bool {
         let deadline_passed = state
             .quit_deadline
             .is_some_and(|deadline| Instant::now() >= deadline);
-        if state.session.is_none() || deadline_passed {
+        if (state.session.is_none() && state.dictation_control.session.is_none()) || deadline_passed
+        {
             with_app(rune::AppHandle::quit);
         } else {
             tx.wake_after(Duration::from_millis(100));
         }
-    } else if state.phase.is_active() {
+    } else if state.phase.is_active() || state.dictation_control.dictation.is_active() {
         tx.wake_after(Duration::from_millis(100));
         changed = true;
     } else {
@@ -229,10 +298,32 @@ fn poll(state: &mut AppState, _seconds: f64, tx: &mut Tx) -> bool {
     changed
 }
 
+/// Applies the editable settings fields and persists what changed.
+///
+/// The hotkey field is deliberately absent: its draft is committed on
+/// Enter, so the shortcuts the user types on the way to a binding are never
+/// grabbed system-wide.
+fn sync_dictation_settings(state: &mut AppState) -> bool {
+    let model = settings::value_or_none(&state.model_draft.text).map(std::path::PathBuf::from);
+    let language = settings::value_or_none(&state.language_draft.text).map(str::to_owned);
+    match state.dictation_control.apply_settings(model, language) {
+        Ok(changed) => changed,
+        Err(error) => {
+            state.notice = Some(error.to_string());
+            true
+        }
+    }
+}
+
 fn handle_tray(state: &mut AppState, action: TrayAction, tx: &mut Tx) {
     match action {
         TrayAction::Start => start_recording(state),
         TrayAction::Stop => stop_recording(state),
+        TrayAction::CancelDictation => {
+            if state.dictation_control.cancel() {
+                state.notice = None;
+            }
+        }
         TrayAction::Show => show_window(),
         TrayAction::OpenFolder => open_folder(state),
         TrayAction::Quit => quit(state, tx),
@@ -252,11 +343,28 @@ fn handle_intent(state: &mut AppState, intent: UiIntent, tx: &mut Tx) {
                 run_action(state, action);
             }
         }
+        UiIntent::DismissDictation => {
+            state.notice = None;
+            state.dictation_control.dismiss();
+        }
+        UiIntent::ApplyHotkey => {
+            if let Some(message) = state
+                .dictation_control
+                .apply_hotkey(&state.hotkey_draft.text)
+            {
+                state.notice = Some(message);
+            }
+        }
     }
 }
 
 fn start_recording(state: &mut AppState) {
     if !state.phase.can_start() {
+        return;
+    }
+    if let Err(message) = dictation::meeting_start_allowed(&state.dictation_control.dictation) {
+        state.notice = Some(message.to_owned());
+        show_window();
         return;
     }
     state.notice = None;
@@ -418,8 +526,13 @@ fn open_folder(state: &mut AppState) {
 
 fn quit(state: &mut AppState, tx: &mut Tx) {
     state.quitting = true;
+    // A dictation stops and commits like a take: both get the same bounded
+    // wait for their text or their file.
+    state.dictation_control.stop();
     if let Some(session) = &state.session {
         session.stop();
+    }
+    if state.session.is_some() || state.dictation_control.session.is_some() {
         state.quit_deadline = Some(Instant::now() + Duration::from_secs(2));
         tx.wake_after(Duration::from_millis(100));
     } else {

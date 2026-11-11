@@ -7,6 +7,7 @@ A privacy-first recording & transcription app.
 - Offline-first
 - On-device transcription
 - System audio + microphone capture
+- Global-hotkey dictation: speak, and the text is typed into the focused app
 - Single-file Ogg Opus or WAV recording
 - Simple local storage
 - Featherlight UI
@@ -28,6 +29,19 @@ show the state while the window is hidden. The previous egui shell is still
 available with `--no-default-features --features egui,linux`. See
 [`apps/koe-desktop/README.md`](apps/koe-desktop/README.md) for the framework
 choice and the platform limits.
+
+While koe sits in the background, a configurable global hotkey (the default is
+`Ctrl+Shift+Space`) starts dictation from the microphone; press it again and
+the speech is transcribed on-device and inserted into whatever app holds
+keyboard focus, Japanese included. A misfire is correctable: **Cancel
+dictation** in the menu bar discards without typing. On Linux the hotkey
+needs X11 — without an X server koe refuses to arm it, and under Wayland it
+fires only while an X11/XWayland window has focus — and the text is pasted
+through the clipboard (with the previous clipboard restored), so a running
+input method cannot mangle it; a GGUF model file is required. macOS and
+Windows type Unicode key events; macOS uses the system speech model and
+needs the accessibility permission. The binding, model, and language persist
+in a settings file and are edited in the window.
 
 ## Command line
 

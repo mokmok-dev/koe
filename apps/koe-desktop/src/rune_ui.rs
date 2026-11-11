@@ -5,9 +5,12 @@ use std::time::{Duration, Instant};
 use koe_capture::Source;
 use koe_record::Format;
 use rune::tok::{self, type_};
-use rune::{Color, Cx, El, TextStyle, col, el, row, text};
+use rune::{Color, Cx, El, TextStyle, col, el, row, text, text_input};
 
+use crate::dictation::Dictation;
+use crate::hotkey;
 use crate::rune_app::{AppState, UiIntent};
+use crate::settings;
 use crate::state::{Phase, Sources};
 
 const RED: Color = Color {
@@ -50,6 +53,7 @@ pub fn view(state: &AppState, _: &mut Cx<AppState>) -> El {
         .child(primary_button(state, &theme))
         .child(sources(state, &theme))
         .child(format_choice(state, &theme))
+        .child(dictation(state, &theme))
         .child(folder(state, &theme));
     if let Some(notice) = &state.notice {
         content = content.child(banner(notice.as_str(), AMBER));
@@ -59,6 +63,20 @@ pub fn view(state: &AppState, _: &mut Cx<AppState>) -> El {
     {
         content = content.child(banner(
             "No menu bar icon. Keep this window open to control recordings.",
+            AMBER,
+        ));
+        content = content.child(
+            text(error.as_str())
+                .font(TextStyle::new(10.0, 400.0))
+                .color(theme.text_secondary)
+                .truncate(),
+        );
+    }
+    if state.dictation_control.hotkeys.is_none()
+        && let Some(error) = &state.dictation_control.hotkey_error
+    {
+        content = content.child(banner(
+            "No global hotkey. Dictation needs a desktop that lets apps register shortcuts; on Linux that means X11. Press Enter in the Hotkey field to retry.",
             AMBER,
         ));
         content = content.child(
@@ -300,6 +318,135 @@ fn format_choice(state: &AppState, theme: &tok::Theme) -> El {
         row_content = row_content.child(choice);
     }
     row_content
+}
+
+fn dictation(state: &AppState, theme: &tok::Theme) -> El {
+    let mut column = col().w_full().gap(6.0).child(
+        text("Dictation")
+            .font(type_::SECTION)
+            .color(theme.text_secondary),
+    );
+    column = column.child(
+        text(dictation_status(state).as_str())
+            .font(type_::BODY)
+            .color(theme.text),
+    );
+    column = column.child(field_row(
+        theme,
+        "Hotkey",
+        text_input(&state.hotkey_draft, TextStyle::new(13.0, 400.0))
+            .single_line()
+            .placeholder("Ctrl+Shift+Space", theme.text_secondary)
+            .w_full()
+            .on_edit(|s: &mut AppState| &mut s.hotkey_draft)
+            .on_submit(|s: &mut AppState, _| s.pending = Some(UiIntent::ApplyHotkey)),
+    ));
+    let draft = state.hotkey_draft.text.trim();
+    if let Some(draft) = settings::value_or_none(draft) {
+        match hotkey::parse(draft) {
+            Err(error) => {
+                column = column.child(
+                    text(error.to_string().as_str())
+                        .font(type_::LABEL)
+                        .color(RED)
+                        .truncate(),
+                );
+            }
+            Ok(hotkey) if hotkey != state.dictation_control.settings.hotkey => {
+                column = column.child(
+                    text("Press Enter to apply this binding")
+                        .font(type_::LABEL)
+                        .color(theme.text_secondary),
+                );
+            }
+            Ok(_) => {}
+        }
+    }
+    column = column.child(field_row(
+        theme,
+        "Model",
+        text_input(&state.model_draft, TextStyle::new(13.0, 400.0))
+            .single_line()
+            .placeholder("/path/to/model.gguf", theme.text_secondary)
+            .w_full()
+            .on_edit(|s: &mut AppState| &mut s.model_draft),
+    ));
+    column = column.child(
+        text(model_hint(state).as_str())
+            .font(type_::LABEL)
+            .color(theme.text_secondary),
+    );
+    column = column.child(field_row(
+        theme,
+        "Language",
+        text_input(&state.language_draft, TextStyle::new(13.0, 400.0))
+            .single_line()
+            .placeholder("ja", theme.text_secondary)
+            .w_full()
+            .on_edit(|s: &mut AppState| &mut s.language_draft),
+    ));
+    if let Dictation::Done(_) = &state.dictation_control.dictation {
+        column = column.child(
+            el().padding(8.0)
+                .radius(8.0)
+                .fill(theme.control_track)
+                .role("button")
+                .label("Clear dictation")
+                .focusable(true)
+                .child(text("Clear").font(type_::LABEL).color(theme.text))
+                .on_press(|s: &mut AppState| s.pending = Some(UiIntent::DismissDictation)),
+        );
+    }
+    column
+}
+
+/// One settings field: a label and the input beside it.
+fn field_row(theme: &tok::Theme, label: &str, input: El) -> El {
+    row()
+        .w_full()
+        .items_center()
+        .gap(8.0)
+        .child(text(label).font(type_::LABEL).color(theme.text_secondary))
+        .child(input)
+}
+
+/// The status sentence the dictation section shows.
+fn dictation_status(state: &AppState) -> String {
+    let binding = hotkey::display(&state.dictation_control.settings.hotkey);
+    match &state.dictation_control.dictation {
+        Dictation::Idle => format!("Press {binding} anywhere to dictate"),
+        Dictation::Listening { .. } => {
+            let elapsed = state
+                .dictation_control
+                .dictation
+                .elapsed(Instant::now())
+                .map_or_else(String::new, crate::hud::elapsed_text);
+            format!("Dictating {elapsed} — press {binding} to stop")
+        }
+        Dictation::Stopping { .. } => "Transcribing — the text follows".to_owned(),
+        Dictation::Done(done) if done.failed() => done.failure.as_ref().map_or_else(
+            || "Dictation heard nothing".to_owned(),
+            |failure| format!("{}: {failure}", failure.headline()),
+        ),
+        Dictation::Done(done) => format!("Typed {}", done.text),
+    }
+}
+
+/// What the model field should explain on this platform.
+fn model_hint(state: &AppState) -> String {
+    #[cfg(target_os = "macos")]
+    {
+        if settings::value_or_none(&state.model_draft.text).is_none() {
+            return "Leave the model empty to use the system speech model".to_owned();
+        }
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        if settings::dictation_model(&state.dictation_control.settings).is_none() {
+            return "No transcription model set: dictation will refuse to start".to_owned();
+        }
+    }
+    "The GGUF file a dictation transcribes with".to_owned()
 }
 
 fn folder(state: &AppState, theme: &tok::Theme) -> El {
