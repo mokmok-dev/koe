@@ -59,6 +59,8 @@ pub enum TrayAction {
     CancelDictation,
     /// Show the main window.
     Show,
+    /// Show the settings screen.
+    ShowSettings,
     /// Open the recordings folder.
     OpenFolder,
     /// Exit the app.
@@ -103,6 +105,7 @@ impl Tray {
         let stop = MenuItem::with_id("stop", "Stop recording", state.can_stop, None);
         let cancel = MenuItem::with_id("cancel", "Cancel dictation", state.can_cancel, None);
         let show = MenuItem::with_id("show", "Open koe", true, None);
+        let settings = MenuItem::with_id("settings", "Settings…", true, None);
         let folder = MenuItem::with_id("folder", "Open recordings folder", true, None);
         let quit = MenuItem::with_id("quit", "Quit koe", true, None);
         let first_separator = PredefinedMenuItem::separator();
@@ -117,6 +120,7 @@ impl Tray {
             &cancel,
             &second_separator,
             &show,
+            &settings,
             &folder,
             &third_separator,
             &quit,
@@ -251,6 +255,7 @@ pub fn action_for(id: &MenuId) -> Option<TrayAction> {
         "stop" => Some(TrayAction::Stop),
         "cancel" => Some(TrayAction::CancelDictation),
         "show" => Some(TrayAction::Show),
+        "settings" => Some(TrayAction::ShowSettings),
         "folder" => Some(TrayAction::OpenFolder),
         "quit" => Some(TrayAction::Quit),
         _ => None,
@@ -320,6 +325,7 @@ mod tests {
             ("stop", TrayAction::Stop),
             ("cancel", TrayAction::CancelDictation),
             ("show", TrayAction::Show),
+            ("settings", TrayAction::ShowSettings),
             ("folder", TrayAction::OpenFolder),
             ("quit", TrayAction::Quit),
         ] {

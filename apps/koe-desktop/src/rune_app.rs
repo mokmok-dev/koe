@@ -26,6 +26,16 @@ thread_local! {
     static HUD: RefCell<Option<OverlayHandle<HudState>>> = const { RefCell::new(None) };
 }
 
+/// Which screen the main window shows.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Screen {
+    /// The recording status, controls, and last take.
+    #[default]
+    Recorder,
+    /// Every setting: dictation, sources, format, and the folder.
+    Settings,
+}
+
 /// A command the window or tray asked for.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum UiIntent {
@@ -45,6 +55,10 @@ pub enum UiIntent {
     DismissDictation,
     /// Commit the hotkey field.
     ApplyHotkey,
+    /// Show the settings screen.
+    ShowSettings,
+    /// Show the recorder screen.
+    ShowRecorder,
 }
 
 /// The shell's state.
@@ -57,6 +71,7 @@ pub struct AppState {
     pub(crate) tray_error: Option<String>,
     pub(crate) notice: Option<String>,
     pub(crate) pending: Option<UiIntent>,
+    pub(crate) screen: Screen,
     pub(crate) dictation_control: DictationControl,
     pub(crate) hotkey_draft: TextEdit,
     pub(crate) model_draft: TextEdit,
@@ -98,6 +113,7 @@ impl Default for AppState {
             tray_error: None,
             notice: warning,
             pending: None,
+            screen: Screen::default(),
             dictation_control,
             hotkey_draft,
             model_draft,
@@ -325,6 +341,10 @@ fn handle_tray(state: &mut AppState, action: TrayAction, tx: &mut Tx) {
             }
         }
         TrayAction::Show => show_window(),
+        TrayAction::ShowSettings => {
+            state.screen = Screen::Settings;
+            show_window();
+        }
         TrayAction::OpenFolder => open_folder(state),
         TrayAction::Quit => quit(state, tx),
     }
@@ -355,6 +375,8 @@ fn handle_intent(state: &mut AppState, intent: UiIntent, tx: &mut Tx) {
                 state.notice = Some(message);
             }
         }
+        UiIntent::ShowSettings => state.screen = Screen::Settings,
+        UiIntent::ShowRecorder => state.screen = Screen::Recorder,
     }
 }
 

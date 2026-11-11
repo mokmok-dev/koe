@@ -9,7 +9,7 @@ use rune::{Color, Cx, El, TextStyle, col, el, row, text, text_input};
 
 use crate::dictation::Dictation;
 use crate::hotkey;
-use crate::rune_app::{AppState, UiIntent};
+use crate::rune_app::{AppState, Screen, UiIntent};
 use crate::settings;
 use crate::state::{Phase, Sources};
 
@@ -48,13 +48,21 @@ pub fn view(state: &AppState, _: &mut Cx<AppState>) -> El {
         .padding(22.0)
         .gap(12.0)
         .fill(theme.bg)
-        .child(header(state, &theme))
-        .child(status_card(state, &theme))
-        .child(primary_button(state, &theme))
-        .child(sources(state, &theme))
-        .child(format_choice(state, &theme))
-        .child(dictation(state, &theme))
-        .child(folder(state, &theme));
+        .child(header(state, &theme));
+    match state.screen {
+        Screen::Recorder => {
+            content = content
+                .child(status_card(state, &theme))
+                .child(primary_button(state, &theme));
+        }
+        Screen::Settings => {
+            content = content
+                .child(dictation(state, &theme))
+                .child(sources(state, &theme))
+                .child(format_choice(state, &theme))
+                .child(folder(state, &theme));
+        }
+    }
     if let Some(notice) = &state.notice {
         content = content.child(banner(notice.as_str(), AMBER));
     }
@@ -110,12 +118,30 @@ fn header(state: &AppState, theme: &tok::Theme) -> El {
                 .color(theme.text_secondary),
         )
         .child(el().grow(1.0))
+        .child(screen_button(state, theme))
         .child(
             el().padding(8.0)
                 .radius(10.0)
                 .fill(colour.alpha(0.16))
                 .child(text(label).font(type_::SECTION).color(colour)),
         )
+}
+
+/// The header button that flips the window between the two screens.
+fn screen_button(state: &AppState, theme: &tok::Theme) -> El {
+    let (label, intent) = if state.screen == Screen::Settings {
+        ("Back", UiIntent::ShowRecorder)
+    } else {
+        ("Settings", UiIntent::ShowSettings)
+    };
+    el().padding(8.0)
+        .radius(8.0)
+        .fill(theme.control_track)
+        .role("button")
+        .label(label)
+        .focusable(true)
+        .child(text(label).font(type_::LABEL).color(theme.text))
+        .on_press(move |s: &mut AppState| s.pending = Some(intent))
 }
 
 fn status_card(state: &AppState, theme: &tok::Theme) -> El {

@@ -387,7 +387,9 @@ impl Shell {
                     self.notice = None;
                 }
             }
-            TrayAction::Show => self.show_window(),
+            // This shell has no settings screen, so both menu items open
+            // the window.
+            TrayAction::Show | TrayAction::ShowSettings => self.show_window(),
             TrayAction::OpenFolder => self.open_folder(cx),
             TrayAction::Quit => self.quit(cx),
         }
