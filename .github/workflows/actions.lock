@@ -3,16 +3,50 @@
 # Docs: https://gh.io/actions-lockfile
 version: 'v0.0.3'
 workflows:
+    '.github/workflows/mutants.yaml':
+        - 'actions/cache@v6.1.0'
+        - 'actions/checkout@v7.0.1'
+        - 'determinatesystems/determinate-nix-action@v3.24.2'
+        - 'determinatesystems/flakehub-cache-action@v3.24.2'
     '.github/workflows/nix.yaml': []
     '.github/workflows/windows.yaml':
         - 'actions/checkout@v7.0.1'
         - 'dtolnay/rust-toolchain@stable'
 dependencies:
+    'actions/cache@v6.1.0':
+        ref: 'v6.1.0'
+        commit: 'sha1-55cc8345863c7cc4c66a329aec7e433d2d1c52a9'
+        owner_id: 44036562
+        repo_id: 215566462
     'actions/checkout@v7.0.1':
         ref: 'v7.0.1'
         commit: 'sha1-3d3c42e5aac5ba805825da76410c181273ba90b1'
         owner_id: 44036562
         repo_id: 197814629
+    'determinatesystems/determinate-nix-action@v3.24.2':
+        ref: 'v3.24.2'
+        commit: 'sha1-16f94ba7aae399b9f9077c254b6719ec6de7e3e3'
+        owner_id: 80991770
+        repo_id: 983748827
+        uses:
+            - 'determinatesystems/nix-installer-action@9383ce2bf08796b65508822f5982f49151badc4e'
+    'determinatesystems/flakehub-cache-action@v3.24.2':
+        ref: 'v3.24.2'
+        commit: 'sha1-f00fba8dc0949d63cbbb7d33da7912417d588d75'
+        owner_id: 80991770
+        repo_id: 918259998
+        uses:
+            - 'determinatesystems/magic-nix-cache-action@f69a2d3e148e90223fe63ab6e3f6331f2e7e33dc'
+    'determinatesystems/magic-nix-cache-action@f69a2d3e148e90223fe63ab6e3f6331f2e7e33dc':
+        ref: 'main'
+        commit: 'sha1-f69a2d3e148e90223fe63ab6e3f6331f2e7e33dc'
+        owner_id: 80991770
+        repo_id: 657706878
+    'determinatesystems/nix-installer-action@9383ce2bf08796b65508822f5982f49151badc4e':
+        ref: 'main'
+        commit: 'sha1-9383ce2bf08796b65508822f5982f49151badc4e'
+        owner_id: 80991770
+        repo_id: 588678074
     'dtolnay/rust-toolchain@stable':
         ref: 'stable'
         commit: 'sha1-b725eda525362e7cf34af9a7243cac1e3f01a7ec'

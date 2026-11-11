@@ -83,17 +83,18 @@ cargo test -p koe-capture-core
 # Facade and the host backend.
 cargo test -p koe-capture --features linux
 
-# Every Linux gate: clippy, tests, mutation score, macOS check, Windows check.
+# Every Linux gate: clippy, tests, macOS check, Windows check.
 nix flake check
 
-# Only the mutation gate.
-nix build .#checks.x86_64-linux.mutation
+# Mutation testing: the whole workspace, or only the lines a branch changed.
+# CI also excludes koe-transcribe-ggml and koe-record, whose rebuilds dominate.
+cargo mutants --iterate
+cargo mutants --iterate --in-diff <(git diff origin/main)
 
 # Inspect the default microphone and system-audio devices on the host.
 cargo run -p koe-capture --features linux --example probe
 ```
 
-The mutation gate targets `koe-capture-core`. The OS crates are separate
-crates, so no mutation exclusion is needed. Native macOS and Windows CI jobs
-run clippy and the test suite against their backends. They compile and link,
-but they do not open a real capture device.
+Mutation testing runs in the `mutants` workflow. Native macOS and Windows CI
+jobs run clippy and the test suite against their backends. They compile and
+link, but they do not open a real capture device.

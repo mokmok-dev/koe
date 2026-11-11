@@ -1,0 +1,64 @@
+# Mutation testing runs here rather than in `nix flake check`, because a full run
+# takes far longer than every other check together. `--iterate` never retests a
+# mutant an earlier run recorded as caught or unviable: a pull request tests the
+# changed lines that are not already recorded, and main tests everything not
+# already recorded. The first run on main is therefore the only full one; delete
+# the branch's cache entries to force another. A test weakened after its mutant
+# was recorded as caught stays undetected until then.
+name: mutants
+on:
+  pull_request:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+permissions:
+  id-token: write
+  contents: read
+jobs:
+  mutants:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          # The three-dot diff needs a merge base with the base branch.
+          fetch-depth: 0
+      - uses: DeterminateSystems/determinate-nix-action@v3.24.2
+      - uses: DeterminateSystems/flakehub-cache-action@v3.24.2
+      - uses: actions/cache/restore@v6.1.0
+        with:
+          path: mutants.out
+          key: mutants-${{ github.head_ref || github.ref_name }}-${{ github.sha }}
+          # A run continues from its own branch; a pull request may also start
+          # from main's history. Main never inherits a pull request's cache.
+          restore-keys: |
+            mutants-${{ github.head_ref }}-
+            mutants-main-
+      - name: Diff against the base branch
+        if: github.event_name == 'pull_request'
+        env:
+          BASE_REF: ${{ github.event.pull_request.base.ref }}
+        # fetch-depth: 0 already fetched every head into refs/remotes/origin.
+        run: git diff --no-color "origin/$BASE_REF...HEAD" > "$RUNNER_TEMP/changed.diff"
+      - name: Run mutants
+        env:
+          DIFF: ${{ github.event_name == 'pull_request' && format('{0}/changed.diff', runner.temp) }}
+        run: |
+          # The ggml backend rebuilds its C++ library per mutant, and the bundled
+          # libopus rebuild dwarfs the recording crate's run.
+          nix develop --command cargo mutants \
+            --jobs 8 \
+            --exclude koe-transcribe-ggml \
+            --exclude koe-record \
+            --iterate \
+            ${DIFF:+--in-diff "$DIFF"}
+      - uses: actions/cache/save@v6.1.0
+        # An empty diff, a diff without Rust files, or a diff that matches no
+        # mutant exits before cargo-mutants creates mutants.out.
+        if: always() && hashFiles('mutants.out/mutants.json') != ''
+        with:
+          path: mutants.out
+          key: mutants-${{ github.head_ref || github.ref_name }}-${{ github.sha }}
