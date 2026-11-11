@@ -419,4 +419,56 @@ mod tests {
         assert_eq!(loaded.model, Some(PathBuf::from("tiny.gguf")));
         assert_eq!(loaded.language, Some("ja".to_owned()));
     }
+
+    #[test]
+    fn presses_stay_at_zero_without_hotkeys() {
+        let root = tempfile::tempdir().unwrap();
+        let control = control(root.path());
+        assert_eq!(control.presses(), 0);
+    }
+
+    #[test]
+    fn a_second_mount_does_nothing_after_the_first() {
+        let root = tempfile::tempdir().unwrap();
+        let mut control = control(root.path());
+        let waker = repaint(|| {});
+        let _ = control.mount(&waker);
+        assert_eq!(control.mount(&waker), None);
+    }
+
+    // The microphone opens before the model loads, and a headless macOS
+    // runner never answers the open, so the real thread this exercises
+    // cannot report there within a bound.
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn a_failed_dictation_surfaces_its_notice_and_dismisses() {
+        let root = tempfile::tempdir().unwrap();
+        let mut control = control(root.path());
+        control.settings.model = Some(PathBuf::from("tiny.gguf"));
+        assert_eq!(control.toggle(false), None);
+        assert!(control.session.is_some());
+
+        let mut notice = None;
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while control.session.is_some() {
+            assert!(
+                Instant::now() < deadline,
+                "the dictation thread did not report"
+            );
+            notice = control.poll().or(notice);
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let notice = notice.unwrap();
+        assert!(
+            !notice.starts_with("Typed"),
+            "a failed dictation reports its failure, not its text: {notice}"
+        );
+        assert!(
+            !notice.starts_with("recorder thread did not start"),
+            "the thread reports a real outcome, not a lost one: {notice}"
+        );
+        assert!(matches!(control.dictation, Dictation::Done(_)));
+        control.dismiss();
+        assert!(matches!(control.dictation, Dictation::Idle));
+    }
 }

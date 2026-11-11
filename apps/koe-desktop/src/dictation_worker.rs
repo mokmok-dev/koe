@@ -612,4 +612,34 @@ mod tests {
             Some(Snapshot::Nothing)
         ));
     }
+
+    #[test]
+    fn push_bounded_keeps_a_full_backlog_at_the_limit() {
+        let mut backlog = vec![0.0_f32; BACKLOG_LIMIT - 1];
+        push_bounded(&mut backlog, &[7.0]);
+        assert_eq!(backlog.len(), BACKLOG_LIMIT);
+        assert_eq!(backlog[BACKLOG_LIMIT - 1], 7.0);
+
+        push_bounded(&mut backlog, &[8.0]);
+        assert_eq!(backlog.len(), BACKLOG_LIMIT);
+        assert_eq!(backlog[0], 0.0);
+        assert_eq!(backlog[BACKLOG_LIMIT - 1], 8.0);
+    }
+
+    #[test]
+    fn push_bounded_drops_the_oldest_once_full() {
+        let half = BACKLOG_LIMIT / 2;
+        let mut backlog = vec![0.0_f32; half];
+        push_bounded(&mut backlog, &vec![1.0; half]);
+        assert_eq!(backlog.len(), BACKLOG_LIMIT);
+
+        push_bounded(&mut backlog, &vec![2.0; half]);
+        assert_eq!(backlog.len(), BACKLOG_LIMIT);
+        assert_eq!(backlog[0], 1.0);
+        assert_eq!(backlog[BACKLOG_LIMIT - 1], 2.0);
+        assert!(
+            backlog.iter().all(|&sample| sample > 0.0),
+            "the zeros the overflow dropped are gone"
+        );
+    }
 }

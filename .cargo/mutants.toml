@@ -44,6 +44,37 @@ exclude_re = [
   # same silence packet, and a non-empty buffer short-circuits the `||` before
   # the comparison runs.
   "koe-record/src/file.rs:205:60: replace == with != in <impl AudioFile for OggOpusFile>::finish",
+
+  # Equivalent mutant: CONTROL and SHIFT are disjoint bitflags, so the
+  # default binding's modifiers are the same under `|` and `^`.
+  "replace \\| with \\^ in default_hotkey",
+
+  # Equivalent mutant: the overflow is zero at the exact backlog limit, so
+  # the `>=` branch drains nothing.
+  "replace > with >= in push_bounded",
+
+  # The hotkey adapter, the mounts, and the rebind path need a desktop
+  # shortcut registrar; the check host has no display, so their mutants
+  # would report as missed with no test able to run them. The parser,
+  # the key table, and the display stay in scope.
+  "hotkey\\.rs:.*(press_queue|Hotkeys::presses|Hotkeys::rebind|x_reachable)",
+
+  # The mounts and the rebind-retry in apply_hotkey take the same adapter
+  # road: a registration that succeeds on an interactive desktop returns
+  # None there and a failure notice on the check host, so no test can pin
+  # either without breaking one of the two hosts. The press count is only
+  # observable with a live registrar, and the stop flag and the success
+  # notice need a live capture pipeline the check host does not have.
+  "dictation_control\\.rs:.*(DictationControl::mount|DictationControl::remount|DictationControl::stop|apply_hotkey)",
+  "dictation_control\\.rs:.*replace DictationControl::presses -> usize with 0",
+  "dictation_control\\.rs:.*replace match guard done\\.failed\\(\\) with true",
+
+  # The dictation engine's OS adapters: the session flags and the thread
+  # drop matter only with a live microphone, the pump and the finish
+  # decision need an open capture stream, and the insertion paths need a
+  # clipboard and a synthetic keyboard. None exist on the check host, so
+  # their mutants would report as missed with no test able to run them.
+  "dictation_worker\\.rs:.*(Session::stop|Session::cancel|Drop for Session|replace pump ->|in finish|type_text|paste_text|replace snapshot ->|replace restore|paste_keyboard|send_paste_shortcut|type_unicode)"
 ]
 
 # Nextest skips doctests, so their coverage is absent from this gate.

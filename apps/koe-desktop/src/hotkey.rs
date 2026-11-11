@@ -617,4 +617,112 @@ mod tests {
         #[cfg(not(target_os = "macos"))]
         assert_eq!(display(&hotkey), "Ctrl+Alt+Shift+Super+PageDown");
     }
+
+    /// One token: it parses to `code` and displays as `Ctrl+shown`.
+    fn round_trips(token: &str, code: Code, shown: &str) {
+        let hotkey = parse(&format!("Ctrl+{token}"))
+            .unwrap_or_else(|error| panic!("token {token}: {error}"));
+        assert_eq!(
+            hotkey,
+            HotKey::new(Some(Modifiers::CONTROL), code),
+            "token {token}"
+        );
+        assert_eq!(
+            display(&hotkey),
+            format!("Ctrl+{shown}"),
+            "display of {token}"
+        );
+    }
+
+    #[test]
+    fn every_letter_and_digit_token_round_trips() {
+        let rows: &[(&str, Code, &str)] = &[
+            ("a", Code::KeyA, "A"),
+            ("b", Code::KeyB, "B"),
+            ("c", Code::KeyC, "C"),
+            ("d", Code::KeyD, "D"),
+            ("e", Code::KeyE, "E"),
+            ("f", Code::KeyF, "F"),
+            ("g", Code::KeyG, "G"),
+            ("h", Code::KeyH, "H"),
+            ("i", Code::KeyI, "I"),
+            ("j", Code::KeyJ, "J"),
+            ("k", Code::KeyK, "K"),
+            ("l", Code::KeyL, "L"),
+            ("m", Code::KeyM, "M"),
+            ("n", Code::KeyN, "N"),
+            ("o", Code::KeyO, "O"),
+            ("p", Code::KeyP, "P"),
+            ("q", Code::KeyQ, "Q"),
+            ("r", Code::KeyR, "R"),
+            ("s", Code::KeyS, "S"),
+            ("t", Code::KeyT, "T"),
+            ("u", Code::KeyU, "U"),
+            ("v", Code::KeyV, "V"),
+            ("w", Code::KeyW, "W"),
+            ("x", Code::KeyX, "X"),
+            ("y", Code::KeyY, "Y"),
+            ("z", Code::KeyZ, "Z"),
+            ("0", Code::Digit0, "0"),
+            ("1", Code::Digit1, "1"),
+            ("2", Code::Digit2, "2"),
+            ("3", Code::Digit3, "3"),
+            ("4", Code::Digit4, "4"),
+            ("5", Code::Digit5, "5"),
+            ("6", Code::Digit6, "6"),
+            ("7", Code::Digit7, "7"),
+            ("8", Code::Digit8, "8"),
+            ("9", Code::Digit9, "9"),
+        ];
+        for (token, code, shown) in rows {
+            round_trips(token, *code, shown);
+        }
+    }
+
+    #[test]
+    fn every_named_key_token_round_trips() {
+        let rows: &[(&str, Code, &str)] = &[
+            ("f1", Code::F1, "F1"),
+            ("f2", Code::F2, "F2"),
+            ("f3", Code::F3, "F3"),
+            ("f4", Code::F4, "F4"),
+            ("f5", Code::F5, "F5"),
+            ("f6", Code::F6, "F6"),
+            ("f7", Code::F7, "F7"),
+            ("f8", Code::F8, "F8"),
+            ("f9", Code::F9, "F9"),
+            ("f10", Code::F10, "F10"),
+            ("f11", Code::F11, "F11"),
+            ("f12", Code::F12, "F12"),
+            ("space", Code::Space, "Space"),
+            ("tab", Code::Tab, "Tab"),
+            ("enter", Code::Enter, "Enter"),
+            ("escape", Code::Escape, "Escape"),
+            ("backspace", Code::Backspace, "Backspace"),
+            ("delete", Code::Delete, "Delete"),
+            ("insert", Code::Insert, "Insert"),
+            ("home", Code::Home, "Home"),
+            ("end", Code::End, "End"),
+            ("pageup", Code::PageUp, "PageUp"),
+            ("pagedown", Code::PageDown, "PageDown"),
+            ("up", Code::ArrowUp, "Up"),
+            ("down", Code::ArrowDown, "Down"),
+            ("left", Code::ArrowLeft, "Left"),
+            ("right", Code::ArrowRight, "Right"),
+            ("comma", Code::Comma, "Comma"),
+            ("period", Code::Period, "Period"),
+            ("slash", Code::Slash, "Slash"),
+            ("semicolon", Code::Semicolon, "Semicolon"),
+            ("quote", Code::Quote, "Quote"),
+            ("bracketleft", Code::BracketLeft, "BracketLeft"),
+            ("bracketright", Code::BracketRight, "BracketRight"),
+            ("minus", Code::Minus, "Minus"),
+            ("equal", Code::Equal, "Equal"),
+            ("backquote", Code::Backquote, "Backquote"),
+            ("backslash", Code::Backslash, "Backslash"),
+        ];
+        for (token, code, shown) in rows {
+            round_trips(token, *code, shown);
+        }
+    }
 }
