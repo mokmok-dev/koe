@@ -34,7 +34,9 @@ While koe sits in the background, a configurable global hotkey (the default is
 `Ctrl+Shift+Space`) starts dictation from the microphone; press it again and
 the speech is transcribed on-device and inserted into whatever app holds
 keyboard focus, Japanese included. The overlay HUD shows the words as they are
-recognized while it captures. A misfire is correctable: **Cancel
+recognized while it captures: the macOS system model and a streaming GGUF
+family report them as they go, while a batch model such as Whisper reports at
+the stop. A misfire is correctable: **Cancel
 dictation** in the menu bar discards without typing. On Linux the hotkey
 needs X11 — without an X server koe refuses to arm it, and under Wayland it
 fires only while an X11/XWayland window has focus — and the text is pasted
