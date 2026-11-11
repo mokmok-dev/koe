@@ -641,6 +641,10 @@ mod tests {
             model: Some(PathBuf::from(OsString::from_vec(vec![0xFF]))),
             ..DictationSettings::default()
         };
-        assert_eq!(dictation_model(&settings), None);
+        let resolved = dictation_model(&settings);
+        #[cfg(target_os = "macos")]
+        assert_eq!(resolved, Some(Model::system_speech()));
+        #[cfg(not(target_os = "macos"))]
+        assert_eq!(resolved, None);
     }
 }

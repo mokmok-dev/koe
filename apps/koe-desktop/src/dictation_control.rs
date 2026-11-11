@@ -338,6 +338,9 @@ mod tests {
         }
     }
 
+    // On macOS the system speech model always resolves, so the no-model
+    // refusal this pins cannot happen there.
+    #[cfg(not(target_os = "macos"))]
     #[test]
     fn a_press_without_a_model_is_refused_without_a_thread() {
         let root = tempfile::tempdir().unwrap();
@@ -358,6 +361,10 @@ mod tests {
         assert!(control.session.is_none());
     }
 
+    // The microphone opens before the model loads, and a headless macOS
+    // runner never answers the open, so the real thread this exercises
+    // cannot report there within a bound.
+    #[cfg(not(target_os = "macos"))]
     #[test]
     fn a_cancel_discards_the_dictation_the_thread_captured() {
         let root = tempfile::tempdir().unwrap();
