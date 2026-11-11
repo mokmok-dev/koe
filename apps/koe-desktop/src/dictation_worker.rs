@@ -17,6 +17,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Sender, TryRecvError};
 use std::sync::{Mutex, PoisonError};
 use std::thread;
+#[cfg(target_os = "linux")]
 use std::time::Duration;
 
 use koe_capture::{Source, StreamSpec};

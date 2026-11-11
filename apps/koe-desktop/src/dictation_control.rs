@@ -312,6 +312,7 @@ mod tests {
     #![allow(clippy::unwrap_used)]
 
     use std::path::PathBuf;
+    #[cfg(not(target_os = "macos"))]
     use std::time::Duration;
 
     use super::*;
