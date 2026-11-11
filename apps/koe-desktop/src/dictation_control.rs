@@ -323,6 +323,7 @@ mod tests {
     }
 
     /// Waits until the dictation thread has reported, with a bound.
+    #[cfg(not(target_os = "macos"))]
     fn reported(control: &mut DictationControl) {
         let deadline = Instant::now() + Duration::from_secs(5);
         loop {

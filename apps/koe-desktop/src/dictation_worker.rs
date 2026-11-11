@@ -39,11 +39,13 @@ const BACKLOG_LIMIT: usize = SAMPLE_RATE as usize * 60;
 
 /// How long the clipboard takes to settle before the paste shortcut is sent,
 /// so the focused app reads the new selection and not the previous one.
+#[cfg(target_os = "linux")]
 const PASTE_SETTLE: Duration = Duration::from_millis(100);
 
 /// How long after the paste the previous clipboard comes back. Nothing
 /// acknowledges that the target read the paste, so the wait is a bounded
 /// settling policy, the same one hex, the reference dictation app, uses.
+#[cfg(target_os = "linux")]
 const RESTORE_DELAY: Duration = Duration::from_millis(500);
 
 /// One model load at a time. Rapid stop-and-restart cycles queue here instead
