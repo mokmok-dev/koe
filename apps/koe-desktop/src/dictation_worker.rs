@@ -661,6 +661,30 @@ mod tests {
     }
 
     #[test]
+    fn a_session_reports_the_transcript_its_thread_publishes() {
+        let thread_side = LiveTranscript::default();
+        let (_sender, events) = std::sync::mpsc::channel();
+        let session = Session {
+            stop: Arc::new(AtomicBool::new(false)),
+            cancel: Arc::new(AtomicBool::new(false)),
+            events,
+            transcript: thread_side.clone(),
+        };
+        assert_eq!(session.transcript(), "");
+        thread_side.apply(&Event::Volatile {
+            text: "こんにちは".into(),
+            revision: 1,
+        });
+        assert_eq!(session.transcript(), "こんにちは");
+        thread_side.apply(&Event::Committed {
+            text: "こんにちは".into(),
+            start_ms: 0,
+            end_ms: 500,
+        });
+        assert_eq!(session.transcript(), "こんにちは");
+    }
+
+    #[test]
     fn the_backlog_keeps_every_sample_until_it_is_full() {
         let mut backlog = Vec::new();
         push_bounded(&mut backlog, &[0.1, 0.2]);
