@@ -100,7 +100,17 @@ private final class SpeechEngine: @unchecked Sendable {
         guard installed.contains(normalized) else {
             return SetupOutcome(status: -3, engine: nil)
         }
-        let transcriber = SpeechTranscriber(locale: normalized, preset: .transcription)
+        // The `.transcription` preset reports finalized phrases only, so a
+        // dictation would have nothing to draw until it stopped. Volatile
+        // results are the tentative `isFinal == false` ones the HUD shows
+        // while the user speaks; the attribute keeps the time codes the
+        // committed phrases carry.
+        let transcriber = SpeechTranscriber(
+            locale: normalized,
+            transcriptionOptions: [],
+            reportingOptions: [.volatileResults],
+            attributeOptions: [.audioTimeRange]
+        )
         guard let format = await SpeechAnalyzer.bestAvailableAudioFormat(compatibleWith: [transcriber]) else {
             // The assets are absent and this backend never downloads.
             return SetupOutcome(status: -3, engine: nil)

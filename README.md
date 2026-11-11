@@ -16,8 +16,8 @@ A privacy-first recording & transcription app.
 ## Desktop app
 
 The desktop app shows the recording state in the menu bar and an overlay HUD
-while a take runs. GPUI owns the window and the overlay, and `tray-icon` owns
-the menu bar item. Build it with the host feature:
+while a take or a dictation runs. GPUI owns the window and the overlay, and
+`tray-icon` owns the menu bar item. Build it with the host feature:
 
 ```console
 cargo run -p koe-desktop --features linux
@@ -33,7 +33,10 @@ choice and the platform limits.
 While koe sits in the background, a configurable global hotkey (the default is
 `Ctrl+Shift+Space`) starts dictation from the microphone; press it again and
 the speech is transcribed on-device and inserted into whatever app holds
-keyboard focus, Japanese included. A misfire is correctable: **Cancel
+keyboard focus, Japanese included. The overlay HUD shows the words as they are
+recognized while it captures: the macOS system model and a streaming GGUF
+family report them as they go, while a batch model such as Whisper reports at
+the stop. A misfire is correctable: **Cancel
 dictation** in the menu bar discards without typing. On Linux the hotkey
 needs X11 — without an X server koe refuses to arm it, and under Wayland it
 fires only while an X11/XWayland window has focus — and the text is pasted

@@ -14,14 +14,36 @@ use gpui::{
 use gpui_kit::component::{Theme, ThemeMode, TitleBar};
 
 use crate::dictation;
-use crate::dictation_control::DictationControl;
+use crate::dictation_control::{DictationControl, Press};
+use crate::dictation_worker;
 use crate::engine::{self, Completion, EngineEvent};
-use crate::hud::{HudPhase, HudState};
+use crate::hud::{self, HudState};
 use crate::overlay;
 use crate::settings::{self, Settings};
 use crate::state::{Action, Event, Phase, Sources};
 use crate::tray::{Tray, TrayAction, TrayState, TrayStatus};
 use crate::ui::MainView;
+
+/// How long a refused hotkey press stays in the HUD.
+///
+/// The window notice and the tray tooltip are the lasting copies; the HUD
+/// only needs to hold the sentence long enough to read it.
+const REFUSAL_HOLD: Duration = Duration::from_secs(5);
+
+/// How often the shell looks at a running dictation.
+///
+/// The dictation thread publishes a new transcript once per 20 ms audio block,
+/// and the speech models report tentative phrases between blocks. A tick
+/// slower than that samples the transcript instead of following it, which
+/// reads as words arriving a beat late.
+const DICTATION_TICK: Duration = Duration::from_millis(20);
+
+/// How often the shell looks at a running take or a dictation whose transcript
+/// nothing draws.
+///
+/// The take HUD redraws its meters from smoothed levels, and `KOE_HUD=off`
+/// leaves the transcript with no reader, so neither needs the dictation tick.
+const ACTIVE_TICK: Duration = Duration::from_millis(100);
 
 /// Which of the window's two screens is showing.
 ///
@@ -61,6 +83,8 @@ pub struct Shell {
     hud_view: Option<Entity<overlay::HudView>>,
     last_hud: Option<HudState>,
     hud_enabled: bool,
+    /// A refused hotkey press shown in the HUD, and when it stops showing.
+    refusal: Option<(String, Instant)>,
     pending_show: bool,
     pending_quit: bool,
     pending_hud_close: Option<AnyWindowHandle>,
@@ -108,6 +132,7 @@ impl Shell {
             hud_view: None,
             last_hud: None,
             hud_enabled: hud_enabled(),
+            refusal: None,
             pending_show: false,
             pending_quit: false,
             pending_hud_close: None,
@@ -129,9 +154,20 @@ impl Shell {
         }
         let presses = self.dictation_control.presses();
         for _ in 0..presses {
-            if let Some(message) = self.dictation_control.toggle(self.phase.is_active()) {
-                self.notice = Some(message);
-                self.show_window();
+            // A press makes the previous refusal stale, whether or not this
+            // one is also refused.
+            self.refusal = None;
+            match self.dictation_control.toggle(self.phase.is_active()) {
+                Some(Press::Refused(message)) => {
+                    self.refusal = Some((message.clone(), Instant::now() + REFUSAL_HOLD));
+                    self.notice = Some(message);
+                    self.show_window();
+                }
+                Some(Press::Failed(message)) => {
+                    self.notice = Some(message);
+                    self.show_window();
+                }
+                None => {}
             }
         }
         changed |= presses > 0;
@@ -161,9 +197,17 @@ impl Shell {
             {
                 tick.quit = true;
             }
-            tick.delay = Duration::from_millis(100);
-        } else if self.phase.is_active() || self.dictation_control.dictation.is_active() {
-            tick.delay = Duration::from_millis(100);
+            tick.delay = ACTIVE_TICK;
+        } else if self.phase.is_active() {
+            tick.delay = ACTIVE_TICK;
+        } else if self.dictation_control.dictation.is_active() {
+            // Only the HUD reads the transcript; with `KOE_HUD=off` the slower
+            // tick keeps the tray and the state machine current for less work.
+            tick.delay = if self.hud_enabled {
+                DICTATION_TICK
+            } else {
+                ACTIVE_TICK
+            };
         } else if self.dictation_control.hotkeys.is_some() {
             // A press waits in the queue until the next tick. A dictation
             // start is where the lost audio is speech, so the idle tick that
@@ -468,18 +512,23 @@ impl Shell {
     }
 
     fn sync_hud(&mut self, cx: &mut Context<Self>) -> bool {
+        let now = Instant::now();
+        if self
+            .refusal
+            .as_ref()
+            .is_some_and(|(message, until)| hud::held_refusal(message, *until, now).is_none())
+        {
+            self.refusal = None;
+        }
         if !self.hud_enabled {
             return false;
         }
-        if !self.phase.is_active() {
+        let Some(next) = self.hud_state(now) else {
             if let Some(handle) = self.hud.take() {
                 self.pending_hud_close = Some(handle);
             }
             self.hud_view = None;
             return self.last_hud.take().is_some();
-        }
-        let Some(next) = self.hud_state() else {
-            return false;
         };
         if self.last_hud.as_ref() == Some(&next) {
             return false;
@@ -533,24 +582,24 @@ impl Shell {
         }
     }
 
-    fn hud_state(&self) -> Option<HudState> {
-        let phase = match &self.phase {
-            Phase::Arming { .. } => HudPhase::Starting,
-            Phase::Recording(_) => HudPhase::Recording,
-            Phase::Stopping { .. } => HudPhase::Saving,
-            Phase::Idle | Phase::Done(_) => return None,
-        };
-        let live = self.phase.live();
-        Some(HudState {
-            phase,
-            elapsed: self.phase.elapsed(Instant::now()).unwrap_or_default(),
-            live: [
-                live.contains(koe_capture::Source::Microphone),
-                live.contains(koe_capture::Source::SystemAudio),
-            ],
-            levels: self.levels,
-            warning: self.phase.warning().map(str::to_owned),
-        })
+    fn hud_state(&self, now: Instant) -> Option<HudState> {
+        let transcript = self
+            .dictation_control
+            .session
+            .as_ref()
+            .map_or_else(String::new, dictation_worker::Session::transcript);
+        let refusal = self
+            .refusal
+            .as_ref()
+            .and_then(|(message, until)| hud::held_refusal(message, *until, now));
+        HudState::for_frame(
+            &self.dictation_control.dictation,
+            &transcript,
+            &self.phase,
+            self.levels,
+            refusal,
+            now,
+        )
     }
 }
 

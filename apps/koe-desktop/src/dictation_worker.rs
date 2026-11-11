@@ -21,7 +21,7 @@ use std::thread;
 use std::time::Duration;
 
 use koe_capture::{Source, StreamSpec};
-use koe_transcribe::{AudioSpec, LiveSession, Options, Transcriber};
+use koe_transcribe::{AudioSpec, Event, LiveSession, LiveText, Options, Transcriber};
 
 use crate::dictation::{DictationOutcome, DictationPlan};
 use crate::engine::SAMPLE_RATE;
@@ -53,11 +53,49 @@ const RESTORE_DELAY: Duration = Duration::from_millis(500);
 /// hundreds of megabytes.
 static MODEL_LOAD: Mutex<()> = Mutex::new(());
 
+/// The recognized text so far, shared between the dictation thread and the
+/// shell.
+///
+/// The thread folds recognition events in and the shell reads the joined text
+/// on a tick. Both hold the lock only for that copy, so neither waits on
+/// inference.
+#[derive(Clone, Default)]
+struct LiveTranscript(Arc<Mutex<LiveText>>);
+
+impl LiveTranscript {
+    fn apply(&self, event: &Event) {
+        self.0
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .apply(event);
+    }
+
+    fn read(&self) -> String {
+        self.0
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .to_string()
+    }
+
+    /// Publishes the text the final inference committed, replacing the
+    /// provisional tail the last capture block left behind.
+    fn commit(&self, text: &str) {
+        let mut live = LiveText::new();
+        live.apply(&Event::Committed {
+            text: text.into(),
+            start_ms: 0,
+            end_ms: 0,
+        });
+        *self.0.lock().unwrap_or_else(PoisonError::into_inner) = live;
+    }
+}
+
 /// A running dictation.
 pub struct Session {
     stop: Arc<AtomicBool>,
     cancel: Arc<AtomicBool>,
     events: mpsc::Receiver<Box<DictationOutcome>>,
+    transcript: LiveTranscript,
 }
 
 impl Session {
@@ -70,16 +108,27 @@ impl Session {
         let (sender, events) = mpsc::channel();
         let stop = Arc::new(AtomicBool::new(false));
         let cancel = Arc::new(AtomicBool::new(false));
+        let transcript = LiveTranscript::default();
         let thread_stop = Arc::clone(&stop);
         let thread_cancel = Arc::clone(&cancel);
+        let thread_transcript = transcript.clone();
         thread::Builder::new()
             .name("koe-dictation".to_owned())
-            .spawn(move || run(&plan, &thread_stop, &thread_cancel, &sender))
+            .spawn(move || {
+                run(
+                    &plan,
+                    &thread_stop,
+                    &thread_cancel,
+                    &sender,
+                    &thread_transcript,
+                );
+            })
             .map_err(|error| DesktopError::Thread(error.to_string()))?;
         Ok(Self {
             stop,
             cancel,
             events,
+            transcript,
         })
     }
 
@@ -93,6 +142,12 @@ impl Session {
     pub fn cancel(&self) {
         self.cancel.store(true, Ordering::Release);
         self.stop();
+    }
+
+    /// The text the dictation has recognized so far.
+    #[must_use]
+    pub fn transcript(&self) -> String {
+        self.transcript.read()
     }
 
     /// Takes the thread's report without blocking.
@@ -128,8 +183,9 @@ fn run(
     stop: &Arc<AtomicBool>,
     cancel: &Arc<AtomicBool>,
     sender: &Sender<Box<DictationOutcome>>,
+    transcript: &LiveTranscript,
 ) {
-    let outcome = capture(plan, stop, cancel);
+    let outcome = capture(plan, stop, cancel, transcript);
     let _ = sender.send(Box::new(outcome));
 }
 
@@ -138,6 +194,7 @@ fn capture(
     plan: &DictationPlan,
     stop: &Arc<AtomicBool>,
     cancel: &Arc<AtomicBool>,
+    transcript: &LiveTranscript,
 ) -> DictationOutcome {
     let spec = match StreamSpec::new(Source::Microphone, SAMPLE_RATE, 1) {
         Ok(spec) => spec,
@@ -176,8 +233,8 @@ fn capture(
     if let Err(error) = spawned {
         return failed(DesktopError::Thread(error.to_string()));
     }
-    let (session, capture_failure) = pump(&mut stream, &ready, stop);
-    finish(stream, session, capture_failure, cancel)
+    let (session, capture_failure) = pump(&mut stream, &ready, stop, transcript);
+    finish(stream, session, capture_failure, cancel, transcript)
 }
 
 /// Reads the microphone until the take stops or the stream fails, feeding the
@@ -186,6 +243,7 @@ fn pump(
     stream: &mut koe_capture::CaptureStream,
     ready: &mpsc::Receiver<Result<LiveSession, DesktopError>>,
     stop: &Arc<AtomicBool>,
+    transcript: &LiveTranscript,
 ) -> (Option<LiveSession>, Option<DesktopError>) {
     let mut backlog: Vec<f32> = Vec::new();
     let mut session: Option<LiveSession> = None;
@@ -239,6 +297,13 @@ fn pump(
                 break;
             }
         }
+        if let Some(running) = &session {
+            // `poll` never waits for inference, and a latched failure is left
+            // to `finish`, which reports it with the text that did commit.
+            while let Ok(Some(event)) = running.poll() {
+                transcript.apply(&event);
+            }
+        }
     }
     (session, capture_failure)
 }
@@ -254,6 +319,7 @@ fn finish(
     session: Option<LiveSession>,
     capture_failure: Option<DesktopError>,
     cancel: &Arc<AtomicBool>,
+    transcript: &LiveTranscript,
 ) -> DictationOutcome {
     drop(stream);
     if cancel.load(Ordering::Acquire) {
@@ -289,6 +355,9 @@ fn finish(
             failure: None,
         };
     }
+    // The HUD's last TRANSCRIBING frame must show what is inserted, not a
+    // provisional tail the final inference revised or withdrew.
+    transcript.commit(&text);
     if !text.is_empty()
         && let Err(error) = type_text(&text)
     {
@@ -541,6 +610,78 @@ mod tests {
         assert_eq!(dictated_text(" hello world \n"), "hello world");
         assert_eq!(dictated_text(""), "");
         assert_eq!(dictated_text("   "), "");
+    }
+
+    #[test]
+    fn the_live_transcript_joins_committed_text_and_the_provisional_tail() {
+        let transcript = LiveTranscript::default();
+        transcript.apply(&Event::Committed {
+            text: "こんにちは".into(),
+            start_ms: 0,
+            end_ms: 500,
+        });
+        assert_eq!(transcript.read(), "こんにちは");
+        transcript.apply(&Event::Volatile {
+            text: "世界".into(),
+            revision: 1,
+        });
+        assert_eq!(transcript.read(), "こんにちは 世界");
+        transcript.apply(&Event::Volatile {
+            text: "皆さん".into(),
+            revision: 2,
+        });
+        assert_eq!(transcript.read(), "こんにちは 皆さん");
+    }
+
+    #[test]
+    fn the_committed_text_replaces_the_provisional_tail() {
+        let transcript = LiveTranscript::default();
+        transcript.apply(&Event::Committed {
+            text: "こんにちは".into(),
+            start_ms: 0,
+            end_ms: 500,
+        });
+        transcript.apply(&Event::Volatile {
+            text: "世界".into(),
+            revision: 1,
+        });
+        transcript.commit("こんにちは");
+        assert_eq!(transcript.read(), "こんにちは");
+    }
+
+    #[test]
+    fn a_clone_reads_what_the_capture_thread_folds_in() {
+        let thread_side = LiveTranscript::default();
+        let shell_side = thread_side.clone();
+        thread_side.apply(&Event::Volatile {
+            text: "hi".into(),
+            revision: 1,
+        });
+        assert_eq!(shell_side.read(), "hi");
+    }
+
+    #[test]
+    fn a_session_reports_the_transcript_its_thread_publishes() {
+        let thread_side = LiveTranscript::default();
+        let (_sender, events) = std::sync::mpsc::channel();
+        let session = Session {
+            stop: Arc::new(AtomicBool::new(false)),
+            cancel: Arc::new(AtomicBool::new(false)),
+            events,
+            transcript: thread_side.clone(),
+        };
+        assert_eq!(session.transcript(), "");
+        thread_side.apply(&Event::Volatile {
+            text: "こんにちは".into(),
+            revision: 1,
+        });
+        assert_eq!(session.transcript(), "こんにちは");
+        thread_side.apply(&Event::Committed {
+            text: "こんにちは".into(),
+            start_ms: 0,
+            end_ms: 500,
+        });
+        assert_eq!(session.transcript(), "こんにちは");
     }
 
     #[test]
