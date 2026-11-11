@@ -24,6 +24,10 @@ use crate::tray::{Tray, TrayAction, TrayState, TrayStatus};
 use crate::ui::MainView;
 
 /// Which of the window's two screens is showing.
+///
+/// The settings page selected inside gpui-kit's `Settings` is not part of this:
+/// GPUI drops an element's keyed state once that element stops rendering, so
+/// the settings screen opens on its first page after a visit to the recorder.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) enum Screen {
     /// The take status, the start and stop control, and the last take.
@@ -36,12 +40,13 @@ pub(crate) enum Screen {
 /// The shell's state, shared by the window, the tray, and the tick loop.
 #[allow(
     clippy::struct_excessive_bools,
-    reason = "the window requests are independent flags consumed once per tick"
+    reason = "the shell holds independent pending window requests and view flags; each flag is its own state machine"
 )]
 pub struct Shell {
     pub(crate) phase: Phase,
     pub(crate) settings: Settings,
     pub(crate) screen: Screen,
+    pub(crate) sidebar_collapsed: bool,
     pub(crate) session: Option<engine::Session>,
     pub(crate) levels: [f32; 2],
     pub(crate) tray: Option<Tray>,
@@ -57,7 +62,6 @@ pub struct Shell {
     last_hud: Option<HudState>,
     hud_enabled: bool,
     pending_show: bool,
-    pending_hide: bool,
     pending_quit: bool,
     pending_hud_close: Option<AnyWindowHandle>,
 }
@@ -68,8 +72,6 @@ pub struct Tick {
     pub delay: Duration,
     /// Whether to open or focus the main window.
     pub show: bool,
-    /// Whether to close the main window.
-    pub hide: bool,
     /// Whether to exit the application.
     pub quit: bool,
     /// The HUD window to close once the shell lease is released.
@@ -91,6 +93,7 @@ impl Shell {
             phase: Phase::Idle,
             settings: Settings::default(),
             screen: Screen::Recorder,
+            sidebar_collapsed: false,
             session: None,
             levels: [0.0; 2],
             tray: None,
@@ -106,7 +109,6 @@ impl Shell {
             last_hud: None,
             hud_enabled: hud_enabled(),
             pending_show: false,
-            pending_hide: false,
             pending_quit: false,
             pending_hud_close: None,
         }
@@ -147,7 +149,6 @@ impl Shell {
         let mut tick = Tick {
             delay: Duration::from_millis(250),
             show: false,
-            hide: false,
             quit: false,
             hud_close: self.pending_hud_close.take(),
         };
@@ -170,10 +171,8 @@ impl Shell {
             tick.delay = Duration::from_millis(50);
         }
         tick.show = self.pending_show;
-        tick.hide = self.pending_hide;
         tick.quit |= self.pending_quit;
         self.pending_show = false;
-        self.pending_hide = false;
         self.pending_quit = false;
         tick
     }
@@ -364,6 +363,12 @@ impl Shell {
         cx.notify();
     }
 
+    /// Collapses the sidebar to its icon strip, or expands it again.
+    pub fn toggle_sidebar(&mut self, cx: &mut Context<Self>) {
+        self.sidebar_collapsed = !self.sidebar_collapsed;
+        cx.notify();
+    }
+
     /// Commits the hotkey field's draft on Enter.
     ///
     /// The binding is committed here rather than while the user types,
@@ -400,14 +405,6 @@ impl Shell {
     /// Shows the window, or asks the tick loop to open it again.
     pub const fn show_window(&mut self) {
         self.pending_show = true;
-    }
-
-    /// Hides the window and keeps the tray icon.
-    pub fn hide_window(&mut self, cx: &mut Context<Self>) {
-        if self.window.is_some() {
-            self.pending_hide = true;
-        }
-        cx.notify();
     }
 
     /// Stops the take and the dictation, waits up to two seconds for their
@@ -563,8 +560,12 @@ fn hud_enabled() -> bool {
 
 fn main_window_options(cx: &App) -> WindowOptions {
     let mut options = TitleBar::window_options();
-    options.window_bounds = Some(WindowBounds::centered(size(px(440.0), px(640.0)), cx));
-    options.window_min_size = Some(size(px(420.0), px(560.0)));
+    // The Settings screen stacks two sidebars: 200px app sidebar, a 180px
+    // settings page list, and 44px of content padding. The default keeps the
+    // page panel above the 480px where setting rows sit label beside field;
+    // the minimum leaves that panel 366px, where rows stack instead.
+    options.window_bounds = Some(WindowBounds::centered(size(px(920.0), px(680.0)), cx));
+    options.window_min_size = Some(size(px(760.0), px(560.0)));
     options.window_decorations = Some(WindowDecorations::Client);
     options.app_id = Some("koe".to_owned());
     options
@@ -596,15 +597,6 @@ fn open_main_window(cx: &mut App, shell: &Entity<Shell>) {
                 shell.notice = Some(format!("Could not open the window: {error}"));
             });
         }
-    }
-}
-
-/// Closes the main window without a shell lease.
-fn hide_main_window(cx: &mut App, shell: &Entity<Shell>) {
-    let existing = shell.read(cx).window;
-    if let Some(handle) = existing {
-        let _ = handle.update(cx, |_, window, _| window.remove_window());
-        shell.update(cx, |shell, _| shell.window = None);
     }
 }
 
@@ -641,9 +633,6 @@ pub fn run() {
                     let tick = cx.update(|cx| shell.update(cx, Shell::tick));
                     if tick.show {
                         cx.update(|cx| open_main_window(cx, &shell));
-                    }
-                    if tick.hide {
-                        cx.update(|cx| hide_main_window(cx, &shell));
                     }
                     if let Some(handle) = tick.hud_close {
                         cx.update(|cx| overlay::close(cx, handle));
