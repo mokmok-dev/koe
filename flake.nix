@@ -93,8 +93,6 @@
                   in
                   !(builtins.elem name [
                     "target"
-                    "mutants.out"
-                    "mutants.out.old"
                     ".direnv"
                   ])
                   && !(pkgs.lib.hasPrefix "result" name);
@@ -157,29 +155,6 @@
               test = craneLib.cargoTest hostArgs;
             }
             // pkgs.lib.optionalAttrs (system == "x86_64-linux") {
-              mutation = craneLib.mkCargoDerivation (
-                cargoCommonArgs
-                // {
-                  inherit cargoArtifacts;
-                  pname = "koe-mutants";
-                  nativeBuildInputs = cargoCommonArgs.nativeBuildInputs ++ [
-                    pkgs.cargo-mutants
-                    pkgs.cargo-nextest
-                  ];
-                  doCheck = false;
-                  buildPhaseCargoCommand = "";
-                  buildPhase = ''
-                    runHook preBuild
-                    # The ggml backend rebuilds its C++ library per mutant.
-                    # The bundled libopus rebuild dwarfs the recording crate's run.
-                    cargo mutants --jobs 8 --exclude koe-transcribe-ggml --exclude koe-record
-                    test ! -s mutants.out/missed.txt
-                    test ! -s mutants.out/timeout.txt
-                    runHook postBuild
-                  '';
-                  installPhase = "mkdir -p $out";
-                }
-              );
               crossMacos = crossCheck "aarch64-apple-darwin" "koe-capture-macos";
               crossWindows = crossCheck "x86_64-pc-windows-gnu" "koe-capture-windows";
               coreNoStd = craneLib.mkCargoDerivation {
