@@ -27,10 +27,12 @@ pub trait Shim: Clone + Send + Sync + 'static {
 
     /// Opens a recognition session.
     ///
+    /// `live` asks for the tentative tail at the shim's lowest latency.
+    ///
     /// # Errors
     ///
     /// Returns the shim's status when the session cannot start.
-    fn create(&self, locale: Option<&CStr>) -> Result<Self::Handle, i32>;
+    fn create(&self, locale: Option<&CStr>, live: bool) -> Result<Self::Handle, i32>;
 
     /// Appends 16 kHz mono samples.
     ///
@@ -85,7 +87,7 @@ impl<S: Shim> koe_transcribe_core::Engine for Engine<S> {
             .map_err(|_| Error::OptionsInvalid { option: "language" })?;
         let handle = self
             .shim
-            .create(locale.as_deref())
+            .create(locale.as_deref(), options.is_live())
             .map_err(|status| create_error(status, requested))?;
         Ok(Box::new(Session {
             shim: self.shim.clone(),
@@ -238,6 +240,7 @@ mod tests {
         feed_status: Mutex<i32>,
         creates: Mutex<usize>,
         locales: Mutex<Vec<Option<String>>>,
+        lives: Mutex<Vec<bool>>,
         feeds: Mutex<Vec<Vec<f32>>>,
         committed: Mutex<VecDeque<Result<Option<CommittedPhrase>, i32>>>,
         volatile: Mutex<VecDeque<Result<Option<VolatileTail>, i32>>>,
@@ -253,13 +256,14 @@ mod tests {
     impl Shim for Scripted {
         type Handle = Handle;
 
-        fn create(&self, locale: Option<&CStr>) -> Result<Handle, i32> {
+        fn create(&self, locale: Option<&CStr>, live: bool) -> Result<Handle, i32> {
             *self.0.creates.lock().unwrap() += 1;
             self.0
                 .locales
                 .lock()
                 .unwrap()
                 .push(locale.map(|tag| tag.to_string_lossy().into_owned()));
+            self.0.lives.lock().unwrap().push(live);
             match *self.0.create_status.lock().unwrap() {
                 0 => Ok(Handle),
                 status => Err(status),
@@ -312,7 +316,7 @@ mod tests {
 
     /// A session built straight off a fresh handle, bypassing `create`.
     fn session(shim: &Scripted) -> Session<Scripted> {
-        let handle = shim.create(None).unwrap();
+        let handle = shim.create(None, false).unwrap();
         Session {
             shim: shim.clone(),
             handle: Some(handle),
@@ -358,6 +362,15 @@ mod tests {
             *shim.0.locales.lock().unwrap(),
             vec![Some(String::from("ja")), None]
         );
+    }
+
+    #[test]
+    fn create_passes_the_requested_liveness() {
+        let shim = script();
+        let engine = Engine::new(shim.clone());
+        engine.new_session(&Options::new().live()).unwrap();
+        engine.new_session(&Options::new()).unwrap();
+        assert_eq!(*shim.0.lives.lock().unwrap(), vec![true, false]);
     }
 
     #[test]

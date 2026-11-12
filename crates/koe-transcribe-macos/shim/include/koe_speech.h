@@ -7,7 +7,9 @@
 
 typedef struct koe_stt_string { const char *data; uint32_t length; } koe_stt_string;
 typedef struct koe_stt_engine koe_stt_engine;
-int32_t koe_stt_engine_create(const char *locale_utf8_or_null, koe_stt_engine **out);
+/* live = 1 asks for the tentative tail at the lowest latency; 0 keeps the
+   configuration whose committed text is the most accurate. */
+int32_t koe_stt_engine_create(const char *locale_utf8_or_null, int32_t live, koe_stt_engine **out);
 int32_t koe_stt_engine_feed(koe_stt_engine *, const float *pcm, uint32_t frames);
 /* 1 = popped one committed phrase, 0 = none, negative = status */
 int32_t koe_stt_engine_take_committed(koe_stt_engine *, koe_stt_string *text, int64_t *start_ms, int64_t *end_ms);

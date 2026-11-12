@@ -88,7 +88,7 @@ private final class SpeechEngine: @unchecked Sendable {
   }
 
   /// Builds everything a session needs, without starting its tasks.
-  static func setup(localeTag: String?) async -> SetupOutcome {
+  static func setup(localeTag: String?, live: Bool) async -> SetupOutcome {
     guard SpeechTranscriber.isAvailable else {
       return SetupOutcome(status: -3, engine: nil)
     }
@@ -100,17 +100,25 @@ private final class SpeechEngine: @unchecked Sendable {
     guard installed.contains(normalized) else {
       return SetupOutcome(status: -3, engine: nil)
     }
-    // The `.transcription` preset reports finalized phrases only, so a
-    // dictation would have nothing to draw until it stopped. Volatile
-    // results are the tentative `isFinal == false` ones the HUD shows
-    // while the user speaks; the attribute keeps the time codes the
-    // committed phrases carry.
-    let transcriber = SpeechTranscriber(
-      locale: normalized,
-      transcriptionOptions: [],
-      reportingOptions: [.volatileResults],
-      attributeOptions: [.audioTimeRange]
-    )
+    // A live session draws a phrase before it is ratified, so it needs the
+    // tentative `isFinal == false` results, and the progressive preset reports
+    // them at `.fastResults` latency. That latency is documented as less
+    // accurate, so a session whose text is read only at the end keeps the
+    // plain options below.
+    let transcriber: SpeechTranscriber
+    if live {
+      transcriber = SpeechTranscriber(
+        locale: normalized,
+        preset: .timeIndexedProgressiveTranscription
+      )
+    } else {
+      transcriber = SpeechTranscriber(
+        locale: normalized,
+        transcriptionOptions: [],
+        reportingOptions: [.volatileResults],
+        attributeOptions: [.audioTimeRange]
+      )
+    }
     guard let format = await SpeechAnalyzer.bestAvailableAudioFormat(compatibleWith: [transcriber])
     else {
       // The assets are absent and this backend never downloads.
@@ -481,6 +489,7 @@ private final class SpeechEngine: @unchecked Sendable {
 @_cdecl("koe_stt_engine_create")
 func koeSpeechEngineCreate(
   locale: UnsafePointer<CChar>?,
+  live: Int32,
   out: UnsafeMutablePointer<UnsafeMutableRawPointer?>?
 ) -> Int32 {
   guard let out else {
@@ -493,7 +502,7 @@ func koeSpeechEngineCreate(
   let semaphore = DispatchSemaphore(value: 0)
   let box = SetupBox()
   Task.detached {
-    box.set(await SpeechEngine.setup(localeTag: localeTag))
+    box.set(await SpeechEngine.setup(localeTag: localeTag, live: live != 0))
     semaphore.signal()
   }
   if semaphore.wait(timeout: .now() + 15) == .timedOut {

@@ -293,7 +293,8 @@ fn spawn_transcription(
     let options = transcription
         .language
         .clone()
-        .map_or_else(Options::new, |language| Options::new().language(language));
+        .map_or_else(Options::new, |language| Options::new().language(language))
+        .live();
     let model = transcription.model.clone();
     let mut ready = HashMap::with_capacity(plan.streams.len());
     let mut wanted = Vec::with_capacity(plan.streams.len());

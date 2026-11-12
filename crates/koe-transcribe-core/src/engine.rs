@@ -32,13 +32,18 @@ impl Model {
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Options {
     language: Option<Box<str>>,
+    live: bool,
 }
 
 impl Options {
-    /// Defaults: let the engine pick the language.
+    /// Defaults: let the engine pick the language, and ask no backend to trade
+    /// committed-text accuracy for a faster reporting cadence.
     #[must_use]
     pub const fn new() -> Self {
-        Self { language: None }
+        Self {
+            language: None,
+            live: false,
+        }
     }
 
     /// Requests a language by BCP 47 tag, for example `ja` or `pt-BR`.
@@ -48,10 +53,27 @@ impl Options {
         self
     }
 
+    /// Requests the text a listener reads while the audio still arrives.
+    ///
+    /// A backend may spend the accuracy of the committed text on a faster
+    /// reporting cadence, so a caller that shows the text only once the audio
+    /// ends leaves this off.
+    #[must_use]
+    pub const fn live(mut self) -> Self {
+        self.live = true;
+        self
+    }
+
     /// The requested language tag, if any.
     #[must_use]
     pub fn language_tag(&self) -> Option<&str> {
         self.language.as_deref()
+    }
+
+    /// Whether the caller reads the text while the audio still arrives.
+    #[must_use]
+    pub const fn is_live(&self) -> bool {
+        self.live
     }
 }
 
@@ -131,6 +153,7 @@ mod tests {
         let options = Options::new();
         assert_eq!(options, Options::default());
         assert_eq!(options.language_tag(), None);
+        assert!(!options.is_live());
     }
 
     #[test]
@@ -139,5 +162,12 @@ mod tests {
         assert_eq!(options.language_tag(), Some("ja"));
         let replaced = options.language(String::from("pt-BR"));
         assert_eq!(replaced.language_tag(), Some("pt-BR"));
+    }
+
+    #[test]
+    fn a_live_session_is_requested() {
+        let options = Options::new().live().language("ja");
+        assert!(options.is_live());
+        assert_eq!(options.language_tag(), Some("ja"));
     }
 }

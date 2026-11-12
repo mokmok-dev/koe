@@ -31,7 +31,7 @@ fn run() -> Result<(), Box<dyn Error>> {
     let (pcm, rate, channels) = read_wav(&wav_path)?;
     let spec = AudioSpec::new(rate, channels)?;
     let transcriber = Transcriber::new(&Model::gguf(model_path))?;
-    let session = transcriber.live(spec, &Options::new())?;
+    let session = transcriber.live(spec, &Options::new().live())?;
 
     let mut live = LiveText::new();
     let block = usize::from(channels) * usize::try_from(rate)?;

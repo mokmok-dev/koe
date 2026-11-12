@@ -25,7 +25,7 @@ struct KoeSttString {
 }
 
 unsafe extern "C" {
-    fn koe_stt_engine_create(locale: *const c_char, out: *mut *mut KoeSttEngine) -> i32;
+    fn koe_stt_engine_create(locale: *const c_char, live: i32, out: *mut *mut KoeSttEngine) -> i32;
     fn koe_stt_engine_feed(engine: *mut KoeSttEngine, pcm: *const f32, frames: u32) -> i32;
     fn koe_stt_engine_take_committed(
         engine: *mut KoeSttEngine,
@@ -58,10 +58,10 @@ pub struct SpeechShim;
 impl Shim for SpeechShim {
     type Handle = EngineHandle;
 
-    fn create(&self, locale: Option<&CStr>) -> Result<EngineHandle, i32> {
+    fn create(&self, locale: Option<&CStr>, live: bool) -> Result<EngineHandle, i32> {
         let locale = locale.map_or(null(), CStr::as_ptr);
         let mut handle: *mut KoeSttEngine = null_mut();
-        let status = unsafe { koe_stt_engine_create(locale, &raw mut handle) };
+        let status = unsafe { koe_stt_engine_create(locale, i32::from(live), &raw mut handle) };
         if status != 0 {
             return Err(status);
         }
