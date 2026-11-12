@@ -3,8 +3,8 @@
 use std::time::Instant;
 
 use gpui::{
-    AnyElement, App, AppContext as _, Context, Entity, FontWeight, IntoElement, ParentElement,
-    Render, SharedString, Styled as _, Subscription, Window, div, px, rgb,
+    AnyElement, App, AppContext as _, Axis, Context, Entity, FontWeight, IntoElement,
+    ParentElement, Render, SharedString, Styled as _, Subscription, Window, div, px, rgb,
 };
 use gpui_kit::component::{
     ActiveTheme as _, Disableable as _, Icon, IconName, Sizable as _, TitleBar,
@@ -313,10 +313,10 @@ impl MainView {
                         });
                     }
                 },
-            )
-            .w(px(240.0)),
+            ),
         )
         .description("The speech model must support the chosen language.")
+        .layout(Axis::Vertical)
         .keywords(["language", "locale", "speech"]);
 
         let source_item = |source: Source, title: &'static str| {
