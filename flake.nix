@@ -236,6 +236,8 @@
               nixfmt.enable = true;
               rustfmt.enable = true;
               rustfmt.package = rustToolchain;
+              # nixpkgs marks the Swift toolchain broken on aarch64-linux.
+              swift-format.enable = pkgs.stdenv.hostPlatform.isDarwin;
             };
           };
         };
