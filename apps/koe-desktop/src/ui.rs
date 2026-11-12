@@ -1062,7 +1062,7 @@ fn done_card(
 fn phase_tone(phase: &Phase) -> gpui::Rgba {
     match phase {
         Phase::Idle => rgb(IDLE),
-        Phase::Arming { .. } => rgb(AMBER),
+        Phase::Arming { .. } | Phase::Paused(_) => rgb(AMBER),
         Phase::Recording(_) => rgb(RED),
         Phase::Stopping { .. } => rgb(BLUE),
         Phase::Done(done) if done.failed() => rgb(RED),
@@ -1075,6 +1075,7 @@ fn detail(phase: &Phase) -> String {
         Phase::Idle => "ready when you are".to_owned(),
         Phase::Arming { .. } => "opening sources".to_owned(),
         Phase::Recording(live) => format!("{} source(s) live", live.live.len()),
+        Phase::Paused(live) => format!("paused, {} source(s) held", live.live.len()),
         Phase::Stopping { .. } => "finishing the file".to_owned(),
         Phase::Done(done) if done.failed() => done.failure.as_ref().map_or_else(
             || "the take did not complete".to_owned(),

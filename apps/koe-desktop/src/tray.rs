@@ -18,6 +18,8 @@ pub enum TrayStatus {
     Starting,
     /// At least one source is capturing.
     Recording,
+    /// The take holds its file open without writing.
+    Paused,
     /// The file is closing.
     Saving,
     /// A take finished cleanly.
@@ -206,6 +208,10 @@ pub fn label(state: &TrayState) -> String {
             || "Recording".to_owned(),
             |elapsed| format!("Recording {}", elapsed_text(elapsed)),
         ),
+        TrayStatus::Paused => state.elapsed.map_or_else(
+            || "Paused".to_owned(),
+            |elapsed| format!("Paused {}", elapsed_text(elapsed)),
+        ),
         TrayStatus::Saving => "Saving...".to_owned(),
         TrayStatus::Saved => "Saved".to_owned(),
         TrayStatus::Failed => "Recording failed".to_owned(),
@@ -267,6 +273,7 @@ mod tests {
         assert_eq!(label(&state(TrayStatus::Ready)), "Ready");
         assert_eq!(label(&state(TrayStatus::Starting)), "Starting...");
         assert_eq!(label(&state(TrayStatus::Recording)), "Recording");
+        assert_eq!(label(&state(TrayStatus::Paused)), "Paused");
         assert_eq!(label(&state(TrayStatus::Saving)), "Saving...");
         assert_eq!(label(&state(TrayStatus::Saved)), "Saved");
         assert_eq!(label(&state(TrayStatus::Failed)), "Recording failed");
@@ -287,6 +294,16 @@ mod tests {
         state.elapsed = Some(Duration::from_secs(65));
         assert_eq!(label(&state), "Recording 01:05");
         assert_eq!(tooltip(&state), "koe · Recording 01:05");
+    }
+
+    #[test]
+    fn a_paused_take_says_so_and_keeps_the_frozen_time() {
+        let mut state = state(TrayStatus::Paused);
+        state.elapsed = Some(Duration::from_secs(65));
+        state.can_start = false;
+        state.can_stop = true;
+        assert_eq!(label(&state), "Paused 01:05");
+        assert_eq!(tooltip(&state), "koe · Paused 01:05");
     }
 
     #[test]
