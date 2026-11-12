@@ -12,6 +12,7 @@ pub mod error;
 pub mod hotkey;
 pub mod hud;
 pub mod icon;
+pub mod language;
 pub mod overlay;
 pub mod settings;
 pub mod state;

@@ -230,7 +230,7 @@ impl DictationControl {
         None
     }
 
-    /// Applies the model and language drafts, persisting what changed.
+    /// Applies the model and language settings, persisting what changed.
     ///
     /// # Errors
     ///
@@ -415,7 +415,7 @@ mod tests {
     }
 
     #[test]
-    fn the_model_and_language_drafts_persist_when_they_change() {
+    fn the_model_and_language_settings_persist_when_they_change() {
         let root = tempfile::tempdir().unwrap();
         let mut control = control(root.path());
         assert!(control.apply_settings(None, Some("ja".to_owned())).unwrap());

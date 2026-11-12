@@ -424,7 +424,7 @@ impl Shell {
         cx.notify();
     }
 
-    /// Persists the model and language fields.
+    /// Persists the model and language settings.
     pub fn apply_dictation_settings(
         &mut self,
         model: Option<PathBuf>,
