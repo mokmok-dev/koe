@@ -8,6 +8,7 @@ use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use global_hotkey::hotkey::HotKey;
+use koe_transcribe::Model;
 
 use crate::dictation::{self, Dictation, DictationContext, DictationEvent, DictationOutcome};
 use crate::dictation_worker;
@@ -106,6 +107,15 @@ impl DictationControl {
         self.hotkeys.as_ref().map_or(0, Hotkeys::presses)
     }
 
+    /// The model and language dictation and a meeting take transcribe with.
+    #[must_use]
+    pub fn transcription(&self) -> (Option<Model>, Option<Box<str>>) {
+        (
+            settings::dictation_model(&self.settings),
+            self.settings.language.as_deref().map(Box::from),
+        )
+    }
+
     /// Applies one hotkey press, given whether a meeting take is active.
     ///
     /// # Errors
@@ -115,14 +125,11 @@ impl DictationControl {
     /// belongs in the HUD; a failure is the dictation thread's, and the window
     /// notice is enough for it.
     pub fn toggle(&mut self, meeting_active: bool) -> Option<Press> {
+        let (model, language) = self.transcription();
         let context = DictationContext {
             meeting_active,
-            model: settings::dictation_model(&self.settings),
-            language: self
-                .settings
-                .language
-                .as_ref()
-                .map(|language| language.as_str().into()),
+            model,
+            language,
         };
         let action = self.dictation.toggle(context, Instant::now())?;
         let refused = matches!(&action, dictation::DictationAction::Refuse(_));

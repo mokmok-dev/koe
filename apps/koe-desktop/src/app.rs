@@ -16,11 +16,12 @@ use gpui_kit::component::{Theme, ThemeMode, TitleBar};
 use crate::dictation;
 use crate::dictation_control::{DictationControl, Press};
 use crate::dictation_worker;
-use crate::engine::{self, Completion, EngineEvent};
+use crate::engine::{self, Completion, EngineEvent, TranscriptionPlan};
 use crate::hud::{self, HudState};
 use crate::overlay;
 use crate::settings::{self, Settings};
 use crate::state::{Action, Event, Phase, Sources};
+use crate::transcript::{self, MeetingTranscript, Speaker};
 use crate::tray::{Tray, TrayAction, TrayState, TrayStatus};
 use crate::ui::MainView;
 
@@ -70,6 +71,8 @@ pub struct Shell {
     pub(crate) screen: Screen,
     pub(crate) sidebar_collapsed: bool,
     pub(crate) session: Option<engine::Session>,
+    pub(crate) transcript: MeetingTranscript,
+    pub(crate) transcript_pending: bool,
     pub(crate) levels: [f32; 2],
     pub(crate) tray: Option<Tray>,
     pub(crate) tray_error: Option<String>,
@@ -119,6 +122,8 @@ impl Shell {
             screen: Screen::Recorder,
             sidebar_collapsed: false,
             session: None,
+            transcript: MeetingTranscript::default(),
+            transcript_pending: false,
             levels: [0.0; 2],
             tray: None,
             tray_error: None,
@@ -281,6 +286,15 @@ impl Shell {
                     *slot = if level > *slot { level } else { *slot * 0.82 };
                 }
                 EngineEvent::Warning(message) => self.notice = Some(message),
+                EngineEvent::Transcript { source, at, text } => {
+                    if self.transcript_pending {
+                        if self.transcript.replace(Speaker::of(source), at, &text) {
+                            self.transcript_pending = false;
+                        }
+                    } else {
+                        self.transcript.push(Speaker::of(source), at, &text);
+                    }
+                }
                 EngineEvent::Opened(source) => self.apply(Event::Opened(source)),
                 EngineEvent::Lost { source, message } => {
                     self.apply(Event::Lost { source, message });
@@ -355,7 +369,7 @@ impl Shell {
             return;
         }
         self.notice = None;
-        let plan = match self.settings.plan() {
+        let mut plan = match self.settings.plan() {
             Ok(plan) => plan,
             Err(error) => {
                 self.notice = Some(error.to_string());
@@ -363,8 +377,17 @@ impl Shell {
                 return;
             }
         };
+        let (model, language) = self.dictation_control.transcription();
+        if let Some(model) = model {
+            plan.transcription = Some(TranscriptionPlan { model, language });
+        } else {
+            self.notice = Some(transcript::MODEL_MISSING.to_owned());
+        }
         let action = self.phase.reduce(Event::Start(plan), Instant::now());
         if let Some(action) = action {
+            // Until this take retains an utterance, the rows on screen belong
+            // to an earlier take.
+            self.transcript_pending = true;
             self.run(action);
         }
         cx.notify();

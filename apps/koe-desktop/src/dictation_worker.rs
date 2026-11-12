@@ -30,12 +30,12 @@ use crate::error::DesktopError;
 /// Frames each microphone read delivers, one mono channel wide.
 const BLOCK_FRAMES: usize = 960;
 
-/// Samples the backlog may hold while the model loads: about a minute.
+/// Frames a backlog may hold while the model loads: about a minute.
 ///
 /// The backlog only grows during the load, so this ceiling is the load time
-/// the thread is willing to buffer; the oldest samples go first once it is
+/// the thread is willing to buffer; the oldest frames go first once it is
 /// full.
-const BACKLOG_LIMIT: usize = SAMPLE_RATE as usize * 60;
+pub(crate) const BACKLOG_LIMIT: usize = SAMPLE_RATE as usize * 60;
 
 /// How long the clipboard takes to settle before the paste shortcut is sent,
 /// so the focused app reads the new selection and not the previous one.
@@ -51,7 +51,7 @@ const RESTORE_DELAY: Duration = Duration::from_millis(500);
 /// One model load at a time. Rapid stop-and-restart cycles queue here instead
 /// of stacking concurrent loads, each of which holds a model that can run to
 /// hundreds of megabytes.
-static MODEL_LOAD: Mutex<()> = Mutex::new(());
+pub(crate) static MODEL_LOAD: Mutex<()> = Mutex::new(());
 
 /// The recognized text so far, shared between the dictation thread and the
 /// shell.
@@ -289,7 +289,9 @@ fn pump(
                             break;
                         }
                     }
-                    None => push_bounded(&mut backlog, samples),
+                    None => {
+                        let _ = push_bounded(&mut backlog, samples, BACKLOG_LIMIT);
+                    }
                 }
             }
             Err(error) => {
@@ -383,13 +385,17 @@ pub fn dictated_text(transcript: &str) -> String {
     transcript.trim().to_owned()
 }
 
-/// Appends `samples`, dropping the oldest once the backlog is full.
-fn push_bounded(backlog: &mut Vec<f32>, samples: &[f32]) {
-    if backlog.len() + samples.len() > BACKLOG_LIMIT {
-        let overflow = (backlog.len() + samples.len() - BACKLOG_LIMIT).min(backlog.len());
+/// Appends `samples`, dropping and returning the oldest samples once `limit`
+/// is reached.
+pub(crate) fn push_bounded(backlog: &mut Vec<f32>, samples: &[f32], limit: usize) -> usize {
+    let overflow = (backlog.len() + samples.len())
+        .saturating_sub(limit)
+        .min(backlog.len());
+    if overflow > 0 {
         backlog.drain(..overflow);
     }
     backlog.extend_from_slice(samples);
+    overflow
 }
 
 /// Inserts `text` into whatever currently holds keyboard focus.
@@ -687,8 +693,8 @@ mod tests {
     #[test]
     fn the_backlog_keeps_every_sample_until_it_is_full() {
         let mut backlog = Vec::new();
-        push_bounded(&mut backlog, &[0.1, 0.2]);
-        push_bounded(&mut backlog, &[0.3]);
+        let _ = push_bounded(&mut backlog, &[0.1, 0.2], BACKLOG_LIMIT);
+        let _ = push_bounded(&mut backlog, &[0.3], BACKLOG_LIMIT);
         assert_eq!(backlog, [0.1, 0.2, 0.3]);
     }
 
@@ -697,7 +703,7 @@ mod tests {
         let mut backlog: Vec<f32> = (0..BACKLOG_LIMIT)
             .map(|sample| sample as f32 / 10.0)
             .collect();
-        push_bounded(&mut backlog, &[7.0, 8.0, 9.0]);
+        let _ = push_bounded(&mut backlog, &[7.0, 8.0, 9.0], BACKLOG_LIMIT);
         assert_eq!(backlog.len(), BACKLOG_LIMIT);
         assert_eq!(backlog[..3].to_vec(), vec![0.3, 0.4, 0.5]);
         assert_eq!(backlog[BACKLOG_LIMIT - 3..].to_vec(), vec![7.0, 8.0, 9.0]);
@@ -753,11 +759,12 @@ mod tests {
     #[test]
     fn push_bounded_keeps_a_full_backlog_at_the_limit() {
         let mut backlog = vec![0.0_f32; BACKLOG_LIMIT - 1];
-        push_bounded(&mut backlog, &[7.0]);
+        let _ = push_bounded(&mut backlog, &[7.0], BACKLOG_LIMIT);
         assert_eq!(backlog.len(), BACKLOG_LIMIT);
         assert_eq!(backlog[BACKLOG_LIMIT - 1], 7.0);
 
-        push_bounded(&mut backlog, &[8.0]);
+        let dropped = push_bounded(&mut backlog, &[8.0], BACKLOG_LIMIT);
+        assert_eq!(dropped, 1);
         assert_eq!(backlog.len(), BACKLOG_LIMIT);
         assert_eq!(backlog[0], 0.0);
         assert_eq!(backlog[BACKLOG_LIMIT - 1], 8.0);
@@ -767,10 +774,10 @@ mod tests {
     fn push_bounded_drops_the_oldest_once_full() {
         let half = BACKLOG_LIMIT / 2;
         let mut backlog = vec![0.0_f32; half];
-        push_bounded(&mut backlog, &vec![1.0; half]);
+        let _ = push_bounded(&mut backlog, &vec![1.0; half], BACKLOG_LIMIT);
         assert_eq!(backlog.len(), BACKLOG_LIMIT);
 
-        push_bounded(&mut backlog, &vec![2.0; half]);
+        let _ = push_bounded(&mut backlog, &vec![2.0; half], BACKLOG_LIMIT);
         assert_eq!(backlog.len(), BACKLOG_LIMIT);
         assert_eq!(backlog[0], 1.0);
         assert_eq!(backlog[BACKLOG_LIMIT - 1], 2.0);

@@ -653,6 +653,7 @@ mod tests {
             spec: koe_record::RecordingSpec::new(48_000, koe_record::Channels::Stereo).unwrap(),
             streams: Vec::new(),
             sources: Sources::EMPTY,
+            transcription: None,
         };
         assert!(phase.reduce(Event::Start(plan), base()).is_none());
         assert!(matches!(phase, Phase::Idle));

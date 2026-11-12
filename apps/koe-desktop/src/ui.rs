@@ -3,16 +3,18 @@
 use std::time::Instant;
 
 use gpui::{
-    AnyElement, App, AppContext as _, Axis, Context, Entity, FontWeight, IntoElement,
-    ParentElement, Render, SharedString, Styled as _, Subscription, Window, div, px, rgb,
+    AnyElement, App, AppContext as _, Axis, Context, Entity, FontWeight, IntoElement, ParentElement,
+    Render, Role, SharedString, Styled as _, Subscription, Window, div, px, rgb,
 };
 use gpui_kit::component::{
     ActiveTheme as _, Disableable as _, Icon, IconName, IndexPath, Sizable as _, TitleBar,
     alert::Alert,
+    bubble::{Bubble, BubbleVariant},
     button::{Button, ButtonVariants as _},
     group_box::{GroupBox, GroupBoxVariant, GroupBoxVariants as _},
     h_flex,
     input::{Input, InputEvent, InputState},
+    message::{Message, MessageAlignment, MessageContent, MessageGroup, MessageHeader},
     progress::Progress,
     scroll::ScrollableElement as _,
     searchable_list::SearchableVec,
@@ -32,6 +34,7 @@ use crate::hud;
 use crate::language;
 use crate::settings;
 use crate::state::{Done, Phase, Sources};
+use crate::transcript::MeetingTranscript;
 
 const LIVE: u32 = 0x007E_E787;
 const IDLE: u32 = 0x005A_5A62;
@@ -244,6 +247,11 @@ impl MainView {
                 ),
             )
             .child(primary)
+            .children(transcript_card(
+                &shell.transcript,
+                shell.transcript_pending,
+                cx,
+            ))
             .into_any_element()
     }
 
@@ -449,7 +457,7 @@ impl MainView {
             .page(
                 SettingPage::new("Dictation")
                     .icon(Icon::new(IconName::Mic))
-                    .description("The global binding and the speech model the dictation uses.")
+                    .description("The global binding and the speech model dictation and meeting transcripts use.")
                     .resettable(false)
                     .group(SettingGroup::new().title("Status").item(status_item))
                     .group(SettingGroup::new().title("Binding").item(hotkey_item))
@@ -696,17 +704,19 @@ fn model_hint(text: &str, shell: &Shell) -> String {
     {
         let _ = shell;
         if settings::value_or_none(text).is_none() {
-            return "Leave the model empty to use the system speech model".to_owned();
+            return "Leave the model empty to use the system speech model for dictation and meetings"
+                .to_owned();
         }
     }
     #[cfg(not(target_os = "macos"))]
     {
         let _ = text;
         if settings::dictation_model(&shell.dictation_control.settings).is_none() {
-            return "No transcription model set: dictation will refuse to start".to_owned();
+            return "No transcription model set: dictation refuses to start and meeting takes record without a transcript"
+                .to_owned();
         }
     }
-    "The GGUF file a dictation transcribes with".to_owned()
+    "The GGUF file dictation and meeting transcripts use".to_owned()
 }
 
 fn meter(name: &str, source: Source, levels: [f32; 2], live: Sources) -> impl IntoElement {
@@ -734,6 +744,72 @@ fn meter(name: &str, source: Source, levels: [f32; 2], live: Sources) -> impl In
                 .with_size(px(6.0))
                 .flex_1(),
         )
+}
+
+/// The meeting transcript retained so far, one message per utterance.
+fn transcript_card(
+    transcript: &MeetingTranscript,
+    pending: bool,
+    cx: &Context<MainView>,
+) -> Option<AnyElement> {
+    if transcript.is_empty() {
+        return None;
+    }
+    let theme = cx.theme();
+    let count = transcript.len();
+    let count_label = format!("{count} utterance{}", if count == 1 { "" } else { "s" });
+    let title = if pending {
+        "Previous take"
+    } else {
+        "Transcript"
+    };
+    let messages = transcript.utterances().iter().map(|utterance| {
+        Message::new()
+            .id(("utterance", utterance.sequence))
+            .role(Role::ListItem)
+            .alignment(MessageAlignment::Start)
+            .header(
+                MessageHeader::new()
+                    .child(utterance.speaker.label())
+                    .child("·")
+                    .child(utterance.clock.clone()),
+            )
+            .content(
+                MessageContent::new().bubble(
+                    Bubble::new()
+                        .with_variant(BubbleVariant::Secondary)
+                        .child(utterance.text.clone()),
+                ),
+            )
+    });
+
+    Some(
+        GroupBox::new()
+            .outline()
+            .child(
+                v_flex()
+                    .gap(px(10.0))
+                    .child(
+                        h_flex()
+                            .items_center()
+                            .gap(px(8.0))
+                            .child(
+                                div()
+                                    .text_base()
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .child(title),
+                            )
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .text_color(theme.muted_foreground)
+                                    .child(count_label),
+                            ),
+                    )
+                    .child(MessageGroup::new().children(messages)),
+            )
+            .into_any_element(),
+    )
 }
 
 struct DoneView {

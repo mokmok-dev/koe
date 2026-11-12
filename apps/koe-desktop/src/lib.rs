@@ -16,6 +16,7 @@ pub mod language;
 pub mod overlay;
 pub mod settings;
 pub mod state;
+pub mod transcript;
 pub mod tray;
 pub mod ui;
 

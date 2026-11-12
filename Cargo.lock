@@ -3635,6 +3635,7 @@ name = "koe-desktop"
 version = "2026.11.1"
 dependencies = [
  "arboard",
+ "chrono",
  "enigo",
  "global-hotkey",
  "gpui-kit",
