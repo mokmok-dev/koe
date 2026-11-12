@@ -16,11 +16,12 @@ use gpui_kit::component::{Theme, ThemeMode, TitleBar};
 use crate::dictation;
 use crate::dictation_control::{DictationControl, Press};
 use crate::dictation_worker;
-use crate::engine::{self, Completion, EngineEvent};
+use crate::engine::{self, Completion, EngineEvent, TranscriptionPlan};
 use crate::hud::{self, HudState};
 use crate::overlay;
 use crate::settings::{self, Settings};
 use crate::state::{Action, Event, Phase, Sources};
+use crate::transcript::{self, MeetingTranscript, Speaker};
 use crate::tray::{Tray, TrayAction, TrayState, TrayStatus};
 use crate::ui::MainView;
 
@@ -45,15 +46,17 @@ const DICTATION_TICK: Duration = Duration::from_millis(20);
 /// leaves the transcript with no reader, so neither needs the dictation tick.
 const ACTIVE_TICK: Duration = Duration::from_millis(100);
 
-/// Which of the window's two screens is showing.
+/// Which of the window's three screens is showing.
 ///
 /// The settings page selected inside gpui-kit's `Settings` is not part of this:
 /// GPUI drops an element's keyed state once that element stops rendering, so
-/// the settings screen opens on its first page after a visit to the recorder.
+/// the settings screen opens on its first page after a visit to another screen.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) enum Screen {
-    /// The take status, the start and stop control, and the last take.
+    /// The take controls and the transcript of both sources as a message thread.
     #[default]
+    Meeting,
+    /// The take status, the start and stop control, and the last take.
     Recorder,
     /// The dictation settings, the sources, the format, and the folder.
     Settings,
@@ -70,6 +73,8 @@ pub struct Shell {
     pub(crate) screen: Screen,
     pub(crate) sidebar_collapsed: bool,
     pub(crate) session: Option<engine::Session>,
+    pub(crate) transcript: MeetingTranscript,
+    pub(crate) transcript_pending: bool,
     pub(crate) levels: [f32; 2],
     pub(crate) tray: Option<Tray>,
     pub(crate) tray_error: Option<String>,
@@ -116,9 +121,11 @@ impl Shell {
         Self {
             phase: Phase::Idle,
             settings: Settings::default(),
-            screen: Screen::Recorder,
+            screen: Screen::Meeting,
             sidebar_collapsed: false,
             session: None,
+            transcript: MeetingTranscript::default(),
+            transcript_pending: false,
             levels: [0.0; 2],
             tray: None,
             tray_error: None,
@@ -281,6 +288,18 @@ impl Shell {
                     *slot = if level > *slot { level } else { *slot * 0.82 };
                 }
                 EngineEvent::Warning(message) => self.notice = Some(message),
+                EngineEvent::Transcript { source, at, text } => {
+                    if self.transcript_pending {
+                        if self.transcript.replace(Speaker::of(source), at, &text) {
+                            self.transcript_pending = false;
+                        }
+                    } else {
+                        self.transcript.push(Speaker::of(source), at, &text);
+                    }
+                }
+                EngineEvent::Draft { source, at, text } => {
+                    self.transcript.draft(Speaker::of(source), at, &text);
+                }
                 EngineEvent::Opened(source) => self.apply(Event::Opened(source)),
                 EngineEvent::Lost { source, message } => {
                     self.apply(Event::Lost { source, message });
@@ -355,7 +374,7 @@ impl Shell {
             return;
         }
         self.notice = None;
-        let plan = match self.settings.plan() {
+        let mut plan = match self.settings.plan() {
             Ok(plan) => plan,
             Err(error) => {
                 self.notice = Some(error.to_string());
@@ -363,8 +382,18 @@ impl Shell {
                 return;
             }
         };
+        let (model, language) = self.dictation_control.transcription();
+        if let Some(model) = model {
+            plan.transcription = Some(TranscriptionPlan { model, language });
+        } else {
+            self.notice = Some(transcript::MODEL_MISSING.to_owned());
+        }
         let action = self.phase.reduce(Event::Start(plan), Instant::now());
         if let Some(action) = action {
+            // Until this take retains an utterance, the rows on screen belong
+            // to an earlier take.
+            self.transcript_pending = true;
+            self.transcript.clear_drafts();
             self.run(action);
         }
         cx.notify();
@@ -398,6 +427,12 @@ impl Shell {
     /// Switches to the settings screen.
     pub fn show_settings(&mut self, cx: &mut Context<Self>) {
         self.screen = Screen::Settings;
+        cx.notify();
+    }
+
+    /// Switches to the meeting screen.
+    pub fn show_meeting(&mut self, cx: &mut Context<Self>) {
+        self.screen = Screen::Meeting;
         cx.notify();
     }
 

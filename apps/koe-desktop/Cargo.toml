@@ -14,6 +14,7 @@ name = "koe-desktop"
 path = "src/main.rs"
 
 [dependencies]
+chrono = { version = "0.4.45", default-features = false, features = ["clock"] }
 enigo = "0.6"
 global-hotkey = "0.10"
 gpui-kit.workspace = true
