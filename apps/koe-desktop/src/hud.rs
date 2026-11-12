@@ -1,21 +1,26 @@
 //! The HUD geometry, the state it draws, and the text it shares with the
 //! window.
 //!
-//! Every HUD pixel comes from [`HudState`], so a take or a dictation in
-//! progress never reacts to a click that was meant for the app underneath.
+//! Every HUD pixel comes from [`HudState`]. Only the compact take card takes
+//! pointer input, and only while it draws the pause control; elsewhere the
+//! overlay asks the platform to let clicks through.
 
 use std::time::{Duration, Instant};
-
-use koe_capture::Source;
 
 use crate::dictation::Dictation;
 use crate::state::Phase;
 
-/// Width of the HUD window in points.
+/// Width of the transcript HUD window in points.
 pub const HUD_WIDTH: f32 = 340.0;
 
-/// Height of the HUD window in points.
+/// Height of the transcript HUD window in points.
 pub const HUD_HEIGHT: f32 = 88.0;
+
+/// Width of the compact take card in points.
+pub const TAKE_WIDTH: f32 = 240.0;
+
+/// Height of the compact take card in points.
+pub const TAKE_HEIGHT: f32 = 56.0;
 
 /// Distance the HUD keeps from each monitor edge.
 pub const EDGE_MARGIN: f32 = 24.0;
@@ -35,6 +40,8 @@ pub enum HudPhase {
     Starting,
     /// Audio is being written.
     Recording,
+    /// The take is holding its file open without writing.
+    Paused,
     /// The file is being finalized.
     Saving,
     /// A dictation is capturing speech.
@@ -50,24 +57,13 @@ pub enum HudPhase {
 pub struct HudState {
     /// Stage the HUD is drawing.
     pub phase: HudPhase,
-    /// Time since the take or the dictation started, in whole seconds.
+    /// Time the take or the dictation spent capturing, in whole seconds.
     ///
     /// Whole seconds are what [`elapsed_text`] draws, so two ticks in the same
     /// whole second derive the same elapsed; a dictation whose text did not
-    /// change is then not redrawn, while a take still redraws as its meters
-    /// move.
+    /// change is then not redrawn, while a take still redraws its timer.
     pub elapsed: Duration,
-    /// Whether each source is capturing, in microphone then system order.
-    ///
-    /// Only a take draws these; a dictation has no per-source widget, so its
-    /// values stay at their defaults.
-    pub live: [bool; 2],
-    /// Peak per source, in the same order, clamped to `0.0..=1.0` when drawn.
-    ///
-    /// Drawn only for a take, like [`Self::live`].
-    pub levels: [f32; 2],
-    /// A problem to tell the user about: a take's lost source, or the reason a
-    /// dictation was refused.
+    /// A problem to tell the user about: the reason a dictation was refused.
     pub warning: Option<String>,
     /// The dictation's recognized text, already capped to what the box shows.
     pub transcript: String,
@@ -86,35 +82,30 @@ impl HudState {
         dictation: &Dictation,
         transcript: &str,
         take: &Phase,
-        levels: [f32; 2],
         refusal: Option<&str>,
         now: Instant,
     ) -> Option<Self> {
         Self::dictation(dictation, transcript, now)
-            .or_else(|| Self::take(take, levels, now))
+            .or_else(|| Self::take(take, now))
             .or_else(|| refusal.map(Self::refused))
     }
 
-    /// The HUD a meeting take draws, or `None` when no take is running.
+    /// The compact card a meeting take draws, or `None` when no take is
+    /// running.
     #[must_use]
-    pub fn take(take: &Phase, levels: [f32; 2], now: Instant) -> Option<Self> {
+    pub fn take(take: &Phase, now: Instant) -> Option<Self> {
         let phase = match take {
             Phase::Arming { .. } => HudPhase::Starting,
             Phase::Recording(_) => HudPhase::Recording,
+            Phase::Paused(_) => HudPhase::Paused,
             Phase::Stopping { .. } => HudPhase::Saving,
             Phase::Idle | Phase::Done(_) => return None,
         };
-        let live = take.live();
         let elapsed = take.elapsed(now).unwrap_or_default();
         Some(Self {
             phase,
             elapsed: Duration::from_secs(elapsed.as_secs()),
-            live: [
-                live.contains(Source::Microphone),
-                live.contains(Source::SystemAudio),
-            ],
-            levels,
-            warning: take.warning().map(str::to_owned),
+            warning: None,
             transcript: String::new(),
         })
     }
@@ -133,8 +124,6 @@ impl HudState {
         Some(Self {
             phase,
             elapsed: Duration::from_secs(elapsed.as_secs()),
-            live: [false; 2],
-            levels: [0.0; 2],
             warning: None,
             transcript: transcript_tail(transcript),
         })
@@ -146,10 +135,28 @@ impl HudState {
         Self {
             phase: HudPhase::Refused,
             elapsed: Duration::ZERO,
-            live: [false; 2],
-            levels: [0.0; 2],
             warning: Some(message.to_owned()),
             transcript: String::new(),
+        }
+    }
+
+    /// Whether this HUD draws the compact take card rather than the
+    /// transcript card.
+    #[must_use]
+    pub const fn is_take(&self) -> bool {
+        matches!(
+            self.phase,
+            HudPhase::Starting | HudPhase::Recording | HudPhase::Paused | HudPhase::Saving
+        )
+    }
+
+    /// The pause control's label, or `None` when the card has no control.
+    #[must_use]
+    pub const fn pause_label(&self) -> Option<&'static str> {
+        match self.phase {
+            HudPhase::Recording => Some("Pause"),
+            HudPhase::Paused => Some("Resume"),
+            _ => None,
         }
     }
 }
@@ -167,6 +174,7 @@ pub const fn badge(state: &HudState) -> &'static str {
     match state.phase {
         HudPhase::Starting => "STARTING",
         HudPhase::Recording => "REC",
+        HudPhase::Paused => "PAUSED",
         HudPhase::Saving => "SAVING",
         HudPhase::Listening => "DICTATING",
         HudPhase::Transcribing => "TRANSCRIBING",
@@ -221,8 +229,6 @@ mod tests {
         HudState {
             phase,
             elapsed: Duration::ZERO,
-            live: [true, false],
-            levels: [0.0, 0.0],
             warning: None,
             transcript: String::new(),
         }
@@ -236,6 +242,7 @@ mod tests {
     fn each_phase_has_its_own_badge() {
         assert_eq!(badge(&hud(HudPhase::Starting)), "STARTING");
         assert_eq!(badge(&hud(HudPhase::Recording)), "REC");
+        assert_eq!(badge(&hud(HudPhase::Paused)), "PAUSED");
         assert_eq!(badge(&hud(HudPhase::Saving)), "SAVING");
         assert_eq!(badge(&hud(HudPhase::Listening)), "DICTATING");
         assert_eq!(badge(&hud(HudPhase::Transcribing)), "TRANSCRIBING");
@@ -269,7 +276,7 @@ mod tests {
             pending: Sources::MICROPHONE,
         };
         assert_eq!(
-            HudState::take(&arming, [0.0; 2], now).unwrap().phase,
+            HudState::take(&arming, now).unwrap().phase,
             HudPhase::Starting
         );
 
@@ -277,18 +284,25 @@ mod tests {
             live: Sources::MICROPHONE,
             ..live.clone()
         });
-        let state = HudState::take(&recording, [0.5, 0.0], now).unwrap();
+        let state = HudState::take(&recording, now).unwrap();
         assert_eq!(state.phase, HudPhase::Recording);
-        assert_eq!(state.live, [true, false]);
-        assert_eq!(state.levels, [0.5, 0.0]);
         assert_eq!(state.transcript, "");
+
+        let paused = Phase::Paused(Live {
+            pause_started: Some(now + Duration::from_secs(5)),
+            ..live.clone()
+        });
+        let state = HudState::take(&paused, now + Duration::from_secs(20)).unwrap();
+        assert_eq!(state.phase, HudPhase::Paused);
+        assert_eq!(badge(&state), "PAUSED");
+        assert_eq!(elapsed_text(state.elapsed), "00:05");
 
         let stopping = Phase::Stopping {
             live,
             cause: StopCause::User,
         };
         assert_eq!(
-            HudState::take(&stopping, [0.0; 2], now).unwrap().phase,
+            HudState::take(&stopping, now).unwrap().phase,
             HudPhase::Saving
         );
     }
@@ -296,7 +310,7 @@ mod tests {
     #[test]
     fn an_idle_or_finished_take_closes_the_hud() {
         let now = Instant::now();
-        assert!(HudState::take(&Phase::Idle, [0.0; 2], now).is_none());
+        assert!(HudState::take(&Phase::Idle, now).is_none());
         let done = Phase::Done(Box::new(Done {
             output: "take.ogg".into(),
             summary: None,
@@ -305,7 +319,28 @@ mod tests {
             warning: None,
             session_removed: false,
         }));
-        assert!(HudState::take(&done, [0.0; 2], now).is_none());
+        assert!(HudState::take(&done, now).is_none());
+    }
+
+    #[test]
+    fn only_a_take_draws_the_compact_card() {
+        assert!(hud(HudPhase::Starting).is_take());
+        assert!(hud(HudPhase::Recording).is_take());
+        assert!(hud(HudPhase::Paused).is_take());
+        assert!(hud(HudPhase::Saving).is_take());
+        assert!(!hud(HudPhase::Listening).is_take());
+        assert!(!hud(HudPhase::Transcribing).is_take());
+        assert!(!hud(HudPhase::Refused).is_take());
+    }
+
+    #[test]
+    fn the_pause_control_appears_only_on_a_capturing_take() {
+        assert_eq!(hud(HudPhase::Recording).pause_label(), Some("Pause"));
+        assert_eq!(hud(HudPhase::Paused).pause_label(), Some("Resume"));
+        assert_eq!(hud(HudPhase::Starting).pause_label(), None);
+        assert_eq!(hud(HudPhase::Saving).pause_label(), None);
+        assert_eq!(hud(HudPhase::Listening).pause_label(), None);
+        assert_eq!(hud(HudPhase::Refused).pause_label(), None);
     }
 
     #[test]
@@ -376,7 +411,6 @@ mod tests {
             &Dictation::Idle,
             "",
             &recording,
-            [0.5, 0.0],
             Some("A meeting recording owns the microphone."),
             later,
         )
@@ -389,7 +423,6 @@ mod tests {
             &dictating,
             "hello",
             &recording,
-            [0.5, 0.0],
             Some("A meeting recording owns the microphone."),
             later,
         )
@@ -403,10 +436,9 @@ mod tests {
         let now = Instant::now();
         let idle = Phase::Idle;
         let state =
-            HudState::for_frame(&Dictation::Idle, "", &idle, [0.0; 2], Some("Refused."), now)
-                .unwrap();
+            HudState::for_frame(&Dictation::Idle, "", &idle, Some("Refused."), now).unwrap();
         assert_eq!(state.phase, HudPhase::Refused);
-        assert!(HudState::for_frame(&Dictation::Idle, "", &idle, [0.0; 2], None, now).is_none());
+        assert!(HudState::for_frame(&Dictation::Idle, "", &idle, None, now).is_none());
     }
 
     #[test]

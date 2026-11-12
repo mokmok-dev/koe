@@ -148,6 +148,10 @@ pub struct Live {
     pub lost: Sources,
     /// The last source warning, if any.
     pub warning: Option<String>,
+    /// Time the take has spent paused, accumulated at each resume.
+    pub paused: Duration,
+    /// When the current pause began, while the take is paused.
+    pub pause_started: Option<Instant>,
 }
 
 impl Live {
@@ -159,7 +163,19 @@ impl Live {
             live: Sources::EMPTY,
             lost: Sources::EMPTY,
             warning: None,
+            paused: Duration::ZERO,
+            pause_started: None,
         }
+    }
+
+    /// Time the take has been capturing, excluding every paused interval.
+    fn elapsed(&self, now: Instant) -> Duration {
+        let paused = self.pause_started.map_or(self.paused, |since| {
+            self.paused
+                .saturating_add(now.saturating_duration_since(since))
+        });
+        now.saturating_duration_since(self.started)
+            .saturating_sub(paused)
     }
 }
 
@@ -212,6 +228,8 @@ pub enum Phase {
     },
     /// At least one source is capturing.
     Recording(Live),
+    /// Capture is open but nothing is being written.
+    Paused(Live),
     /// Capture is closing and the file is finishing.
     Stopping {
         /// The take's shared state.
@@ -239,6 +257,10 @@ pub enum Event {
     },
     /// The user or the tray asked to stop.
     Stop,
+    /// The user asked to stop writing audio without closing the file.
+    Pause,
+    /// The user asked to write audio again after a pause.
+    Resume,
     /// The recorder thread finished the file.
     Finished(Box<Completion>),
     /// The user dismissed the result.
@@ -254,15 +276,19 @@ pub enum Action {
     Stop,
     /// Discard the session of a take that wrote no audio.
     Delete,
+    /// Ask the recorder to stop writing until it resumes.
+    Pause,
+    /// Ask the recorder to write again.
+    Resume,
 }
 
 impl Phase {
-    /// Whether a take is starting, recording, or saving.
+    /// Whether a take is starting, recording, paused, or saving.
     #[must_use]
     pub const fn is_active(&self) -> bool {
         matches!(
             self,
-            Self::Arming { .. } | Self::Recording(_) | Self::Stopping { .. }
+            Self::Arming { .. } | Self::Recording(_) | Self::Paused(_) | Self::Stopping { .. }
         )
     }
 
@@ -275,7 +301,16 @@ impl Phase {
     /// Whether Stop applies.
     #[must_use]
     pub const fn can_stop(&self) -> bool {
-        matches!(self, Self::Arming { .. } | Self::Recording(_))
+        matches!(
+            self,
+            Self::Arming { .. } | Self::Recording(_) | Self::Paused(_)
+        )
+    }
+
+    /// Whether the take is paused.
+    #[must_use]
+    pub const fn is_paused(&self) -> bool {
+        matches!(self, Self::Paused(_))
     }
 
     /// Records whether the finished empty take's session was removed.
@@ -292,9 +327,10 @@ impl Phase {
     #[must_use]
     pub const fn live(&self) -> Sources {
         match self {
-            Self::Arming { live, .. } | Self::Recording(live) | Self::Stopping { live, .. } => {
-                live.live
-            }
+            Self::Arming { live, .. }
+            | Self::Recording(live)
+            | Self::Paused(live)
+            | Self::Stopping { live, .. } => live.live,
             Self::Idle | Self::Done(_) => Sources::EMPTY,
         }
     }
@@ -303,9 +339,10 @@ impl Phase {
     #[must_use]
     pub const fn lost(&self) -> Sources {
         match self {
-            Self::Arming { live, .. } | Self::Recording(live) | Self::Stopping { live, .. } => {
-                live.lost
-            }
+            Self::Arming { live, .. }
+            | Self::Recording(live)
+            | Self::Paused(live)
+            | Self::Stopping { live, .. } => live.lost,
             Self::Idle | Self::Done(_) => Sources::EMPTY,
         }
     }
@@ -314,22 +351,24 @@ impl Phase {
     #[must_use]
     pub fn warning(&self) -> Option<&str> {
         match self {
-            Self::Arming { live, .. } | Self::Recording(live) | Self::Stopping { live, .. } => {
-                live.warning.as_deref()
-            }
+            Self::Arming { live, .. }
+            | Self::Recording(live)
+            | Self::Paused(live)
+            | Self::Stopping { live, .. } => live.warning.as_deref(),
             Self::Idle => None,
             Self::Done(done) => done.warning.as_deref(),
         }
     }
 
-    /// Time spent in the current take.
+    /// Time spent capturing in the current take, excluding paused intervals.
     #[must_use]
     pub fn elapsed(&self, now: Instant) -> Option<Duration> {
         match self {
             Self::Idle => None,
-            Self::Arming { live, .. } | Self::Recording(live) | Self::Stopping { live, .. } => {
-                Some(now.saturating_duration_since(live.started))
-            }
+            Self::Arming { live, .. }
+            | Self::Recording(live)
+            | Self::Paused(live)
+            | Self::Stopping { live, .. } => Some(live.elapsed(now)),
             Self::Done(done) => Some(done.duration),
         }
     }
@@ -341,6 +380,7 @@ impl Phase {
             Self::Idle => "Ready",
             Self::Arming { .. } => "Starting",
             Self::Recording(_) => "Recording",
+            Self::Paused(_) => "Paused",
             Self::Stopping { .. } => "Saving",
             Self::Done(done) if done.failed() => "Failed",
             Self::Done(_) => "Saved",
@@ -350,6 +390,10 @@ impl Phase {
     /// Applies `event` and returns the work it asks for.
     ///
     /// An event that does not apply leaves the phase unchanged.
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the transition table is one exhaustive match; splitting it hides which events each phase answers"
+    )]
     pub fn reduce(&mut self, event: Event, now: Instant) -> Option<Action> {
         let current = std::mem::replace(self, Self::Idle);
         let (next, action) = match (current, event) {
@@ -370,10 +414,8 @@ impl Phase {
                 live.warning = Some(message);
                 settle_arming(live, pending)
             }
-            (Self::Recording(mut live), Event::Lost { source, message }) => {
-                live.live = live.live.without(source);
-                live.lost = live.lost.with(source);
-                live.warning = Some(message);
+            (Self::Recording(live), Event::Lost { source, message }) => {
+                let live = lose(live, source, message);
                 if live.live.is_empty() {
                     (
                         Self::Stopping {
@@ -386,7 +428,45 @@ impl Phase {
                     (Self::Recording(live), None)
                 }
             }
-            (Self::Arming { live, .. } | Self::Recording(live), Event::Stop) => (
+            (Self::Paused(live), Event::Lost { source, message }) => {
+                let live = lose(live, source, message);
+                if live.live.is_empty() {
+                    (
+                        Self::Stopping {
+                            live,
+                            cause: StopCause::AllSourcesLost,
+                        },
+                        Some(Action::Stop),
+                    )
+                } else {
+                    (Self::Paused(live), None)
+                }
+            }
+            (Self::Recording(live), Event::Pause) => (
+                Self::Paused(Live {
+                    pause_started: Some(now),
+                    ..live
+                }),
+                Some(Action::Pause),
+            ),
+            (Self::Paused(live), Event::Resume) => {
+                let paused = live.paused.saturating_add(
+                    live.pause_started
+                        .map_or(Duration::ZERO, |since| now.saturating_duration_since(since)),
+                );
+                (
+                    Self::Recording(Live {
+                        paused,
+                        pause_started: None,
+                        ..live
+                    }),
+                    Some(Action::Resume),
+                )
+            }
+            (
+                Self::Arming { live, .. } | Self::Recording(live) | Self::Paused(live),
+                Event::Stop,
+            ) => (
                 Self::Stopping {
                     live,
                     cause: StopCause::User,
@@ -395,7 +475,10 @@ impl Phase {
             ),
             (Self::Stopping { live, cause }, Event::Stop) => (Self::Stopping { live, cause }, None),
             (
-                Self::Arming { live, .. } | Self::Recording(live) | Self::Stopping { live, .. },
+                Self::Arming { live, .. }
+                | Self::Recording(live)
+                | Self::Paused(live)
+                | Self::Stopping { live, .. },
                 Event::Finished(completion),
             ) => {
                 let Completion {
@@ -405,10 +488,9 @@ impl Phase {
                     transcripts: _,
                 } = *completion;
                 let delete = summary.as_ref().is_some_and(|summary| summary.frames == 0);
-                let duration = summary.as_ref().map_or_else(
-                    || now.saturating_duration_since(live.started),
-                    |summary| summary.duration,
-                );
+                let duration = summary
+                    .as_ref()
+                    .map_or_else(|| live.elapsed(now), |summary| summary.duration);
                 let done = Done {
                     output,
                     summary,
@@ -439,6 +521,13 @@ fn start(plan: SessionPlan, now: Instant) -> Option<(Phase, Option<Action>)> {
         },
         Some(Action::Start(plan)),
     ))
+}
+
+fn lose(mut live: Live, source: Source, message: String) -> Live {
+    live.live = live.live.without(source);
+    live.lost = live.lost.with(source);
+    live.warning = Some(message);
+    live
 }
 
 const fn settle_arming(live: Live, pending: Sources) -> (Phase, Option<Action>) {
@@ -475,15 +564,23 @@ mod tests {
     }
 
     fn started() -> Phase {
+        started_at(base())
+    }
+
+    fn started_at(now: Instant) -> Phase {
         let mut phase = Phase::Idle;
-        phase.reduce(Event::Start(plan()), base());
+        phase.reduce(Event::Start(plan()), now);
         phase
     }
 
     fn recording() -> Phase {
-        let mut phase = started();
-        phase.reduce(Event::Opened(Source::Microphone), base());
-        phase.reduce(Event::Opened(Source::SystemAudio), base());
+        recording_at(base())
+    }
+
+    fn recording_at(now: Instant) -> Phase {
+        let mut phase = started_at(now);
+        phase.reduce(Event::Opened(Source::Microphone), now);
+        phase.reduce(Event::Opened(Source::SystemAudio), now);
         phase
     }
 
@@ -601,6 +698,164 @@ mod tests {
         assert!(matches!(phase, Phase::Stopping { .. }));
         assert!(phase.reduce(Event::Stop, base()).is_none());
         assert!(matches!(phase, Phase::Stopping { .. }));
+    }
+
+    #[test]
+    fn pause_freezes_the_elapsed_time_until_resume() {
+        let t = base();
+        let mut phase = recording_at(t);
+        assert!(matches!(
+            phase.reduce(Event::Pause, t + Duration::from_secs(5)),
+            Some(Action::Pause)
+        ));
+        assert!(matches!(phase, Phase::Paused(_)));
+        assert!(phase.is_paused());
+        assert!(phase.is_active());
+        assert!(phase.can_stop());
+        assert!(!phase.can_start());
+        assert_eq!(phase.label(), "Paused");
+        assert_eq!(
+            phase.elapsed(t + Duration::from_secs(20)),
+            Some(Duration::from_secs(5))
+        );
+
+        assert!(matches!(
+            phase.reduce(Event::Resume, t + Duration::from_secs(20)),
+            Some(Action::Resume)
+        ));
+        assert!(matches!(phase, Phase::Recording(_)));
+        assert_eq!(
+            phase.elapsed(t + Duration::from_secs(25)),
+            Some(Duration::from_secs(10))
+        );
+    }
+
+    #[test]
+    fn pause_time_accumulates_across_cycles_and_freezes_while_saving() {
+        let t = base();
+        let mut phase = recording_at(t);
+
+        phase.reduce(Event::Pause, t + Duration::from_secs(5));
+        phase.reduce(Event::Resume, t + Duration::from_secs(20));
+        assert_eq!(
+            phase.elapsed(t + Duration::from_secs(20)),
+            Some(Duration::from_secs(5))
+        );
+
+        phase.reduce(Event::Pause, t + Duration::from_secs(25));
+        assert_eq!(
+            phase.elapsed(t + Duration::from_secs(30)),
+            Some(Duration::from_secs(10))
+        );
+
+        phase.reduce(Event::Resume, t + Duration::from_secs(40));
+        assert_eq!(
+            phase.elapsed(t + Duration::from_secs(45)),
+            Some(Duration::from_secs(15))
+        );
+
+        phase.reduce(Event::Pause, t + Duration::from_secs(50));
+        phase.reduce(Event::Stop, t + Duration::from_secs(60));
+        assert_eq!(
+            phase.elapsed(t + Duration::from_secs(60)),
+            Some(Duration::from_secs(20))
+        );
+        assert_eq!(
+            phase.elapsed(t + Duration::from_secs(90)),
+            Some(Duration::from_secs(20))
+        );
+    }
+
+    #[test]
+    fn a_pause_or_resume_that_does_not_apply_is_ignored() {
+        let t = base();
+        let mut paused = recording_at(t);
+        paused.reduce(Event::Pause, t);
+        assert!(
+            paused
+                .reduce(Event::Pause, t + Duration::from_secs(1))
+                .is_none()
+        );
+        assert!(paused.is_paused());
+
+        let mut recording = recording_at(t);
+        assert!(
+            recording
+                .reduce(Event::Resume, t + Duration::from_secs(1))
+                .is_none()
+        );
+        assert!(matches!(recording, Phase::Recording(_)));
+
+        let mut arming = started_at(t);
+        assert!(arming.reduce(Event::Pause, t).is_none());
+        assert!(matches!(arming, Phase::Arming { .. }));
+    }
+
+    #[test]
+    fn stopping_a_paused_take_finalizes_the_file() {
+        let t = base();
+        let mut phase = recording_at(t);
+        phase.reduce(Event::Pause, t + Duration::from_secs(5));
+        assert!(matches!(
+            phase.reduce(Event::Stop, t + Duration::from_secs(20)),
+            Some(Action::Stop)
+        ));
+        assert!(matches!(phase, Phase::Stopping { .. }));
+        let action = phase.reduce(Event::Finished(Box::new(completion(960))), base());
+        assert!(action.is_none());
+        assert!(matches!(
+            &phase,
+            Phase::Done(done) if done.summary.is_some_and(|summary| summary.frames == 960)
+        ));
+    }
+
+    #[test]
+    fn a_paused_take_that_loses_every_source_stops() {
+        let t = base();
+        let mut phase = recording_at(t);
+        phase.reduce(Event::Pause, t);
+        phase.reduce(
+            Event::Lost {
+                source: Source::Microphone,
+                message: "unplugged".to_owned(),
+            },
+            t,
+        );
+        assert!(phase.is_paused(), "one live source keeps the pause");
+        assert_eq!(phase.live(), Sources::SYSTEM_AUDIO);
+        let action = phase.reduce(
+            Event::Lost {
+                source: Source::SystemAudio,
+                message: "server stopped".to_owned(),
+            },
+            t,
+        );
+        assert!(matches!(action, Some(Action::Stop)));
+        assert!(matches!(
+            phase,
+            Phase::Stopping {
+                cause: StopCause::AllSourcesLost,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn a_finished_paused_take_without_a_summary_counts_captured_time_only() {
+        let t = base();
+        let mut phase = recording_at(t);
+        phase.reduce(Event::Pause, t + Duration::from_secs(5));
+        phase.reduce(Event::Stop, t + Duration::from_secs(20));
+        phase.reduce(
+            Event::Finished(Box::new(Completion {
+                output: PathBuf::from("take.ogg"),
+                summary: None,
+                failure: Some(DesktopError::NoSources),
+                transcripts: koe_session_store::Transcripts::new(),
+            })),
+            t + Duration::from_secs(20),
+        );
+        assert!(matches!(&phase, Phase::Done(done) if done.duration == Duration::from_secs(5)));
     }
 
     #[test]
@@ -759,6 +1014,14 @@ mod tests {
         assert!(live.is_active());
         assert!(!live.can_start());
         assert!(live.can_stop());
+        assert!(!live.is_paused());
+
+        let mut paused = recording();
+        paused.reduce(Event::Pause, base());
+        assert!(paused.is_active());
+        assert!(paused.is_paused());
+        assert!(!paused.can_start());
+        assert!(paused.can_stop());
 
         let mut stopping = live;
         stopping.reduce(Event::Stop, base());

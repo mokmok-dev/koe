@@ -43,8 +43,8 @@ const DICTATION_TICK: Duration = Duration::from_millis(20);
 /// How often the shell looks at a running take or a dictation whose transcript
 /// nothing draws.
 ///
-/// The take HUD redraws its meters from smoothed levels, and `KOE_HUD=off`
-/// leaves the transcript with no reader, so neither needs the dictation tick.
+/// The take HUD's timer and badge move once a second, and `KOE_HUD=off` leaves
+/// the transcript with no reader, so neither needs the dictation tick.
 const ACTIVE_TICK: Duration = Duration::from_millis(100);
 
 /// Which of the window's three screens is showing.
@@ -305,6 +305,7 @@ impl Shell {
                 }
                 EngineEvent::Opened(source) => self.apply(Event::Opened(source)),
                 EngineEvent::Lost { source, message } => {
+                    self.notice = Some(message.clone());
                     self.apply(Event::Lost { source, message });
                 }
                 EngineEvent::Finished(completion) => {
@@ -382,6 +383,16 @@ impl Shell {
                     self.notice = Some(message);
                 }
             }
+            Action::Pause => {
+                if let Some(session) = &self.session {
+                    session.pause();
+                }
+            }
+            Action::Resume => {
+                if let Some(session) = &self.session {
+                    session.resume();
+                }
+            }
         }
     }
 
@@ -457,6 +468,20 @@ impl Shell {
     /// Stops the current take from the window or the tray.
     pub fn stop_recording(&mut self, cx: &mut Context<Self>) {
         let action = self.phase.reduce(Event::Stop, Instant::now());
+        if let Some(action) = action {
+            self.run(action);
+        }
+        cx.notify();
+    }
+
+    /// Pauses or resumes the current take from the HUD's button.
+    pub fn toggle_recording_pause(&mut self, cx: &mut Context<Self>) {
+        let event = if self.phase.is_paused() {
+            Event::Resume
+        } else {
+            Event::Pause
+        };
+        let action = self.phase.reduce(event, Instant::now());
         if let Some(action) = action {
             self.run(action);
         }
@@ -623,8 +648,20 @@ impl Shell {
         if self.last_hud.as_ref() == Some(&next) {
             return false;
         }
+        // The take card and the transcript card differ in size and position,
+        // and the window is placed when it opens, so a category change swaps
+        // the window instead of moving it.
+        if self
+            .last_hud
+            .as_ref()
+            .is_some_and(|open| open.is_take() != next.is_take())
+        {
+            self.pending_hud_close = self.hud.take();
+            self.hud_view = None;
+        }
         if self.hud.is_none() {
-            let Some((handle, view)) = overlay::open(cx, next.clone()) else {
+            let shell = cx.weak_entity();
+            let Some((handle, view)) = overlay::open(cx, next.clone(), shell) else {
                 return false;
             };
             self.hud = Some(handle);
@@ -635,6 +672,9 @@ impl Shell {
                 view.set_state(update);
                 cx.notify();
             });
+            if let Some(handle) = self.hud {
+                overlay::set_interactive(cx, handle, next.pause_label().is_some());
+            }
         }
         self.last_hud = Some(next);
         true
@@ -649,6 +689,7 @@ impl Shell {
                 Phase::Idle => TrayStatus::Ready,
                 Phase::Arming { .. } => TrayStatus::Starting,
                 Phase::Recording(_) => TrayStatus::Recording,
+                Phase::Paused(_) => TrayStatus::Paused,
                 Phase::Stopping { .. } => TrayStatus::Saving,
                 Phase::Done(done) if done.failed() => TrayStatus::Failed,
                 Phase::Done(_) => TrayStatus::Saved,
@@ -686,7 +727,6 @@ impl Shell {
             &self.dictation_control.dictation,
             &transcript,
             &self.phase,
-            self.levels,
             refusal,
             now,
         )

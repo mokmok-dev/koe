@@ -34,7 +34,7 @@ pub fn status_icon(status: TrayStatus) -> Result<Icon, String> {
 const fn colour(status: TrayStatus) -> [u8; 3] {
     match status {
         TrayStatus::Ready => [138, 138, 147],
-        TrayStatus::Starting => [240, 180, 41],
+        TrayStatus::Starting | TrayStatus::Paused => [240, 180, 41],
         TrayStatus::Recording => [255, 90, 95],
         TrayStatus::Saving => [88, 166, 255],
         TrayStatus::Saved => [126, 231, 135],

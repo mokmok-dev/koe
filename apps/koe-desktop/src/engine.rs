@@ -145,6 +145,7 @@ pub struct Completion {
 pub struct Session {
     output: PathBuf,
     stop: Arc<AtomicBool>,
+    paused: Arc<AtomicBool>,
     events: Receiver<EngineEvent>,
 }
 
@@ -158,14 +159,17 @@ impl Session {
         let output = plan.output.clone();
         let (sender, events) = mpsc::channel();
         let stop = Arc::new(AtomicBool::new(false));
+        let paused = Arc::new(AtomicBool::new(false));
         let thread_stop = Arc::clone(&stop);
+        let thread_paused = Arc::clone(&paused);
         thread::Builder::new()
             .name("koe-recorder".to_owned())
-            .spawn(move || run(&plan, &thread_stop, &sender))
+            .spawn(move || run(&plan, &thread_stop, &thread_paused, &sender))
             .map_err(|error| DesktopError::Thread(error.to_string()))?;
         Ok(Self {
             output,
             stop,
+            paused,
             events,
         })
     }
@@ -173,6 +177,16 @@ impl Session {
     /// Asks the capture threads to stop after their current block.
     pub fn stop(&self) {
         self.stop.store(true, Ordering::Release);
+    }
+
+    /// Asks the capture threads to drop audio until [`Self::resume`].
+    pub fn pause(&self) {
+        self.paused.store(true, Ordering::Release);
+    }
+
+    /// Asks the capture threads to write audio again.
+    pub fn resume(&self) {
+        self.paused.store(false, Ordering::Release);
     }
 
     /// Takes the next event without blocking.
@@ -194,7 +208,12 @@ impl Drop for Session {
     }
 }
 
-fn run(plan: &SessionPlan, stop: &Arc<AtomicBool>, sender: &Sender<EngineEvent>) {
+fn run(
+    plan: &SessionPlan,
+    stop: &Arc<AtomicBool>,
+    paused: &Arc<AtomicBool>,
+    sender: &Sender<EngineEvent>,
+) {
     let output = plan.output.clone();
     let mut recorder = match Recorder::create(&plan.output, plan.spec) {
         Ok(recorder) => recorder,
@@ -220,11 +239,20 @@ fn run(plan: &SessionPlan, stop: &Arc<AtomicBool>, sender: &Sender<EngineEvent>)
             let spec = *spec;
             let sender = sender.clone();
             let stop = Arc::clone(stop);
+            let paused = Arc::clone(paused);
             let recorder = &recorder;
             let ready = ready.remove(&source);
-            handles.push(
-                scope.spawn(move || pump(source, spec, &sender, &stop, recorder, ready.as_ref())),
-            );
+            handles.push(scope.spawn(move || {
+                pump(
+                    source,
+                    spec,
+                    &sender,
+                    &stop,
+                    &paused,
+                    recorder,
+                    ready.as_ref(),
+                )
+            }));
         }
         let mut exits = Vec::with_capacity(handles.len());
         for handle in handles {
@@ -360,6 +388,7 @@ fn pump(
     spec: StreamSpec,
     sender: &Sender<EngineEvent>,
     stop: &AtomicBool,
+    paused: &AtomicBool,
     recorder: &Mutex<Recorder>,
     ready: Option<&Receiver<Result<LiveSession, String>>>,
 ) -> SourceExit {
@@ -370,6 +399,8 @@ fn pump(
     let mut base = SystemTime::now();
     let mut started = false;
     let mut behind = false;
+    let mut paused_since = None;
+    let mut paused_total = Duration::ZERO;
     let mut stream = match koe_capture::open(&spec) {
         Ok(stream) => {
             let _ = sender.send(EngineEvent::Opened(source));
@@ -396,8 +427,14 @@ fn pump(
                 match ready.map(Receiver::try_recv) {
                     Some(Ok(Ok(session))) => {
                         waiting = false;
-                        live =
-                            start_live(session, &mut backlog, sender, source, base, &mut emitted);
+                        live = start_live(
+                            session,
+                            &mut backlog,
+                            sender,
+                            source,
+                            backlog_base(base, paused_total),
+                            &mut emitted,
+                        );
                     }
                     Some(Ok(Err(message))) => {
                         warn(sender, message);
@@ -431,12 +468,24 @@ fn pump(
                         base = SystemTime::now();
                         started = true;
                     }
+                    let paused_now = paused.load(Ordering::Acquire);
                     if last_level.elapsed() >= LEVEL_INTERVAL {
                         last_level = Instant::now();
                         let _ = sender.send(EngineEvent::Level {
                             source,
-                            level: peak(samples),
+                            level: if paused_now { 0.0 } else { peak(samples) },
                         });
+                    }
+                    if paused_now {
+                        // Keep draining so the platform does not back up; the
+                        // resume shifts the transcript clock past the gap.
+                        paused_since.get_or_insert_with(Instant::now);
+                        continue;
+                    }
+                    if let Some(since) = paused_since.take() {
+                        let gap = since.elapsed();
+                        base = at_offset(base, gap);
+                        paused_total = paused_total.saturating_add(gap);
                     }
                     let mut guard = recorder.lock().unwrap_or_else(PoisonError::into_inner);
                     let written = guard.write(source, samples);
@@ -506,7 +555,14 @@ fn pump(
     if waiting {
         match ready.map(Receiver::try_recv) {
             Some(Ok(Ok(session))) => {
-                live = start_live(session, &mut backlog, sender, source, base, &mut emitted);
+                live = start_live(
+                    session,
+                    &mut backlog,
+                    sender,
+                    source,
+                    backlog_base(base, paused_total),
+                    &mut emitted,
+                );
                 waiting = false;
             }
             Some(Ok(Err(message))) => {
@@ -526,6 +582,16 @@ fn pump(
         waiting,
         spoke: emitted > 0,
     }
+}
+
+/// The clock to stamp queued audio from.
+///
+/// The queue holds no paused audio, so its origin predates the paused time
+/// already added to `base`. One origin still covers a queue that spans a
+/// pause, and a batch session reports at the last shifted base, so row times
+/// around a pause stay approximate; the saved audio and the timer do not.
+fn backlog_base(base: SystemTime, paused: Duration) -> SystemTime {
+    base.checked_sub(paused).unwrap_or(base)
 }
 
 /// Feeds the audio a source buffered while the model loaded.
@@ -998,6 +1064,14 @@ mod tests {
         let mut transcript = MeetingTranscript::default();
         transcript.push(Speaker::of(Source::Microphone), *at, text);
         assert!(transcript.is_empty());
+    }
+
+    #[test]
+    fn the_backlog_clock_steps_back_over_the_pauses_it_never_held() {
+        let start = SystemTime::UNIX_EPOCH + Duration::from_secs(100);
+        let resumed = at_offset(start, Duration::from_secs(9));
+        assert_eq!(backlog_base(resumed, Duration::from_secs(9)), start);
+        assert_eq!(backlog_base(start, Duration::ZERO), start);
     }
 
     #[test]

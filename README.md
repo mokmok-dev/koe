@@ -16,7 +16,11 @@ A privacy-first recording & transcription app.
 ## Desktop app
 
 The desktop app shows the recording state in the menu bar and an overlay HUD
-while a take or a dictation runs. GPUI owns the window and the overlay, and
+while a take or a dictation runs. While a take records, the HUD is a small card
+in the top-right corner of the primary display with the elapsed time and one
+Pause/Resume button; a pause keeps the file open, and the paused time is left
+out of the timer and out of the saved file. GPUI owns the window and the
+overlay, and
 `tray-icon` owns the menu bar item. Build it with the host feature:
 
 ```console
