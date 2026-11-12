@@ -211,6 +211,10 @@ fn save_then_load_returns_the_same_meeting() {
     assert_eq!(restored.transcript(), session.transcript());
     assert_eq!(loaded.transcripts(), &transcripts);
     assert_eq!(loaded.recording(), None);
+    assert_eq!(
+        fs::read_to_string(meeting_dir(&dir, meeting.id()).join("transcript.txt")).unwrap(),
+        "[0..500] microphone: hello\n[500..900] microphone: world\n"
+    );
 }
 
 #[test]
@@ -339,6 +343,129 @@ fn absent_and_empty_transcripts_stay_distinct() {
 }
 
 #[test]
+fn save_transcripts_writes_the_record_and_the_text_file() {
+    let dir = TempDir::new();
+    let store = Store::open(dir.join("store")).unwrap();
+    let mut meeting = store.create(created_at()).unwrap();
+    let session = paused_session();
+    meeting.save(&session, &Transcripts::new()).unwrap();
+
+    let mut transcripts = Transcripts::new();
+    transcripts.set(Source::Microphone, Some(microphone_transcript()));
+    transcripts.set(
+        Source::SystemAudio,
+        Some(Transcript::new(vec![Segment::new(200, 700, "remote")], 0)),
+    );
+    meeting.save_transcripts(&transcripts).unwrap();
+
+    let directory = meeting_dir(&dir, meeting.id());
+    assert_eq!(
+        fs::read_to_string(directory.join("transcript.txt")).unwrap(),
+        "[0..500] microphone: hello\n\
+         [200..700] system audio: remote\n\
+         [500..900] microphone: world\n"
+    );
+    let loaded = store.load(meeting.id()).unwrap().unwrap();
+    assert_eq!(loaded.transcripts(), &transcripts);
+    assert_eq!(loaded.session(granted()), Some(session));
+}
+
+#[test]
+fn save_transcripts_keeps_the_recorded_audio_name() {
+    let dir = TempDir::new();
+    let store = Store::open(dir.join("store")).unwrap();
+    let mut meeting = store.create(created_at()).unwrap();
+    meeting.set_recording("meeting.ogg").unwrap();
+    meeting.save_transcripts(&texts()).unwrap();
+
+    let loaded = store.load(meeting.id()).unwrap().unwrap();
+    assert_eq!(
+        loaded.recording(),
+        Some(meeting_dir(&dir, meeting.id()).join("meeting.ogg"))
+    );
+    assert_eq!(loaded.transcripts(), &texts());
+}
+
+#[test]
+fn saving_an_empty_set_empties_the_text_file() {
+    let dir = TempDir::new();
+    let store = Store::open(dir.join("store")).unwrap();
+    let mut meeting = store.create(created_at()).unwrap();
+    meeting.save_transcripts(&texts()).unwrap();
+    let path = meeting_dir(&dir, meeting.id()).join("transcript.txt");
+    assert_ne!(fs::read_to_string(&path).unwrap(), "");
+
+    meeting.save_transcripts(&Transcripts::new()).unwrap();
+    assert_eq!(fs::read_to_string(&path).unwrap(), "");
+    assert_eq!(
+        store.load(meeting.id()).unwrap().unwrap().transcripts(),
+        &Transcripts::new()
+    );
+}
+
+#[test]
+fn a_saved_transcript_replaces_the_previous_text_and_leaves_no_partial() {
+    let dir = TempDir::new();
+    let store = Store::open(dir.join("store")).unwrap();
+    let mut meeting = store.create(created_at()).unwrap();
+    meeting.save_transcripts(&texts()).unwrap();
+
+    let shorter = Transcript::new(vec![Segment::new(0, 10, "hi")], 0);
+    let mut transcripts = Transcripts::new();
+    transcripts.set(Source::Microphone, Some(shorter));
+    meeting.save_transcripts(&transcripts).unwrap();
+
+    let directory = meeting_dir(&dir, meeting.id());
+    assert_eq!(
+        fs::read_to_string(directory.join("transcript.txt")).unwrap(),
+        "[0..10] microphone: hi\n"
+    );
+    assert!(!directory.join("transcript.partial").exists());
+}
+
+#[test]
+fn an_oversized_transcript_is_an_error_and_keeps_the_previous_text() {
+    let dir = TempDir::new();
+    let store = Store::open(dir.join("store")).unwrap();
+    let mut meeting = store.create(created_at()).unwrap();
+    meeting.save_transcripts(&texts()).unwrap();
+    let directory = meeting_dir(&dir, meeting.id());
+    let text = fs::read_to_string(directory.join("transcript.txt")).unwrap();
+
+    let oversized = Transcript::new(vec![Segment::new(0, 1, "x".repeat(4 * 1024 * 1024))], 0);
+    let mut transcripts = Transcripts::new();
+    transcripts.set(Source::Microphone, Some(oversized));
+    assert!(matches!(
+        meeting.save_transcripts(&transcripts),
+        Err(Error::TextTooLarge { .. })
+    ));
+    assert_eq!(
+        fs::read_to_string(directory.join("transcript.txt")).unwrap(),
+        text
+    );
+    assert_eq!(
+        store.load(meeting.id()).unwrap().unwrap().transcripts(),
+        &texts()
+    );
+}
+
+#[test]
+fn a_text_that_cannot_be_written_leaves_the_record_holding_the_transcripts() {
+    let dir = TempDir::new();
+    let store = Store::open(dir.join("store")).unwrap();
+    let mut meeting = store.create(created_at()).unwrap();
+    let directory = meeting_dir(&dir, meeting.id());
+    fs::create_dir(directory.join("transcript.partial")).unwrap();
+
+    assert!(matches!(
+        meeting.save_transcripts(&texts()),
+        Err(Error::TextNotWritten { .. })
+    ));
+    let loaded = store.load(meeting.id()).unwrap().unwrap();
+    assert_eq!(loaded.transcripts(), &texts());
+}
+
+#[test]
 fn set_recording_names_the_audio_file() {
     let dir = TempDir::new();
     let root = dir.join("store");
@@ -396,7 +523,13 @@ fn every_invalid_recording_name_is_rejected() {
         "a\\b.ogg",
         "a\0b.ogg",
         "session",
+        "SESSION",
+        "session ",
         "session.partial",
+        "transcript.txt",
+        "Transcript.txt",
+        "transcript.txt.",
+        "transcript.partial",
         long.as_str(),
     ] {
         assert_eq!(
@@ -544,6 +677,77 @@ fn discard_reports_a_rename_error() {
     assert!(matches!(result, Err(Error::Io { .. })));
 }
 
+#[cfg(unix)]
+#[test]
+fn a_trash_copy_that_cannot_be_removed_still_discards_the_meeting() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = TempDir::new();
+    let root = dir.join("store");
+    let store = Store::open(&root).unwrap();
+    let meeting = store.create(created_at()).unwrap();
+    let id = meeting.id();
+    let directory = meeting_dir(&dir, id);
+    fs::write(directory.join("kept"), b"x").unwrap();
+
+    // `remove_dir_all` needs write permission on every directory it empties.
+    let original = fs::metadata(&directory).unwrap().permissions().mode();
+    let mut read_only = fs::metadata(&directory).unwrap().permissions();
+    read_only.set_mode(0o555);
+    fs::set_permissions(&directory, read_only).unwrap();
+
+    let result = store.discard(id);
+
+    let trash = root.join(format!(".trash-{id}"));
+    let mut restored = fs::metadata(&trash).unwrap().permissions();
+    restored.set_mode(original);
+    fs::set_permissions(&trash, restored).unwrap();
+
+    assert_eq!(result, Ok(()));
+    assert!(!directory.exists());
+    assert_eq!(store.list().unwrap(), []);
+}
+
+#[cfg(unix)]
+#[test]
+fn a_stale_trash_copy_that_cannot_be_removed_fails_the_discard() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = TempDir::new();
+    let root = dir.join("store");
+    let store = Store::open(&root).unwrap();
+    let meeting = store.create(created_at()).unwrap();
+    let id = meeting.id();
+    let directory = meeting_dir(&dir, id);
+
+    let trash = root.join(format!(".trash-{id}"));
+    fs::create_dir(&trash).unwrap();
+    fs::write(trash.join("kept"), b"x").unwrap();
+    let original = fs::metadata(&trash).unwrap().permissions().mode();
+    let mut read_only = fs::metadata(&trash).unwrap().permissions();
+    read_only.set_mode(0o555);
+    fs::set_permissions(&trash, read_only).unwrap();
+
+    let result = store.discard(id);
+
+    let mut restored = fs::metadata(&trash).unwrap().permissions();
+    restored.set_mode(original);
+    fs::set_permissions(&trash, restored).unwrap();
+
+    assert!(
+        matches!(
+            result,
+            Err(Error::Io {
+                operation: "remove",
+                ..
+            })
+        ),
+        "{result:?}"
+    );
+    assert!(directory.exists());
+    assert_eq!(store.list().unwrap(), vec![id]);
+}
+
 #[test]
 fn a_corrupt_record_is_a_decode_error_and_still_lists() {
     let dir = TempDir::new();
@@ -578,6 +782,11 @@ fn a_decode_error_is_the_source_of_its_store_error() {
         kind: ErrorKind::NotFound,
     };
     assert!(io.source().is_none());
+
+    let text = Error::TextNotWritten {
+        source: Box::new(Error::IdCollision),
+    };
+    assert!(text.source().is_some());
 }
 
 #[test]
@@ -611,7 +820,16 @@ fn display_names_every_error_variant() {
         ),
         (
             Error::InvalidRecording,
-            "a recording name must be one plain file name in the meeting directory",
+            "a recording name must be one plain file name in the meeting directory that the store does not write itself",
+        ),
+        (
+            Error::TextNotWritten {
+                source: Box::new(Error::Io {
+                    operation: "write transcript",
+                    kind: ErrorKind::NotFound,
+                }),
+            },
+            "transcript.txt was not written: session store `write transcript` failed: entity not found",
         ),
     ];
     for (error, text) in errors {
@@ -675,6 +893,10 @@ fn display_names_every_decode_error() {
         (
             DecodeError::RecordingName { len: 0 },
             "a recording name of 0 bytes is not one plain file name",
+        ),
+        (
+            DecodeError::ReservedName { len: 14 },
+            "a recording name of 14 bytes is reserved for a file the store writes itself",
         ),
         (
             DecodeError::SectionLength {

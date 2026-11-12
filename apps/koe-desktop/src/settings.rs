@@ -4,10 +4,11 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::SystemTime;
 
 use global_hotkey::hotkey::HotKey;
 use koe_record::Format;
+use koe_session_store::{Error as StoreError, Meeting, RECORDING_FILE, Store};
 use koe_transcribe::Model;
 
 use crate::engine::SessionPlan;
@@ -36,45 +37,67 @@ impl Default for Settings {
     }
 }
 
-impl Settings {
-    /// Builds the plan for one take.
-    ///
-    /// # Errors
-    ///
-    /// Returns the file error when the folder cannot be created, and the
-    /// source error when the selection is empty.
-    pub fn plan(&self) -> Result<SessionPlan, DesktopError> {
-        fs::create_dir_all(&self.directory)
-            .map_err(|error| DesktopError::io("create", &self.directory, error))?;
-        let output = self.next_output_path()?;
-        SessionPlan::meeting(output, self.sources)
-    }
+/// A take's store and session, kept until the take finishes.
+#[derive(Debug)]
+pub struct Take {
+    /// The store the session lives in.
+    pub store: Store,
+    /// The session the take fills.
+    pub meeting: Meeting,
+}
 
-    /// Picks a file name that does not exist yet.
+impl Settings {
+    /// Builds the plan for one take and the session it fills.
     ///
     /// # Errors
     ///
-    /// Returns [`DesktopError::OutputExists`] when the folder already holds
-    /// one hundred takes from the same second.
-    pub fn next_output_path(&self) -> Result<PathBuf, DesktopError> {
-        let stamp = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map_or(0, |elapsed| elapsed.as_secs());
-        let extension = self.format.extension();
-        for attempt in 0..100_u32 {
-            let name = if attempt == 0 {
-                format!("koe-{stamp}.{extension}")
-            } else {
-                format!("koe-{stamp}-{attempt}.{extension}")
-            };
-            let path = self.directory.join(name);
-            if !path.exists() {
-                return Ok(path);
-            }
+    /// Returns [`DesktopError::NoSources`] for an empty selection,
+    /// [`DesktopError::Io`] naming the recordings folder when the folder or
+    /// the session cannot be created there, [`DesktopError::Store`] for the
+    /// remaining store failures (`set_recording`, `IdCollision`), and
+    /// [`SessionPlan::meeting`]'s error, which the fixed rate and layouts make
+    /// unreachable today.
+    pub fn plan(&self) -> Result<(Take, SessionPlan), DesktopError> {
+        // Checked before the store so an empty selection creates no directory.
+        if self.sources.is_empty() {
+            return Err(DesktopError::NoSources);
         }
-        Err(DesktopError::OutputExists {
-            path: self.directory.join(format!("koe-{stamp}.{extension}")),
-        })
+        let store =
+            Store::open(&self.directory).map_err(|error| store_error(&self.directory, error))?;
+        let mut meeting = store
+            .create(SystemTime::now())
+            .map_err(|error| store_error(&self.directory, error))?;
+        let name = Path::new(RECORDING_FILE).with_extension(self.format.extension());
+        let output = match meeting.set_recording(name.to_string_lossy().into_owned()) {
+            Ok(output) => output,
+            Err(error) => {
+                // The draft record is already published, so a take that never
+                // starts must not leave a session behind. A failed removal has
+                // no surface here; the error the caller shows is the cause.
+                let _ = store.discard(meeting.id());
+                return Err(error.into());
+            }
+        };
+        let plan = match SessionPlan::meeting(output, self.sources) {
+            Ok(plan) => plan,
+            Err(error) => {
+                // The fixed rate and layouts make this unreachable today, but
+                // a session must not outlive any failure of the plan it fills.
+                let _ = store.discard(meeting.id());
+                return Err(error);
+            }
+        };
+        Ok((Take { store, meeting }, plan))
+    }
+}
+
+/// Keeps a failure on the recordings folder the error that names the folder.
+fn store_error(directory: &Path, error: StoreError) -> DesktopError {
+    match error {
+        StoreError::Io { operation, kind } => {
+            DesktopError::io(operation, directory, io::Error::from(kind))
+        }
+        other => DesktopError::Store(other),
     }
 }
 
@@ -198,7 +221,7 @@ impl DictationSettings {
     ///
     /// # Errors
     ///
-    /// Returns [`DesktopError::Io`] when the file cannot be written,
+    /// Returns [`DesktopError::Settings`] when the file cannot be written,
     /// synced, or renamed.
     pub fn save(&self, path: &Path) -> Result<(), DesktopError> {
         use std::fmt::Write as _;
@@ -208,7 +231,7 @@ impl DictationSettings {
             .filter(|directory| !directory.as_os_str().is_empty())
             .unwrap_or_else(|| Path::new("."));
         fs::create_dir_all(directory)
-            .map_err(|error| DesktopError::io("create", directory, error))?;
+            .map_err(|error| DesktopError::settings("create", directory, error))?;
         let mut text = String::from("# koe desktop settings\n");
         let _ = writeln!(text, "hotkey = {}", hotkey::display(&self.hotkey));
         let _ = writeln!(
@@ -225,16 +248,16 @@ impl DictationSettings {
         );
         let partial = partial_path(path);
         let mut file = fs::File::create(&partial)
-            .map_err(|error| DesktopError::io("create", &partial, error))?;
+            .map_err(|error| DesktopError::settings("create", &partial, error))?;
         file.write_all(text.as_bytes())
-            .map_err(|error| DesktopError::io("write", &partial, error))?;
+            .map_err(|error| DesktopError::settings("write", &partial, error))?;
         file.sync_all()
-            .map_err(|error| DesktopError::io("sync", &partial, error))?;
+            .map_err(|error| DesktopError::settings("sync", &partial, error))?;
         drop(file);
         if let Err(error) = fs::rename(&partial, path) {
             // A rename that failed leaves no half file behind.
             let _ = fs::remove_file(&partial);
-            return Err(DesktopError::io("rename", path, error));
+            return Err(DesktopError::settings("rename", path, error));
         }
         sync_directory(directory);
         Ok(())
@@ -370,6 +393,11 @@ pub fn open_directory(path: &Path) -> Result<(), DesktopError> {
 mod tests {
     #![allow(clippy::unwrap_used)]
 
+    use std::time::Duration;
+
+    use koe_session_store::Transcripts;
+    use koe_transcribe::{Segment, Transcript};
+
     use super::*;
 
     #[test]
@@ -380,37 +408,52 @@ mod tests {
     }
 
     #[test]
-    fn an_existing_name_is_skipped() {
-        let directory = tempfile::tempdir().unwrap();
-        let mut settings = Settings {
-            directory: directory.path().to_path_buf(),
-            ..Settings::default()
-        };
-        let first = settings.next_output_path().unwrap();
-        fs::write(&first, b"").unwrap();
-        let second = settings.next_output_path().unwrap();
-        assert_ne!(first, second);
-        assert_eq!(second.extension().unwrap(), "ogg");
-        settings.format = Format::Wav;
-        let third = settings.next_output_path().unwrap();
-        assert_eq!(third.extension().unwrap(), "wav");
-    }
-
-    #[test]
-    fn a_plan_creates_the_folder_and_names_the_file() {
+    fn a_plan_creates_a_session_named_by_the_time_and_names_the_audio() {
         let root = tempfile::tempdir().unwrap();
         let settings = Settings {
             directory: root.path().join("takes"),
             ..Settings::default()
         };
-        let plan = settings.plan().unwrap();
-        assert!(settings.directory.is_dir());
-        assert_eq!(plan.output.parent(), Some(settings.directory.as_path()));
-        assert_eq!(plan.output.extension().unwrap(), "ogg");
+        let (take, plan) = settings.plan().unwrap();
+        let session = take.meeting.directory();
+        assert_eq!(session.parent(), Some(settings.directory.as_path()));
+        assert_eq!(
+            session.file_name().unwrap().to_str(),
+            Some(take.meeting.id().to_string().as_str())
+        );
+        assert!(
+            SystemTime::now()
+                .duration_since(take.meeting.created_at())
+                .unwrap()
+                < Duration::from_secs(5)
+        );
+        assert_eq!(plan.output.parent(), Some(session));
+        assert_eq!(
+            plan.output.file_name().unwrap().to_str(),
+            Some("meeting.ogg")
+        );
+        assert_eq!(take.meeting.recording(), Some(plan.output));
+        assert!(session.join("session").is_file());
+        assert_eq!(take.store.list().unwrap(), vec![take.meeting.id()]);
     }
 
     #[test]
-    fn a_plan_without_a_source_is_rejected() {
+    fn a_wav_format_names_the_audio_file_with_its_extension() {
+        let root = tempfile::tempdir().unwrap();
+        let settings = Settings {
+            directory: root.path().to_path_buf(),
+            format: Format::Wav,
+            ..Settings::default()
+        };
+        let (_, plan) = settings.plan().unwrap();
+        assert_eq!(
+            plan.output.file_name().unwrap().to_str(),
+            Some("meeting.wav")
+        );
+    }
+
+    #[test]
+    fn a_plan_without_a_source_is_rejected_and_leaves_no_session() {
         let root = tempfile::tempdir().unwrap();
         let settings = Settings {
             directory: root.path().to_path_buf(),
@@ -418,6 +461,74 @@ mod tests {
             ..Settings::default()
         };
         assert!(matches!(settings.plan(), Err(DesktopError::NoSources)));
+        let store = Store::open(root.path()).unwrap();
+        assert_eq!(store.list().unwrap().len(), 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_read_only_recordings_folder_is_reported_with_its_path() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = tempfile::tempdir().unwrap();
+        let directory = root.path().join("takes");
+        fs::create_dir(&directory).unwrap();
+        let original = fs::metadata(&directory).unwrap().permissions().mode();
+        let mut read_only = fs::metadata(&directory).unwrap().permissions();
+        read_only.set_mode(0o555);
+        fs::set_permissions(&directory, read_only).unwrap();
+
+        let settings = Settings {
+            directory: directory.clone(),
+            ..Settings::default()
+        };
+        let result = settings.plan();
+
+        let mut restored = fs::metadata(&directory).unwrap().permissions();
+        restored.set_mode(original);
+        fs::set_permissions(&directory, restored).unwrap();
+
+        assert!(
+            matches!(&result, Err(DesktopError::Io { path, .. }) if path == &directory),
+            "{result:?}"
+        );
+    }
+
+    #[test]
+    fn saved_transcripts_reach_the_record_and_the_text_file() {
+        let root = tempfile::tempdir().unwrap();
+        let settings = Settings {
+            directory: root.path().to_path_buf(),
+            ..Settings::default()
+        };
+        let (mut take, plan) = settings.plan().unwrap();
+        let mut transcripts = Transcripts::new();
+        transcripts.set(
+            koe_capture::Source::Microphone,
+            Some(Transcript::new(vec![Segment::new(0, 100, "hello")], 0)),
+        );
+        take.meeting.save_transcripts(&transcripts).unwrap();
+
+        let loaded = take.store.load(take.meeting.id()).unwrap().unwrap();
+        assert_eq!(loaded.transcripts(), &transcripts);
+        assert_eq!(
+            fs::read_to_string(plan.output.parent().unwrap().join("transcript.txt")).unwrap(),
+            "[0..100] microphone: hello\n"
+        );
+    }
+
+    #[test]
+    fn discarding_an_empty_take_removes_its_session() {
+        let root = tempfile::tempdir().unwrap();
+        let settings = Settings {
+            directory: root.path().to_path_buf(),
+            ..Settings::default()
+        };
+        let (take, _) = settings.plan().unwrap();
+        let session = take.meeting.directory().to_path_buf();
+        take.store.discard(take.meeting.id()).unwrap();
+        assert!(!session.exists());
+        assert_eq!(take.store.list().unwrap().len(), 0);
     }
 
     fn dictation() -> DictationSettings {
@@ -590,14 +701,14 @@ mod tests {
     }
 
     #[test]
-    fn saving_over_an_unwritable_path_fails_with_an_io_error() {
+    fn saving_over_an_unwritable_path_fails_with_a_settings_error() {
         let root = tempfile::tempdir().unwrap();
         let blocked = root.path().join("blocked");
         fs::write(&blocked, b"").unwrap();
         let path = blocked.join(SETTINGS_FILE);
         assert!(matches!(
             dictation().save(&path),
-            Err(DesktopError::Io { .. })
+            Err(DesktopError::Settings { .. })
         ));
     }
 
@@ -608,7 +719,7 @@ mod tests {
         fs::create_dir(&path).unwrap();
         assert!(matches!(
             dictation().save(&path),
-            Err(DesktopError::Io { .. })
+            Err(DesktopError::Settings { .. })
         ));
         assert!(
             !root

@@ -26,6 +26,8 @@ pub enum Command {
     Devices,
     /// Record microphone and system audio into one file.
     Record(RecordArgs),
+    /// Record and transcribe a meeting into a session directory.
+    Meeting(MeetingArgs),
     /// Transcribe a 16-bit PCM WAV file.
     Transcribe(TranscribeArgs),
 }
@@ -35,6 +37,32 @@ pub enum Command {
 pub struct RecordArgs {
     /// Output file: `.ogg`, `.oga`, `.opus`, or `.wav`.
     pub output: PathBuf,
+    /// Capture and transcription options.
+    #[command(flatten)]
+    pub capture: CaptureArgs,
+    /// Transcript file. Defaults to the output path with a `.txt` extension.
+    #[arg(long, conflicts_with = "no_transcribe")]
+    pub transcript: Option<PathBuf>,
+    /// Print time ranges in the transcript file.
+    #[arg(long, conflicts_with = "no_transcribe")]
+    pub timestamps: bool,
+}
+
+/// Arguments for `koe meeting`.
+#[derive(Debug, Args)]
+pub struct MeetingArgs {
+    /// Directory that holds meeting sessions. Defaults to
+    /// `$KOE_RECORDINGS_DIR`, or `recordings` in the current directory.
+    #[arg(long)]
+    pub root: Option<PathBuf>,
+    /// Capture and transcription options.
+    #[command(flatten)]
+    pub capture: CaptureArgs,
+}
+
+/// The capture and transcription options `record` and `meeting` share.
+#[derive(Debug, Args)]
+pub struct CaptureArgs {
     /// What to capture.
     #[arg(long, value_enum, default_value_t = SourceChoice::Both)]
     pub source: SourceChoice,
@@ -53,15 +81,9 @@ pub struct RecordArgs {
     /// GGUF speech model. Omit to use the platform's system model.
     #[arg(long, conflicts_with = "no_transcribe")]
     pub model: Option<PathBuf>,
-    /// Transcript file. Defaults to the output path with a `.txt` extension.
-    #[arg(long, conflicts_with = "no_transcribe")]
-    pub transcript: Option<PathBuf>,
     /// BCP 47 language tag for transcription.
     #[arg(long, conflicts_with = "no_transcribe")]
     pub language: Option<String>,
-    /// Print time ranges in the transcript file.
-    #[arg(long, conflicts_with = "no_transcribe")]
-    pub timestamps: bool,
     /// Record without transcription.
     #[arg(long)]
     pub no_transcribe: bool,
@@ -172,6 +194,15 @@ mod tests {
         }
     }
 
+    fn meeting(args: &[&str]) -> MeetingArgs {
+        let mut all = vec!["meeting"];
+        all.extend_from_slice(args);
+        match parse(&all).unwrap().command {
+            Command::Meeting(args) => args,
+            other => panic!("expected meeting, got {other:?}"),
+        }
+    }
+
     #[test]
     fn devices_parses_as_the_devices_command() {
         assert!(matches!(
@@ -184,16 +215,16 @@ mod tests {
     fn record_defaults_are_stereo_at_48_khz_from_both_sources() {
         let args = record(&["take.ogg"]);
         assert_eq!(args.output, PathBuf::from("take.ogg"));
-        assert_eq!(args.source, SourceChoice::Both);
-        assert_eq!(args.duration, None);
-        assert_eq!(args.rate, 48_000);
-        assert_eq!(args.channels, ChannelChoice::Stereo);
-        assert_eq!(args.gain, 0.0);
-        assert_eq!(args.model, None);
+        assert_eq!(args.capture.source, SourceChoice::Both);
+        assert_eq!(args.capture.duration, None);
+        assert_eq!(args.capture.rate, 48_000);
+        assert_eq!(args.capture.channels, ChannelChoice::Stereo);
+        assert_eq!(args.capture.gain, 0.0);
+        assert_eq!(args.capture.model, None);
         assert_eq!(args.transcript, None);
-        assert_eq!(args.language, None);
+        assert_eq!(args.capture.language, None);
         assert!(!args.timestamps);
-        assert!(!args.no_transcribe);
+        assert!(!args.capture.no_transcribe);
     }
 
     #[test]
@@ -218,22 +249,73 @@ mod tests {
             "ja",
             "--timestamps",
         ]);
-        assert_eq!(args.source, SourceChoice::Microphone);
-        assert_eq!(args.duration, Some(Duration::from_millis(2_500)));
-        assert_eq!(args.rate, 16_000);
-        assert_eq!(args.channels, ChannelChoice::Mono);
-        assert_eq!(args.gain, -3.0);
-        assert_eq!(args.model, Some(PathBuf::from("tiny.gguf")));
+        assert_eq!(args.capture.source, SourceChoice::Microphone);
+        assert_eq!(args.capture.duration, Some(Duration::from_millis(2_500)));
+        assert_eq!(args.capture.rate, 16_000);
+        assert_eq!(args.capture.channels, ChannelChoice::Mono);
+        assert_eq!(args.capture.gain, -3.0);
+        assert_eq!(args.capture.model, Some(PathBuf::from("tiny.gguf")));
         assert_eq!(args.transcript, Some(PathBuf::from("take.txt")));
-        assert_eq!(args.language.as_deref(), Some("ja"));
+        assert_eq!(args.capture.language.as_deref(), Some("ja"));
         assert!(args.timestamps);
-        assert!(!args.no_transcribe);
+        assert!(!args.capture.no_transcribe);
     }
 
     #[test]
     fn record_without_transcription_parses() {
         let args = record(&["take.wav", "--no-transcribe"]);
-        assert!(args.no_transcribe);
+        assert!(args.capture.no_transcribe);
+    }
+
+    #[test]
+    fn meeting_defaults_are_stereo_at_48_khz_from_both_sources() {
+        let args = meeting(&[]);
+        assert_eq!(args.root, None);
+        assert_eq!(args.capture.source, SourceChoice::Both);
+        assert_eq!(args.capture.duration, None);
+        assert_eq!(args.capture.rate, 48_000);
+        assert_eq!(args.capture.channels, ChannelChoice::Stereo);
+        assert_eq!(args.capture.gain, 0.0);
+        assert_eq!(args.capture.model, None);
+        assert_eq!(args.capture.language, None);
+        assert!(!args.capture.no_transcribe);
+    }
+
+    #[test]
+    fn meeting_reads_every_option() {
+        let args = meeting(&[
+            "--root",
+            "meetings",
+            "--source",
+            "system",
+            "--duration",
+            "1.5",
+            "--rate",
+            "16000",
+            "--channels",
+            "mono",
+            "--gain",
+            "-2",
+            "--model",
+            "tiny.gguf",
+            "--language",
+            "ja",
+        ]);
+        assert_eq!(args.root, Some(PathBuf::from("meetings")));
+        assert_eq!(args.capture.source, SourceChoice::System);
+        assert_eq!(args.capture.duration, Some(Duration::from_millis(1_500)));
+        assert_eq!(args.capture.rate, 16_000);
+        assert_eq!(args.capture.channels, ChannelChoice::Mono);
+        assert_eq!(args.capture.gain, -2.0);
+        assert_eq!(args.capture.model, Some(PathBuf::from("tiny.gguf")));
+        assert_eq!(args.capture.language.as_deref(), Some("ja"));
+        assert!(!args.capture.no_transcribe);
+    }
+
+    #[test]
+    fn meeting_without_transcription_parses() {
+        let args = meeting(&["--no-transcribe"]);
+        assert!(args.capture.no_transcribe);
     }
 
     #[test]
@@ -311,6 +393,8 @@ mod tests {
             vec!["record", "take.ogg", "--rate", "fast"],
             vec!["record", "take.ogg", "--gain", "loud"],
             vec!["record", "take.ogg", "--no-transcribe", "--model", "m.gguf"],
+            vec!["meeting", "--source", "speaker"],
+            vec!["meeting", "--no-transcribe", "--model", "m.gguf"],
             vec!["transcribe"],
         ] {
             assert!(parse(&args).is_err(), "{args:?} must be rejected");
@@ -341,7 +425,7 @@ mod tests {
     fn help_text_names_every_command() {
         let error = parse(&["--help"]).unwrap_err();
         let text = error.render().to_string();
-        for command in ["devices", "record", "transcribe"] {
+        for command in ["devices", "record", "meeting", "transcribe"] {
             assert!(text.contains(command), "help must name `{command}`");
         }
     }

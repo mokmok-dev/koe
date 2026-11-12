@@ -37,7 +37,7 @@ fn help_names_every_command_and_exits_zero() {
     let output = koe(&["--help"]);
     assert_success(&output);
     let text = stdout(&output);
-    for command in ["devices", "record", "transcribe"] {
+    for command in ["devices", "record", "meeting", "transcribe"] {
         assert!(text.contains(command), "help must name `{command}`");
     }
 }
@@ -167,6 +167,33 @@ fn a_record_without_a_transcription_backend_fails_before_the_audio_file() {
     assert_failure(&output, 1);
     assert!(stderr(&output).contains("no speech-to-text backend is enabled"));
     assert!(!path.exists());
+}
+
+#[cfg(not(any(feature = "linux", feature = "macos", feature = "windows")))]
+#[test]
+fn a_meeting_without_a_backend_leaves_no_session() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("meetings");
+    let output = Command::new(env!("CARGO_BIN_EXE_koe"))
+        .args([
+            "meeting",
+            "--root",
+            root.to_str().unwrap(),
+            "--source",
+            "microphone",
+            "--duration",
+            "0.1",
+            "--no-transcribe",
+        ])
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    assert_failure(&output, 1);
+    assert!(stderr(&output).contains("no audio capture backend is enabled"));
+    assert!(stdout(&output).contains("session: removed, no audio was written"));
+
+    let store = koe_session_store::Store::open(&root).unwrap();
+    assert_eq!(store.list().unwrap(), []);
 }
 
 #[cfg(not(any(feature = "linux", feature = "macos", feature = "windows")))]

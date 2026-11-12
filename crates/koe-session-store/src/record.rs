@@ -10,7 +10,8 @@ use koe_session::{CHECKPOINT_LEN, Checkpoint};
 use koe_transcribe_core::{Segment, Transcript};
 
 use crate::crc::crc32;
-use crate::error::{DecodeError, Error};
+use crate::error::{DecodeError, Error, io_error};
+use crate::text::{PARTIAL_FILE as TEXT_PARTIAL_FILE, TRANSCRIPT_FILE};
 use crate::transcripts::Transcripts;
 
 /// Name of the record inside a meeting directory.
@@ -46,12 +47,16 @@ pub struct Record {
 
 /// Whether `name` can be the audio file of a meeting directory.
 pub fn is_valid_name(name: &str) -> bool {
+    is_plain_name(name) && !is_reserved_name(name)
+}
+
+/// Whether `name` is one plain file name: no directory part, no NUL, and not
+/// a name a directory walk skips.
+fn is_plain_name(name: &str) -> bool {
     if name.is_empty()
         || name.len() > MAX_NAME_BYTES
         || name.starts_with('.')
         || name.contains(['/', '\\', '\0'])
-        || name == SESSION_FILE
-        || name == PARTIAL_FILE
     {
         return false;
     }
@@ -60,6 +65,27 @@ pub fn is_valid_name(name: &str) -> bool {
         (components.next(), components.next()),
         (Some(Component::Normal(_)), None)
     )
+}
+
+/// Whether `name` belongs to a file the store writes itself.
+///
+/// Compared without case because the filesystems most meetings are stored on
+/// fold case, where `Transcript.txt` names the rendered transcript too; a
+/// trailing dot or space is ignored because Win32 strips both from a path
+/// component. An 8.3 short name (`TRANSC~1.TXT`) is not detected: both
+/// applications always name the audio `meeting.<ext>`, so only a caller of
+/// `Meeting::set_recording` or a record written before the reservation can
+/// carry one.
+fn is_reserved_name(name: &str) -> bool {
+    let name = name.trim_end_matches(['.', ' ']);
+    [
+        SESSION_FILE,
+        PARTIAL_FILE,
+        TRANSCRIPT_FILE,
+        TEXT_PARTIAL_FILE,
+    ]
+    .iter()
+    .any(|reserved| name.eq_ignore_ascii_case(reserved))
 }
 
 /// Encodes `record`, refusing a transcript that does not fit.
@@ -253,8 +279,11 @@ fn decode_body(
     let recording = if has_recording {
         let name = str::from_utf8(&bytes[HEADER_LEN..name_end])
             .map_err(|_| DecodeError::RecordingName { len: name_len })?;
-        if !is_valid_name(name) {
+        if !is_plain_name(name) {
             return Err(DecodeError::RecordingName { len: name_len });
+        }
+        if is_reserved_name(name) {
+            return Err(DecodeError::ReservedName { len: name_len });
         }
         Some(name.into())
     } else {
@@ -402,13 +431,6 @@ pub fn read(directory: &Path) -> Result<Option<Record>, Error> {
         .read_to_end(&mut bytes)
         .map_err(io_error("read"))?;
     decode(&bytes).map(Some).map_err(Error::Decode)
-}
-
-fn io_error(operation: &'static str) -> impl FnOnce(io::Error) -> Error {
-    move |error| Error::Io {
-        operation,
-        kind: error.kind(),
-    }
 }
 
 /// Makes a rename inside `directory` durable.
@@ -893,6 +915,52 @@ mod tests {
                 len: u16_len(NAME.len())
             })
         );
+    }
+
+    #[test]
+    fn a_recorded_name_the_store_reserves_is_reported_as_reserved() {
+        for reserved in ["Transcript.TXT", "transcript.txt.", "transcript.txt "] {
+            let placeholder = "x".repeat(reserved.len() - 4) + ".ogg";
+            assert_eq!(placeholder.len(), reserved.len());
+            let record = Record {
+                recording: Some(placeholder.into()),
+                ..Record::default()
+            };
+            let mut bytes = encode(&record).unwrap();
+            bytes[HEADER_LEN..HEADER_LEN + reserved.len()].copy_from_slice(reserved.as_bytes());
+            seal(&mut bytes);
+            assert_eq!(
+                decode(&bytes),
+                Err(DecodeError::ReservedName {
+                    len: u16_len(reserved.len())
+                })
+            );
+        }
+    }
+
+    #[test]
+    fn a_reserved_name_is_not_a_valid_recording_name() {
+        for name in [
+            "session",
+            "SESSION",
+            "session ",
+            "session.",
+            "session.partial",
+            "transcript.txt",
+            "Transcript.txt",
+            "transcript.txt.",
+            "transcript.txt ",
+            "transcript.partial",
+        ] {
+            assert!(!is_valid_name(name), "{name:?} must be reserved");
+            let record = Record {
+                recording: Some(name.into()),
+                ..Record::default()
+            };
+            assert_eq!(encode(&record), Err(Error::InvalidRecording), "{name:?}");
+        }
+        assert!(is_valid_name("meeting.ogg"));
+        assert!(is_valid_name("Session notes.ogg"));
     }
 
     #[test]

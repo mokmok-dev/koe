@@ -12,6 +12,7 @@ use gpui::{
     WindowDecorations, WindowId, WindowOptions, px, size,
 };
 use gpui_kit::component::{Theme, ThemeMode, TitleBar};
+use koe_session_store::{Error as StoreError, Transcripts};
 
 use crate::dictation;
 use crate::dictation_control::{DictationControl, Press};
@@ -19,7 +20,7 @@ use crate::dictation_worker;
 use crate::engine::{self, Completion, EngineEvent, TranscriptionPlan};
 use crate::hud::{self, HudState};
 use crate::overlay;
-use crate::settings::{self, Settings};
+use crate::settings::{self, Settings, Take};
 use crate::state::{Action, Event, Phase, Sources};
 use crate::transcript::{self, MeetingTranscript, Speaker};
 use crate::tray::{Tray, TrayAction, TrayState, TrayStatus};
@@ -73,6 +74,7 @@ pub struct Shell {
     pub(crate) screen: Screen,
     pub(crate) sidebar_collapsed: bool,
     pub(crate) session: Option<engine::Session>,
+    pub(crate) take: Option<Take>,
     pub(crate) transcript: MeetingTranscript,
     pub(crate) transcript_pending: bool,
     pub(crate) levels: [f32; 2],
@@ -124,6 +126,7 @@ impl Shell {
             screen: Screen::Meeting,
             sidebar_collapsed: false,
             session: None,
+            take: None,
             transcript: MeetingTranscript::default(),
             transcript_pending: false,
             levels: [0.0; 2],
@@ -308,7 +311,17 @@ impl Shell {
                 EngineEvent::Finished(completion) => {
                     self.session = None;
                     self.levels = [0.0; 2];
+                    self.save_transcripts(&completion.transcripts);
+                    // A recorder that never created its file left nothing to
+                    // keep; a partial take keeps its session.
+                    if completion.summary.is_none()
+                        && !completion.output.is_file()
+                        && let Some(message) = self.discard_take()
+                    {
+                        self.notice = Some(message);
+                    }
                     self.apply(Event::Finished(completion));
+                    self.take = None;
                     if !self.quitting && matches!(&self.phase, Phase::Done(done) if done.failed()) {
                         self.show_window();
                     }
@@ -336,11 +349,17 @@ impl Shell {
                     }
                     Err(error) => {
                         self.session = None;
-                        self.notice = Some(error.to_string());
+                        // A thread that never started recorded nothing.
+                        let removal = self.discard_take();
+                        self.notice = Some(removal.map_or_else(
+                            || error.to_string(),
+                            |message| format!("{error}; {message}"),
+                        ));
                         let completion = Box::new(Completion {
                             output,
                             summary: None,
                             failure: Some(error),
+                            transcripts: Transcripts::new(),
                         });
                         let action = self
                             .phase
@@ -357,6 +376,13 @@ impl Shell {
                     session.stop();
                 }
             }
+            Action::Delete => {
+                let removal = self.discard_take();
+                self.phase.set_session_removed(removal.is_none());
+                if let Some(message) = removal {
+                    self.notice = Some(message);
+                }
+            }
             Action::Pause => {
                 if let Some(session) = &self.session {
                     session.pause();
@@ -367,9 +393,37 @@ impl Shell {
                     session.resume();
                 }
             }
-            Action::Delete(path) => {
-                let _ = std::fs::remove_file(path);
+        }
+    }
+
+    /// Stores the take's transcripts in its session.
+    fn save_transcripts(&mut self, transcripts: &Transcripts) {
+        let Some(take) = self.take.as_mut() else {
+            return;
+        };
+        match take.meeting.save_transcripts(transcripts) {
+            Ok(()) => {}
+            Err(StoreError::TextNotWritten { source }) => {
+                self.notice = Some(format!(
+                    "the transcript text file was not written: {source}"
+                ));
             }
+            Err(error) => self.notice = Some(format!("the transcript was not saved: {error}")),
+        }
+    }
+
+    /// Removes the whole session of a take that recorded nothing.
+    ///
+    /// Returns the message to show when the removal failed; the caller decides
+    /// whether it stands alone or joins another error.
+    fn discard_take(&mut self) -> Option<String> {
+        let take = self.take.take()?;
+        match take.store.discard(take.meeting.id()) {
+            Ok(()) => None,
+            Err(error) => Some(format!(
+                "the session at {} was not removed: {error}",
+                take.meeting.directory().display()
+            )),
         }
     }
 
@@ -385,8 +439,8 @@ impl Shell {
             return;
         }
         self.notice = None;
-        let mut plan = match self.settings.plan() {
-            Ok(plan) => plan,
+        let (take, mut plan) = match self.settings.plan() {
+            Ok(planned) => planned,
             Err(error) => {
                 self.notice = Some(error.to_string());
                 self.show_window();
@@ -399,8 +453,9 @@ impl Shell {
         } else {
             self.notice = Some(transcript::MODEL_MISSING.to_owned());
         }
-        let action = self.phase.reduce(Event::Start(plan), Instant::now());
-        if let Some(action) = action {
+        // `Settings::plan` refuses an empty selection, so a start always arms.
+        if let Some(action) = self.phase.reduce(Event::Start(plan), Instant::now()) {
+            self.take = Some(take);
             // Until this take retains an utterance, the rows on screen belong
             // to an earlier take.
             self.transcript_pending = true;
@@ -769,4 +824,86 @@ pub fn run() {
             })
             .detach();
         });
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used)]
+
+    use std::time::{Duration, Instant};
+
+    use koe_record::Summary;
+    use koe_session_store::{Store, Transcripts};
+
+    use super::*;
+    use crate::state::Live;
+
+    /// A shell holding one take in a fresh store under `root`, and the plan the
+    /// engine would have run.
+    fn shell_with_take(root: &std::path::Path) -> (Shell, engine::SessionPlan) {
+        let mut shell = Shell::new();
+        shell.settings.directory = root.to_path_buf();
+        let (take, plan) = shell.settings.plan().unwrap();
+        shell.take = Some(take);
+        shell.phase = Phase::Recording(Live::new(Instant::now()));
+        (shell, plan)
+    }
+
+    fn empty_take(plan: &engine::SessionPlan) -> Box<Completion> {
+        Box::new(Completion {
+            output: plan.output.clone(),
+            summary: Some(Summary {
+                frames: 0,
+                clipped_samples: 0,
+                duration: Duration::from_secs(1),
+            }),
+            failure: None,
+            transcripts: Transcripts::new(),
+        })
+    }
+
+    #[test]
+    fn an_empty_take_records_that_its_session_was_removed() {
+        let root = tempfile::tempdir().unwrap();
+        let (mut shell, plan) = shell_with_take(root.path());
+
+        shell.apply(Event::Finished(empty_take(&plan)));
+
+        assert!(matches!(&shell.phase, Phase::Done(done) if done.session_removed));
+        assert!(shell.take.is_none());
+        assert_eq!(Store::open(root.path()).unwrap().list().unwrap(), []);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_empty_take_that_cannot_be_removed_names_its_session() {
+        use std::fs;
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = tempfile::tempdir().unwrap();
+        let (mut shell, plan) = shell_with_take(root.path());
+        let directory = shell
+            .take
+            .as_ref()
+            .unwrap()
+            .meeting
+            .directory()
+            .to_path_buf();
+
+        let original = fs::metadata(root.path()).unwrap().permissions().mode();
+        let mut read_only = fs::metadata(root.path()).unwrap().permissions();
+        read_only.set_mode(0o555);
+        fs::set_permissions(root.path(), read_only).unwrap();
+
+        shell.apply(Event::Finished(empty_take(&plan)));
+
+        let mut restored = fs::metadata(root.path()).unwrap().permissions();
+        restored.set_mode(original);
+        fs::set_permissions(root.path(), restored).unwrap();
+
+        assert!(matches!(&shell.phase, Phase::Done(done) if !done.session_removed));
+        let notice = shell.notice.as_deref().unwrap();
+        assert!(notice.contains(&directory.display().to_string()));
+        assert!(directory.exists());
+    }
 }

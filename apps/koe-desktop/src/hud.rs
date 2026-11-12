@@ -317,6 +317,7 @@ mod tests {
             failure: None,
             duration: Duration::from_secs(1),
             warning: None,
+            session_removed: false,
         }));
         assert!(HudState::take(&done, now).is_none());
     }

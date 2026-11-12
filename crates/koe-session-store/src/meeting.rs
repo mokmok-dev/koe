@@ -1,6 +1,6 @@
 //! A stored meeting and the operations a caller performs on it.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use koe_session::{Checkpoint, Permissions, Session};
@@ -8,6 +8,7 @@ use koe_session::{Checkpoint, Permissions, Session};
 use crate::error::Error;
 use crate::id::SessionId;
 use crate::record::{self, Record};
+use crate::text;
 use crate::transcripts::Transcripts;
 
 /// One meeting in the store.
@@ -27,6 +28,12 @@ impl Meeting {
     #[must_use]
     pub const fn id(&self) -> SessionId {
         self.id
+    }
+
+    /// The directory that holds this meeting.
+    #[must_use]
+    pub fn directory(&self) -> &Path {
+        &self.directory
     }
 
     /// The instant the meeting was created, derived from the id.
@@ -70,7 +77,8 @@ impl Meeting {
     /// # Errors
     ///
     /// Returns [`Error::InvalidRecording`] when `name` is not one plain file
-    /// name, and [`Error::Io`] when the record cannot be written.
+    /// name, or names a file the store writes itself, and [`Error::Io`] when
+    /// the record cannot be written.
     pub fn set_recording(&mut self, name: impl Into<Box<str>>) -> Result<PathBuf, Error> {
         let name = name.into();
         if !record::is_valid_name(&name) {
@@ -86,23 +94,58 @@ impl Meeting {
         Ok(path)
     }
 
-    /// Saves `session` and `transcripts` as one record.
+    /// Saves `session` and `transcripts` as one record and rewrites the text
+    /// rendered from it.
     ///
     /// A session with no settled checkpoint keeps the stored checkpoint.
     ///
     /// # Errors
     ///
-    /// Returns [`Error::Io`] when the record cannot be written and
-    /// [`Error::TextTooLarge`] when a transcript does not fit it. The handle
-    /// keeps reporting what the disk actually holds.
+    /// Returns [`Error::Io`] when the record cannot be written,
+    /// [`Error::TextTooLarge`] when a transcript does not fit it, and
+    /// [`Error::TextNotWritten`] when the record holds the transcripts but
+    /// `transcript.txt` could not be written. The handle keeps reporting what
+    /// the disk actually holds.
     pub fn save(&mut self, session: &Session, transcripts: &Transcripts) -> Result<(), Error> {
         let candidate = Record {
             checkpoint: Checkpoint::of(session).or(self.record.checkpoint),
             transcripts: transcripts.clone(),
             recording: self.record.recording.clone(),
         };
+        self.commit(candidate)
+    }
+
+    /// Saves `transcripts` without a session, keeping the stored checkpoint.
+    ///
+    /// The `session` record is written first and is the source of truth;
+    /// `transcript.txt` is rendered from it. A failed render therefore leaves
+    /// the record the text was rendered from, and the next save rewrites the
+    /// copy.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Io`] when the record cannot be written,
+    /// [`Error::TextTooLarge`] when a transcript does not fit it, and
+    /// [`Error::TextNotWritten`] when the record holds the transcripts but
+    /// `transcript.txt` could not be written. The handle keeps reporting what
+    /// the disk holds.
+    pub fn save_transcripts(&mut self, transcripts: &Transcripts) -> Result<(), Error> {
+        let candidate = Record {
+            checkpoint: self.record.checkpoint,
+            transcripts: transcripts.clone(),
+            recording: self.record.recording.clone(),
+        };
+        self.commit(candidate)
+    }
+
+    /// Writes `candidate` as the record, then rewrites the text derived from it.
+    fn commit(&mut self, candidate: Record) -> Result<(), Error> {
         record::write(&self.directory, &candidate)?;
         self.record = candidate;
-        Ok(())
+        text::write(&self.directory, &self.record.transcripts).map_err(|error| {
+            Error::TextNotWritten {
+                source: Box::new(error),
+            }
+        })
     }
 }

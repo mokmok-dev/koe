@@ -37,8 +37,23 @@ pub enum Error {
         /// Length the parts add up to.
         bytes: usize,
     },
-    /// The name is not one plain file name inside the meeting directory.
+    /// The name is not one plain file name inside the meeting directory, or it
+    /// names a file the store writes itself.
     InvalidRecording,
+    /// The record holds the transcripts, but the text rendered beside it does
+    /// not.
+    TextNotWritten {
+        /// Failure writing `transcript.txt`.
+        source: Box<Self>,
+    },
+}
+
+/// Maps a failed file operation to [`Error::Io`].
+pub fn io_error(operation: &'static str) -> impl FnOnce(io::Error) -> Error {
+    move |error| Error::Io {
+        operation,
+        kind: error.kind(),
+    }
 }
 
 impl fmt::Display for Error {
@@ -63,8 +78,12 @@ impl fmt::Display for Error {
                 formatter,
                 "a record of {bytes} bytes cannot be written; the format holds at most {MAX_RECORD_LEN}"
             ),
-            Self::InvalidRecording => formatter
-                .write_str("a recording name must be one plain file name in the meeting directory"),
+            Self::InvalidRecording => formatter.write_str(
+                "a recording name must be one plain file name in the meeting directory that the store does not write itself",
+            ),
+            Self::TextNotWritten { source } => {
+                write!(formatter, "transcript.txt was not written: {source}")
+            }
         }
     }
 }
@@ -73,6 +92,7 @@ impl std::error::Error for Error {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::Decode(error) => Some(error),
+            Self::TextNotWritten { source } => Some(source.as_ref()),
             _ => None,
         }
     }
@@ -134,6 +154,11 @@ pub enum DecodeError {
     UnexpectedRecording,
     /// The recording name is not one plain file name.
     RecordingName {
+        /// Length of the name in the record.
+        len: u16,
+    },
+    /// The recording name is one the store reserves for a file it writes.
+    ReservedName {
         /// Length of the name in the record.
         len: u16,
     },
@@ -227,6 +252,10 @@ impl fmt::Display for DecodeError {
             Self::RecordingName { len } => write!(
                 formatter,
                 "a recording name of {len} bytes is not one plain file name"
+            ),
+            Self::ReservedName { len } => write!(
+                formatter,
+                "a recording name of {len} bytes is reserved for a file the store writes itself"
             ),
             Self::SectionLength { source, len } => write!(
                 formatter,

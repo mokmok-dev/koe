@@ -20,6 +20,7 @@ global-hotkey = "0.10"
 gpui-kit.workspace = true
 koe-capture.workspace = true
 koe-record.workspace = true
+koe-session-store.workspace = true
 koe-transcribe.workspace = true
 
 [target.'cfg(target_os = "linux")'.dependencies]
