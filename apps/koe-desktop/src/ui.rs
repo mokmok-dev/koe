@@ -3,8 +3,8 @@
 use std::time::Instant;
 
 use gpui::{
-    AnyElement, App, AppContext as _, Axis, Context, Entity, FontWeight, IntoElement, ParentElement,
-    Render, Role, SharedString, Styled as _, Subscription, Window, div, px, rgb,
+    AnyElement, App, AppContext as _, Axis, Context, Entity, FontWeight, IntoElement,
+    ParentElement, Render, Role, SharedString, Styled as _, Subscription, Window, div, px, rgb,
 };
 use gpui_kit::component::{
     ActiveTheme as _, Disableable as _, Icon, IconName, IndexPath, Sizable as _, TitleBar,
@@ -14,7 +14,8 @@ use gpui_kit::component::{
     group_box::{GroupBox, GroupBoxVariant, GroupBoxVariants as _},
     h_flex,
     input::{Input, InputEvent, InputState},
-    message::{Message, MessageAlignment, MessageContent, MessageGroup, MessageHeader},
+    message::{Message, MessageAlignment, MessageContent, MessageHeader},
+    message_scroller::{MessageScroller, MessageScrollerState},
     progress::Progress,
     scroll::ScrollableElement as _,
     searchable_list::SearchableVec,
@@ -34,7 +35,7 @@ use crate::hud;
 use crate::language;
 use crate::settings;
 use crate::state::{Done, Phase, Sources};
-use crate::transcript::MeetingTranscript;
+use crate::transcript::Speaker;
 
 const LIVE: u32 = 0x007E_E787;
 const IDLE: u32 = 0x005A_5A62;
@@ -63,49 +64,20 @@ pub struct MainView {
     hotkey_input: Entity<InputState>,
     model_input: Entity<InputState>,
     language_select: Entity<SelectState<LanguageItems>>,
+    /// The meeting thread's virtual-list bookkeeping.
+    messages: Entity<MessageScrollerState>,
+    /// Row count and first sequence the thread was last reconciled against.
+    thread_rows: usize,
+    thread_first: Option<u64>,
     _subscriptions: Vec<Subscription>,
 }
 
 impl MainView {
     /// Builds the view, seeds the settings fields, and re-renders on change.
     pub fn new(shell: Entity<Shell>, window: &mut Window, cx: &mut Context<Self>) -> Self {
-        let (hotkey_value, model_value, language_row) = {
-            let shell = shell.read(cx);
-            let settings = &shell.dictation_control.settings;
-            let saved = settings.language.as_deref().unwrap_or_default();
-            (
-                hotkey::display(&settings.hotkey),
-                settings
-                    .model
-                    .as_ref()
-                    .map_or_else(String::new, |model| model.display().to_string()),
-                language::CHOICES.iter().position(|(tag, _)| *tag == saved),
-            )
-        };
+        let (hotkey_input, model_input, language_select) =
+            Self::settings_fields(&shell, window, cx);
 
-        let hotkey_input = cx.new(|cx| {
-            InputState::new(window, cx)
-                .placeholder("Ctrl+Shift+Space")
-                .default_value(hotkey_value)
-        });
-        let model_input = cx.new(|cx| {
-            InputState::new(window, cx)
-                .placeholder("/path/to/model.gguf")
-                .default_value(model_value)
-        });
-
-        let language_items: Vec<SharedString> = language::CHOICES
-            .iter()
-            .map(|(_, name)| SharedString::from(*name))
-            .collect();
-        let language_select = cx.new(|cx| {
-            SelectState::new(LanguageItems::new(language_items), None, window, cx).searchable(true)
-        });
-        // Unlike the constructor, `set_selected_index` records the scroll that
-        // brings the stored language into view on the first open.
-        language_select.update(cx, |state, cx| {
-            state.set_selected_index(language_row.map(IndexPath::new), window, cx);
-        });
 
         let mut subscriptions = Vec::new();
         subscriptions.push(cx.subscribe(&hotkey_input, {
@@ -150,20 +122,129 @@ impl MainView {
             }
         }));
 
-        cx.observe(&shell, |_, _, cx| cx.notify()).detach();
+        let (thread_rows, thread_first) = {
+            let shell = shell.read(cx);
+            (
+                shell.transcript.len(),
+                shell
+                    .transcript
+                    .utterances()
+                    .first()
+                    .map(|utterance| utterance.sequence),
+            )
+        };
+        let messages = cx.new(|cx| MessageScrollerState::new(thread_rows, cx));
+
+        subscriptions.push(cx.observe(&shell, {
+            let messages = messages.clone();
+            move |view, shell, cx| {
+                let (rows, first) = {
+                    let shell = shell.read(cx);
+                    (
+                        shell.transcript.len(),
+                        shell
+                            .transcript
+                            .utterances()
+                            .first()
+                            .map(|utterance| utterance.sequence),
+                    )
+                };
+                view.sync_thread(&messages, rows, first, cx);
+                cx.notify();
+            }
+        }));
+        // The scroller raises its own jump-to-latest visibility from a
+        // notification on this state, which only reaches the window through
+        // this subscription.
+        subscriptions.push(cx.observe(&messages, |_, _, cx| cx.notify()));
+
         Self {
             shell,
             hotkey_input,
             model_input,
             language_select,
+            messages,
+            thread_rows,
+            thread_first,
             _subscriptions: subscriptions,
         }
+    }
+
+    /// Seeds the dictation fields from the saved settings.
+    fn settings_fields(
+        shell: &Entity<Shell>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> (
+        Entity<InputState>,
+        Entity<InputState>,
+        Entity<SelectState<LanguageItems>>,
+    ) {
+        let (hotkey_value, model_value, language_row) = {
+            let shell = shell.read(cx);
+            let settings = &shell.dictation_control.settings;
+            let saved = settings.language.as_deref().unwrap_or_default();
+            (
+                hotkey::display(&settings.hotkey),
+                settings
+                    .model
+                    .as_ref()
+                    .map_or_else(String::new, |model| model.display().to_string()),
+                language::CHOICES.iter().position(|(tag, _)| *tag == saved),
+            )
+        };
+
+        let hotkey_input = cx.new(|cx| {
+            InputState::new(window, cx)
+                .placeholder("Ctrl+Shift+Space")
+                .default_value(hotkey_value)
+        });
+        let model_input = cx.new(|cx| {
+            InputState::new(window, cx)
+                .placeholder("/path/to/model.gguf")
+                .default_value(model_value)
+        });
+        let language_items: Vec<SharedString> = language::CHOICES
+            .iter()
+            .map(|(_, name)| SharedString::from(*name))
+            .collect();
+        let language_select = cx.new(|cx| {
+            SelectState::new(LanguageItems::new(language_items), None, window, cx).searchable(true)
+        });
+        // Unlike the constructor, `set_selected_index` records the scroll that
+        // brings the stored language into view on the first open.
+        language_select.update(cx, |state, cx| {
+            state.set_selected_index(language_row.map(IndexPath::new), window, cx);
+        });
+
+        (hotkey_input, model_input, language_select)
+    }
+
+    /// Rebuilds the meeting thread when the transcript changes.
+    ///
+    /// A batch model can insert an earlier utterance in the middle of the
+    /// list, which shifts every row after it, so the thread is reset rather
+    /// than appended to.
+    fn sync_thread(
+        &mut self,
+        messages: &Entity<MessageScrollerState>,
+        rows: usize,
+        first: Option<u64>,
+        cx: &mut Context<Self>,
+    ) {
+        if rows == self.thread_rows && first == self.thread_first {
+            return;
+        }
+        self.thread_rows = rows;
+        self.thread_first = first;
+        messages.update(cx, |state, cx| state.reset(rows, cx));
     }
 }
 
 impl MainView {
-    /// The take controls: the phase card, the meters, and the start or stop button.
-    fn recorder_screen(&self, shell: &Shell, cx: &Context<Self>) -> AnyElement {
+    /// The take controls shared by the meeting and recorder screens: the phase
+    /// card, the meters, and the start or stop button.
+    fn take_panel(&self, shell: &Shell, cx: &Context<Self>) -> AnyElement {
         let entity = self.shell.clone();
         let theme = cx.theme();
         let phase = &shell.phase;
@@ -247,12 +328,122 @@ impl MainView {
                 ),
             )
             .child(primary)
-            .children(transcript_card(
-                &shell.transcript,
-                shell.transcript_pending,
-                cx,
-            ))
             .into_any_element()
+    }
+
+    /// The take controls over the meeting transcript, read as a message thread.
+    fn meeting_screen(&self, shell: &Shell, cx: &Context<Self>) -> AnyElement {
+        v_flex()
+            .flex_1()
+            .min_w(px(0.0))
+            .min_h(px(0.0))
+            .gap(px(14.0))
+            .child(self.take_panel(shell, cx))
+            .child(self.transcript_panel(shell, cx))
+            .into_any_element()
+    }
+
+    /// The retained transcript, or the empty state that says what will fill it.
+    fn transcript_panel(&self, shell: &Shell, cx: &Context<Self>) -> AnyElement {
+        let theme = cx.theme();
+        let count = shell.transcript.len();
+        let count_label = format!("{count} utterance{}", if count == 1 { "" } else { "s" });
+        let title = if shell.transcript_pending {
+            "Previous take"
+        } else {
+            "Transcript"
+        };
+
+        let thread = if shell.transcript.is_empty() {
+            v_flex()
+                .size_full()
+                .items_center()
+                .justify_center()
+                .gap_1()
+                .child(
+                    div()
+                        .text_sm()
+                        .text_color(theme.foreground)
+                        .child("The meeting appears here as it is transcribed."),
+                )
+                .child(div().text_xs().text_color(theme.muted_foreground).child(
+                    "Start recording to hear You on the microphone and Them on the system audio.",
+                ))
+                .into_any_element()
+        } else {
+            self.message_thread()
+        };
+
+        v_flex()
+            .flex_1()
+            .min_w(px(0.0))
+            .min_h(px(0.0))
+            .gap(px(8.0))
+            .child(
+                h_flex()
+                    .items_center()
+                    .gap(px(8.0))
+                    .child(
+                        div()
+                            .text_base()
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .child(title),
+                    )
+                    .children((count > 0).then(|| {
+                        div()
+                            .text_xs()
+                            .text_color(theme.muted_foreground)
+                            .child(count_label)
+                    })),
+            )
+            .child(
+                div()
+                    .flex_1()
+                    .min_w(px(0.0))
+                    .min_h(px(0.0))
+                    .rounded(theme.radius)
+                    .border_1()
+                    .border_color(theme.border)
+                    .overflow_hidden()
+                    .child(thread),
+            )
+            .into_any_element()
+    }
+
+    /// The retained utterances as chat rows, newest at the bottom.
+    fn message_thread(&self) -> AnyElement {
+        let shell = self.shell.clone();
+        MessageScroller::new(
+            "meeting-thread",
+            self.messages.clone(),
+            move |index, _window, cx| {
+                let shell = shell.read(cx);
+                let Some(utterance) = shell.transcript.utterances().get(index) else {
+                    return div().into_any_element();
+                };
+                Message::new()
+                    .id(("utterance", utterance.sequence))
+                    .role(Role::ListItem)
+                    .alignment(utterance_alignment(utterance.speaker))
+                    .header(
+                        MessageHeader::new()
+                            .child(utterance.speaker.label())
+                            .child("·")
+                            .child(utterance.clock.clone()),
+                    )
+                    .content(
+                        MessageContent::new().bubble(
+                            Bubble::new()
+                                .with_variant(bubble_variant(utterance.speaker))
+                                .child(utterance.text.clone()),
+                        ),
+                    )
+                    .into_any_element()
+            },
+        )
+        .scrollbar(true)
+        .jump_button(true)
+        .into_any_element()
     }
 
     /// The settings pages.
@@ -520,6 +711,7 @@ impl Render for MainView {
         };
 
         let on_toggle_sidebar = click(entity.clone(), Shell::toggle_sidebar);
+        let on_meeting = click(entity.clone(), Shell::show_meeting);
         let on_recorder = click(entity.clone(), Shell::show_recorder);
         let on_settings = click(entity.clone(), Shell::show_settings);
         let on_dismiss = click(entity.clone(), Shell::dismiss);
@@ -572,6 +764,14 @@ impl Render for MainView {
         let done_element = done.map(|done| done_card(done, on_dismiss, cx));
 
         let content = match screen {
+            Screen::Meeting => v_flex()
+                .flex_1()
+                .min_w(px(0.0))
+                .min_h(px(0.0))
+                .p(px(22.0))
+                .gap(px(14.0))
+                .child(self.meeting_screen(shell, cx))
+                .into_any_element(),
             Screen::Recorder => v_flex()
                 .flex_1()
                 .min_w(px(0.0))
@@ -579,7 +779,7 @@ impl Render for MainView {
                 .overflow_y_scrollbar()
                 .p(px(22.0))
                 .gap(px(14.0))
-                .child(self.recorder_screen(shell, cx))
+                .child(self.take_panel(shell, cx))
                 .children(alerts)
                 .children(done_element)
                 .into_any_element(),
@@ -612,6 +812,12 @@ impl Render for MainView {
                         .child(Icon::new(IconName::Mic))
                         .children((!sidebar_collapsed).then_some("koe")),
                 ),
+            )
+            .child(
+                SidebarMenuItem::new("Meeting")
+                    .icon(Icon::new(gpui_kit::assets::IconName::MessageCircle))
+                    .active(screen == Screen::Meeting)
+                    .on_click(on_meeting),
             )
             .child(
                 SidebarMenuItem::new("Recorder")
@@ -746,70 +952,22 @@ fn meter(name: &str, source: Source, levels: [f32; 2], live: Sources) -> impl In
         )
 }
 
-/// The meeting transcript retained so far, one message per utterance.
-fn transcript_card(
-    transcript: &MeetingTranscript,
-    pending: bool,
-    cx: &Context<MainView>,
-) -> Option<AnyElement> {
-    if transcript.is_empty() {
-        return None;
+/// Your own words sit at the trailing edge, the way a sent message does; the
+/// remote voices stay at the leading edge.
+const fn utterance_alignment(speaker: Speaker) -> MessageAlignment {
+    match speaker {
+        Speaker::You => MessageAlignment::End,
+        Speaker::Them => MessageAlignment::Start,
     }
-    let theme = cx.theme();
-    let count = transcript.len();
-    let count_label = format!("{count} utterance{}", if count == 1 { "" } else { "s" });
-    let title = if pending {
-        "Previous take"
-    } else {
-        "Transcript"
-    };
-    let messages = transcript.utterances().iter().map(|utterance| {
-        Message::new()
-            .id(("utterance", utterance.sequence))
-            .role(Role::ListItem)
-            .alignment(MessageAlignment::Start)
-            .header(
-                MessageHeader::new()
-                    .child(utterance.speaker.label())
-                    .child("·")
-                    .child(utterance.clock.clone()),
-            )
-            .content(
-                MessageContent::new().bubble(
-                    Bubble::new()
-                        .with_variant(BubbleVariant::Secondary)
-                        .child(utterance.text.clone()),
-                ),
-            )
-    });
+}
 
-    Some(
-        GroupBox::new()
-            .outline()
-            .child(
-                v_flex()
-                    .gap(px(10.0))
-                    .child(
-                        h_flex()
-                            .items_center()
-                            .gap(px(8.0))
-                            .child(
-                                div()
-                                    .text_base()
-                                    .font_weight(FontWeight::SEMIBOLD)
-                                    .child(title),
-                            )
-                            .child(
-                                div()
-                                    .text_xs()
-                                    .text_color(theme.muted_foreground)
-                                    .child(count_label),
-                            ),
-                    )
-                    .child(MessageGroup::new().children(messages)),
-            )
-            .into_any_element(),
-    )
+/// Your own bubble carries the accent surface, so the two sides of the
+/// conversation stay distinguishable without relying on position alone.
+const fn bubble_variant(speaker: Speaker) -> BubbleVariant {
+    match speaker {
+        Speaker::You => BubbleVariant::Filled,
+        Speaker::Them => BubbleVariant::Secondary,
+    }
 }
 
 struct DoneView {
@@ -923,5 +1081,18 @@ fn detail(phase: &Phase) -> String {
             |failure| failure.headline().to_owned(),
         ),
         Phase::Done(_) => "saved to your recordings folder".to_owned(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn you_sits_at_the_trailing_edge_and_them_at_the_leading_edge() {
+        assert_eq!(utterance_alignment(Speaker::You), MessageAlignment::End);
+        assert_eq!(utterance_alignment(Speaker::Them), MessageAlignment::Start);
+        assert_eq!(bubble_variant(Speaker::You), BubbleVariant::Filled);
+        assert_eq!(bubble_variant(Speaker::Them), BubbleVariant::Secondary);
     }
 }

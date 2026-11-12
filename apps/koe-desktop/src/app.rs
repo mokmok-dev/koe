@@ -46,15 +46,17 @@ const DICTATION_TICK: Duration = Duration::from_millis(20);
 /// leaves the transcript with no reader, so neither needs the dictation tick.
 const ACTIVE_TICK: Duration = Duration::from_millis(100);
 
-/// Which of the window's two screens is showing.
+/// Which of the window's three screens is showing.
 ///
 /// The settings page selected inside gpui-kit's `Settings` is not part of this:
 /// GPUI drops an element's keyed state once that element stops rendering, so
-/// the settings screen opens on its first page after a visit to the recorder.
+/// the settings screen opens on its first page after a visit to another screen.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) enum Screen {
-    /// The take status, the start and stop control, and the last take.
+    /// The take controls and the transcript of both sources as a message thread.
     #[default]
+    Meeting,
+    /// The take status, the start and stop control, and the last take.
     Recorder,
     /// The dictation settings, the sources, the format, and the folder.
     Settings,
@@ -119,7 +121,7 @@ impl Shell {
         Self {
             phase: Phase::Idle,
             settings: Settings::default(),
-            screen: Screen::Recorder,
+            screen: Screen::Meeting,
             sidebar_collapsed: false,
             session: None,
             transcript: MeetingTranscript::default(),
@@ -421,6 +423,12 @@ impl Shell {
     /// Switches to the settings screen.
     pub fn show_settings(&mut self, cx: &mut Context<Self>) {
         self.screen = Screen::Settings;
+        cx.notify();
+    }
+
+    /// Switches to the meeting screen.
+    pub fn show_meeting(&mut self, cx: &mut Context<Self>) {
+        self.screen = Screen::Meeting;
         cx.notify();
     }
 
