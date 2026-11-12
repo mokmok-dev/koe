@@ -3626,6 +3626,7 @@ dependencies = [
  "koe-capture",
  "koe-capture-core",
  "koe-record",
+ "koe-session-store",
  "koe-transcribe",
  "tempfile",
 ]
@@ -3641,6 +3642,7 @@ dependencies = [
  "gpui-kit",
  "koe-capture",
  "koe-record",
+ "koe-session-store",
  "koe-transcribe",
  "tempfile",
  "tray-icon",

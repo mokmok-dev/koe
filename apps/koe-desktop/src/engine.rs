@@ -14,7 +14,8 @@ use std::time::{Duration, Instant, SystemTime};
 
 use koe_capture::{Source, StreamSpec};
 use koe_record::{Channels, Recorder, RecordingSpec, Summary};
-use koe_transcribe::{AudioSpec, Event, LiveSession, Model, Options, Transcriber};
+use koe_session_store::Transcripts;
+use koe_transcribe::{AudioSpec, Event, LiveSession, Model, Options, Transcriber, Transcript};
 
 use crate::dictation_worker::{BACKLOG_LIMIT, MODEL_LOAD, push_bounded};
 use crate::error::DesktopError;
@@ -136,6 +137,8 @@ pub struct Completion {
     pub summary: Option<Summary>,
     /// Why it did not.
     pub failure: Option<DesktopError>,
+    /// The transcript each source produced, for the UI thread to store.
+    pub transcripts: Transcripts,
 }
 
 /// A running recorder.
@@ -196,7 +199,7 @@ fn run(plan: &SessionPlan, stop: &Arc<AtomicBool>, sender: &Sender<EngineEvent>)
     let mut recorder = match Recorder::create(&plan.output, plan.spec) {
         Ok(recorder) => recorder,
         Err(error) => {
-            finish(sender, output, None, Some(error.into()));
+            finish(sender, output, None, Some(error.into()), Transcripts::new());
             return;
         }
     };
@@ -204,7 +207,7 @@ fn run(plan: &SessionPlan, stop: &Arc<AtomicBool>, sender: &Sender<EngineEvent>)
         if let Err(error) = recorder.add_source(*source, spec) {
             let failure = Some(error.into());
             let closed = recorder.finish();
-            finish(sender, output, closed.ok(), failure);
+            finish(sender, output, closed.ok(), failure, Transcripts::new());
             return;
         }
     }
@@ -244,12 +247,10 @@ fn run(plan: &SessionPlan, stop: &Arc<AtomicBool>, sender: &Sender<EngineEvent>)
     let summary = recorder.finish();
     // `LiveSession::finish` can block inside the engine, so the recorder is
     // finalized first; a stuck flush must not leave the audio file unfinalized.
-    for transcription in transcriptions {
-        finish_transcription(transcription, sender);
-    }
+    let transcripts = finish_transcriptions(transcriptions, sender);
     match summary {
-        Ok(summary) => finish(sender, output, Some(summary), None),
-        Err(error) => finish(sender, output, None, Some(error.into())),
+        Ok(summary) => finish(sender, output, Some(summary), None, transcripts),
+        Err(error) => finish(sender, output, None, Some(error.into()), transcripts),
     }
 }
 
@@ -549,7 +550,23 @@ fn start_live(
     Some(session)
 }
 
-fn finish_transcription(transcription: SourceTranscript, sender: &Sender<EngineEvent>) {
+/// Finalizes every source's session and collects what it transcribed.
+fn finish_transcriptions(
+    transcriptions: Vec<SourceTranscript>,
+    sender: &Sender<EngineEvent>,
+) -> Transcripts {
+    let mut transcripts = Transcripts::new();
+    for transcription in transcriptions {
+        let (source, transcript) = finish_transcription(transcription, sender);
+        transcripts.set(source, Some(transcript));
+    }
+    transcripts
+}
+
+fn finish_transcription(
+    transcription: SourceTranscript,
+    sender: &Sender<EngineEvent>,
+) -> (Source, Transcript) {
     let SourceTranscript {
         source,
         live,
@@ -587,6 +604,7 @@ fn finish_transcription(transcription: SourceTranscript, sender: &Sender<EngineE
         at: SystemTime::now(),
         text: String::new(),
     });
+    (source, transcript)
 }
 
 fn drain(
@@ -657,11 +675,13 @@ fn finish(
     output: PathBuf,
     summary: Option<Summary>,
     failure: Option<DesktopError>,
+    transcripts: Transcripts,
 ) {
     let _ = sender.send(EngineEvent::Finished(Box::new(Completion {
         output,
         summary,
         failure,
+        transcripts,
     })));
 }
 
@@ -759,9 +779,14 @@ mod tests {
         }
     }
 
-    fn source_transcript(live: LiveSession, base: SystemTime, emitted: usize) -> SourceTranscript {
+    fn source_transcript(
+        source: Source,
+        live: LiveSession,
+        base: SystemTime,
+        emitted: usize,
+    ) -> SourceTranscript {
         SourceTranscript {
-            source: Source::Microphone,
+            source,
             live,
             base,
             emitted,
@@ -831,7 +856,10 @@ mod tests {
         let mut emitted = 0;
         session.feed(&[0.5; 160]).unwrap();
         drain_until(&session, &sender, base, &mut emitted, 1).unwrap();
-        finish_transcription(source_transcript(session, base, emitted), &sender);
+        finish_transcription(
+            source_transcript(Source::Microphone, session, base, emitted),
+            &sender,
+        );
         drop(sender);
         let events = transcripts(reported(&events));
         assert_eq!(events.len(), 1);
@@ -879,7 +907,10 @@ mod tests {
         session.feed(&[0.5; 160]).unwrap();
         drain(&session, &sender, Source::Microphone, base, &mut emitted).unwrap();
         assert_eq!(emitted, 0);
-        finish_transcription(source_transcript(session, base, emitted), &sender);
+        finish_transcription(
+            source_transcript(Source::Microphone, session, base, emitted),
+            &sender,
+        );
         drop(sender);
         let events = transcripts(reported(&events));
         assert_eq!(events.len(), 1);
@@ -954,7 +985,10 @@ mod tests {
         let mut emitted = 0;
         session.feed(&[0.5; 160]).unwrap();
         drain_until(&session, &sender, base, &mut emitted, 1).unwrap();
-        finish_transcription(source_transcript(session, base, emitted), &sender);
+        finish_transcription(
+            source_transcript(Source::Microphone, session, base, emitted),
+            &sender,
+        );
         drop(sender);
         let events = transcripts(reported(&events));
         assert_eq!(events.len(), 1);
@@ -978,6 +1012,39 @@ mod tests {
         assert_eq!(backlog[BACKLOG_LIMIT - 1], 1.0);
         assert_eq!(audio_ms(dropped, 1, SAMPLE_RATE), 20);
         assert_eq!(audio_ms(dropped * 2, 2, SAMPLE_RATE), 20);
+    }
+
+    #[test]
+    fn finishing_collects_every_sources_transcript() {
+        let microphone = Arc::new(Script::default());
+        microphone
+            .on_finish
+            .lock()
+            .unwrap()
+            .push_back(committed("hello", 0));
+        let system = Arc::new(Script::default());
+        system
+            .on_finish
+            .lock()
+            .unwrap()
+            .push_back(committed("remote", 500));
+        let (sender, _events) = mpsc::channel();
+        let base = SystemTime::now();
+        let transcripts = finish_transcriptions(
+            vec![
+                source_transcript(Source::Microphone, live(microphone), base, 0),
+                source_transcript(Source::SystemAudio, live(system), base, 0),
+            ],
+            &sender,
+        );
+        assert_eq!(
+            transcripts.get(Source::Microphone).map(Transcript::text),
+            Some("hello")
+        );
+        assert_eq!(
+            transcripts.get(Source::SystemAudio).map(Transcript::text),
+            Some("remote")
+        );
     }
 
     #[test]

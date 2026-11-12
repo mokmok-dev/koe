@@ -6,6 +6,7 @@ use std::path::PathBuf;
 
 use koe_capture::Error as CaptureError;
 use koe_record::Error as RecordError;
+use koe_session_store::Error as StoreError;
 use koe_transcribe::Error as TranscribeError;
 
 use crate::wav;
@@ -19,6 +20,8 @@ pub enum AppError {
     Capture(CaptureError),
     /// A recording operation failed.
     Record(RecordError),
+    /// A meeting session operation failed.
+    Store(StoreError),
     /// A speech-to-text operation failed.
     Transcribe(TranscribeError),
     /// The audio file is not a WAV this build reads.
@@ -64,6 +67,7 @@ impl fmt::Display for AppError {
             Self::Usage(message) => formatter.write_str(message),
             Self::Capture(error) => write!(formatter, "capture failed: {error}"),
             Self::Record(error) => write!(formatter, "recording failed: {error}"),
+            Self::Store(error) => write!(formatter, "meeting session: {error}"),
             Self::Transcribe(error) => write!(formatter, "transcription failed: {error}"),
             Self::Wav(error) => write!(formatter, "audio file: {error}"),
             Self::RecorderFinished => formatter.write_str("the recorder was already finished"),
@@ -85,6 +89,12 @@ impl From<CaptureError> for AppError {
 impl From<RecordError> for AppError {
     fn from(error: RecordError) -> Self {
         Self::Record(error)
+    }
+}
+
+impl From<StoreError> for AppError {
+    fn from(error: StoreError) -> Self {
+        Self::Store(error)
     }
 }
 
@@ -133,6 +143,7 @@ mod tests {
             2
         );
         assert_eq!(AppError::Record(RecordError::InvalidPacket).exit_code(), 1);
+        assert_eq!(AppError::Store(StoreError::IdCollision).exit_code(), 1);
     }
 
     #[test]
@@ -152,6 +163,11 @@ mod tests {
             (
                 AppError::Transcribe(TranscribeError::Unsupported),
                 "transcription failed: no speech-to-text backend is enabled".to_owned(),
+            ),
+            (
+                AppError::Store(StoreError::InvalidRecording),
+                "meeting session: a recording name must be one plain file name in the meeting directory that the store does not write itself"
+                    .to_owned(),
             ),
             (
                 AppError::Wav(wav::Error::NotWave),
@@ -188,6 +204,10 @@ mod tests {
         assert!(matches!(
             AppError::from(TranscribeError::Unsupported),
             AppError::Transcribe(TranscribeError::Unsupported)
+        ));
+        assert!(matches!(
+            AppError::from(StoreError::IdCollision),
+            AppError::Store(StoreError::IdCollision)
         ));
         assert!(matches!(
             AppError::from(wav::Error::NotWave),

@@ -5,7 +5,7 @@ use std::io;
 use std::path::PathBuf;
 use std::time::SystemTime;
 
-use crate::error::Error;
+use crate::error::{Error, io_error};
 use crate::id::SessionId;
 use crate::meeting::Meeting;
 use crate::record::{self, Record, SESSION_FILE};
@@ -22,8 +22,10 @@ pub struct Store {
 impl Store {
     /// Opens the store at `root`, creating it and its parents if needed.
     ///
-    /// Best-effort sweeps `.new-*` and `.trash-*` leftovers, which only a crash
-    /// during [`Self::create`] or [`Self::discard`] can leave behind.
+    /// Best-effort sweeps `.new-*` and `.trash-*` leftovers, which a crash, or a
+    /// failed cleanup of its own staging or trash directory, can leave behind. A
+    /// sweep that fails is ignored on purpose: the leftover costs space, not
+    /// correctness.
     ///
     /// # Errors
     ///
@@ -122,13 +124,18 @@ impl Store {
         }))
     }
 
-    /// Removes `id` and its directory.
+    /// Removes `id` from the store.
     ///
-    /// Idempotent: a missing meeting is `Ok`.
+    /// The meeting's directory is renamed into a trash directory, so
+    /// [`Self::list`] stops reporting it and [`Self::load`] returns [`None`].
+    /// Removing the trash copy is best effort; a copy that cannot be removed is
+    /// left for [`Self::open`] to sweep, so the call still succeeds. Idempotent:
+    /// a missing meeting is `Ok`.
     ///
     /// # Errors
     ///
-    /// Returns [`Error::Io`] when the directory cannot be renamed or removed.
+    /// Returns [`Error::Io`] when the directory cannot be renamed, or a stale
+    /// trash copy left by an earlier discard cannot be removed.
     pub fn discard(&self, id: SessionId) -> Result<(), Error> {
         let trash = self.root.join(format!("{TRASH_PREFIX}{id}"));
         if trash.exists() {
@@ -141,7 +148,7 @@ impl Store {
             Err(error) => return Err(io_error("rename")(error)),
         }
         record::sync_directory(&self.root);
-        fs::remove_dir_all(&trash).map_err(io_error("remove"))?;
+        let _ = fs::remove_dir_all(&trash);
         record::sync_directory(&self.root);
         Ok(())
     }
@@ -157,12 +164,5 @@ impl Store {
             }
         }
         Ok(())
-    }
-}
-
-fn io_error(operation: &'static str) -> impl FnOnce(io::Error) -> Error {
-    move |error| Error::Io {
-        operation,
-        kind: error.kind(),
     }
 }

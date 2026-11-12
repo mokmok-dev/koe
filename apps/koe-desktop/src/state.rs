@@ -176,6 +176,11 @@ pub struct Done {
     pub duration: Duration,
     /// The last source warning.
     pub warning: Option<String>,
+    /// Whether the session of an empty take was removed from the store.
+    ///
+    /// The shell records the store's answer after [`Action::Delete`]; a failed
+    /// removal leaves it false, so the card does not claim one.
+    pub session_removed: bool,
 }
 
 impl Done {
@@ -247,8 +252,8 @@ pub enum Action {
     Start(SessionPlan),
     /// Ask the recorder to stop.
     Stop,
-    /// Remove an empty or failed output file.
-    Delete(std::path::PathBuf),
+    /// Discard the session of a take that wrote no audio.
+    Delete,
 }
 
 impl Phase {
@@ -271,6 +276,16 @@ impl Phase {
     #[must_use]
     pub const fn can_stop(&self) -> bool {
         matches!(self, Self::Arming { .. } | Self::Recording(_))
+    }
+
+    /// Records whether the finished empty take's session was removed.
+    ///
+    /// [`Action::Delete`] is the store's work, so its answer arrives after
+    /// [`Self::reduce`] built the [`Done`] the card draws.
+    pub fn set_session_removed(&mut self, removed: bool) {
+        if let Self::Done(done) = self {
+            done.session_removed = removed;
+        }
     }
 
     /// The sources delivering audio, or none.
@@ -387,6 +402,7 @@ impl Phase {
                     output,
                     summary,
                     failure,
+                    transcripts: _,
                 } = *completion;
                 let delete = summary.as_ref().is_some_and(|summary| summary.frames == 0);
                 let duration = summary.as_ref().map_or_else(
@@ -394,16 +410,14 @@ impl Phase {
                     |summary| summary.duration,
                 );
                 let done = Done {
-                    output: output.clone(),
+                    output,
                     summary,
                     failure,
                     duration,
                     warning: live.warning,
+                    session_removed: false,
                 };
-                (
-                    Self::Done(Box::new(done)),
-                    delete.then_some(Action::Delete(output)),
-                )
+                (Self::Done(Box::new(done)), delete.then_some(Action::Delete))
             }
             (Self::Done(_), Event::Dismiss) => (Self::Idle, None),
             (phase, _) => (phase, None),
@@ -482,6 +496,7 @@ mod tests {
                 duration: Duration::from_secs(3),
             }),
             failure: None,
+            transcripts: koe_session_store::Transcripts::new(),
         }
     }
 
@@ -608,7 +623,20 @@ mod tests {
         let mut phase = recording();
         phase.reduce(Event::Stop, base());
         let action = phase.reduce(Event::Finished(Box::new(completion(0))), base());
-        assert!(matches!(action, Some(Action::Delete(_))));
+        assert!(matches!(action, Some(Action::Delete)));
+    }
+
+    #[test]
+    fn set_session_removed_flips_the_finished_take() {
+        let mut phase = recording();
+        phase.reduce(Event::Finished(Box::new(completion(0))), base());
+        assert!(matches!(&phase, Phase::Done(done) if !done.session_removed));
+
+        phase.set_session_removed(true);
+        assert!(matches!(&phase, Phase::Done(done) if done.session_removed));
+
+        phase.set_session_removed(false);
+        assert!(matches!(&phase, Phase::Done(done) if !done.session_removed));
     }
 
     #[test]
@@ -619,6 +647,7 @@ mod tests {
                 output: PathBuf::from("take.ogg"),
                 summary: None,
                 failure: Some(DesktopError::NoSources),
+                transcripts: koe_session_store::Transcripts::new(),
             })),
             base(),
         );
@@ -774,6 +803,7 @@ mod tests {
             failure,
             duration: Duration::from_secs(1),
             warning: None,
+            session_removed: false,
         }
     }
 }

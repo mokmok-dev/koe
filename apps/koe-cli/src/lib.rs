@@ -31,6 +31,7 @@ mod devices;
 mod error;
 mod host;
 mod io;
+mod meeting;
 mod model;
 mod record;
 mod transcribe;
@@ -88,6 +89,7 @@ fn execute(
     match &cli.command {
         Command::Devices => devices::execute(host, io),
         Command::Record(args) => record::execute(args, host, interrupt, io),
+        Command::Meeting(args) => meeting::execute(args, host, interrupt, io),
         Command::Transcribe(args) => transcribe::execute(args, host, io),
     }
 }

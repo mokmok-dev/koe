@@ -8,7 +8,7 @@ A privacy-first recording & transcription app.
 - On-device transcription
 - System audio + microphone capture
 - Global-hotkey dictation: speak, and the text is typed into the focused app
-- Single-file Ogg Opus or WAV recording
+- One session directory per meeting: Ogg Opus or WAV audio with its transcript
 - Simple local storage
 - Featherlight UI
 - Cross platform
@@ -48,13 +48,14 @@ in a settings file and are edited in the window.
 
 ## Command line
 
-The `koe` CLI records the microphone and the system audio into one file and
-transcribes 16-bit PCM WAV files offline. Build it with the backend for the
-host:
+The `koe` CLI records the microphone and the system audio into one file or one
+meeting session, and transcribes 16-bit PCM WAV files offline. Build it with the
+backend for the host:
 
 ```console
 cargo run -p koe-cli --features linux -- devices
 cargo run -p koe-cli --features linux -- record take.ogg --source both --model model.gguf
+cargo run -p koe-cli --features linux -- meeting --root meetings --model model.gguf
 cargo run -p koe-cli --features linux -- transcribe take.wav --model model.gguf --language ja
 ```
 
@@ -70,3 +71,14 @@ path, `--timestamps` to add time ranges, or `--no-transcribe` to record only.
 `transcribe` reads 16-bit PCM WAV and prints committed text, keeping the text
 it received when the engine fails partway. On macOS, omit `--model` to use the
 system speech model.
+
+`meeting` records and transcribes a meeting into a session directory instead of
+a bare file: `<root>/<epoch milliseconds>/` holds the audio as `meeting.ogg`,
+the `session` record that names it and carries the transcripts, and
+`transcript.txt` as one `[start..end] source: text` line per segment. The
+command always writes Ogg Opus; the desktop app uses the same layout with the
+extension its format setting selects. `--root` defaults to
+`$KOE_RECORDINGS_DIR`, then `recordings` in the current directory. It takes the
+same capture and transcription options as `record` except `--transcript` and
+`--timestamps`. A take that records no audio, or a recorder that cannot start,
+leaves no session behind.

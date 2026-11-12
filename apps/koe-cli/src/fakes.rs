@@ -3,7 +3,7 @@
 #![allow(clippy::unwrap_used, clippy::needless_pass_by_value)]
 
 use std::collections::{HashMap, VecDeque};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use koe_capture::{DeviceInfo, Source, StreamSpec};
@@ -75,6 +75,7 @@ impl FakeHost {
     pub fn with_sink(self) -> Self {
         *self.recorder.lock().unwrap() = Some(Ok(FakeSink {
             state: Arc::clone(&self.sink),
+            path: PathBuf::new(),
         }));
         self
     }
@@ -136,11 +137,14 @@ impl Host for FakeHost {
 
     fn create_recorder(
         &self,
-        _path: &Path,
+        path: &Path,
         _spec: RecordingSpec,
     ) -> Result<Box<dyn TrackSink>, AppError> {
         match self.recorder.lock().unwrap().take() {
-            Some(Ok(sink)) => Ok(Box::new(sink)),
+            Some(Ok(mut sink)) => {
+                sink.path = path.to_path_buf();
+                Ok(Box::new(sink))
+            }
             Some(Err(error)) => Err(error),
             None => Err(AppError::usage("no scripted recorder")),
         }
@@ -240,6 +244,9 @@ pub struct SinkState {
     pub fail_end: bool,
     /// Whether finishing fails.
     pub fail_finish: bool,
+    /// Whether finishing writes a placeholder file at the recorder's path,
+    /// even when it reports a failure.
+    pub create_file: bool,
     /// The summary finishing reports.
     pub summary: Summary,
 }
@@ -256,6 +263,7 @@ impl Default for SinkState {
             overflow_write: false,
             fail_end: false,
             fail_finish: false,
+            create_file: false,
             summary: Summary {
                 frames: 0,
                 clipped_samples: 0,
@@ -269,6 +277,8 @@ impl Default for SinkState {
 pub struct FakeSink {
     /// The state shared with the test.
     pub state: Arc<Mutex<SinkState>>,
+    /// The path the recorder was created with.
+    path: PathBuf,
 }
 
 impl FakeSink {
@@ -314,12 +324,18 @@ impl TrackSink for FakeSink {
     }
 
     fn finish(&mut self) -> Result<Summary, AppError> {
-        let mut state = self.state();
-        if state.fail_finish {
+        let (summary, create, failed) = {
+            let mut state = self.state();
+            state.finished = true;
+            (state.summary, state.create_file, state.fail_finish)
+        };
+        if create {
+            let _ = std::fs::write(&self.path, b"audio");
+        }
+        if failed {
             return Err(AppError::usage("finish failed"));
         }
-        state.finished = true;
-        Ok(state.summary)
+        Ok(summary)
     }
 }
 

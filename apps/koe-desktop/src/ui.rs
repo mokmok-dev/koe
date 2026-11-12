@@ -974,6 +974,7 @@ struct DoneView {
     output: String,
     failed: bool,
     empty: bool,
+    session_removed: bool,
     summary: Option<String>,
     headline: Option<String>,
     failure: Option<String>,
@@ -985,6 +986,7 @@ fn done_view(done: &Done) -> DoneView {
         output: done.output.display().to_string(),
         failed: done.failed(),
         empty: done.summary.is_some_and(|summary| summary.frames == 0),
+        session_removed: done.session_removed,
         summary: done.summary.map(|summary| {
             format!(
                 "{} · {} frames",
@@ -1026,7 +1028,11 @@ fn done_card(
                 div()
                     .text_xs()
                     .text_color(theme.muted_foreground)
-                    .child("No audio was written, so the empty file was removed.")
+                    .child(if done.session_removed {
+                        "No audio was written, so the take's session was removed."
+                    } else {
+                        "No audio was written, and the take's session could not be removed."
+                    })
             }))
             .children((!done.empty).then(|| {
                 div()
