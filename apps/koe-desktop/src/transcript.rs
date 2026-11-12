@@ -33,6 +33,14 @@ impl Speaker {
             Self::Them => "Them",
         }
     }
+
+    /// Index of the speaker's slot in [`MeetingTranscript::drafts`].
+    pub(crate) const fn index(self) -> usize {
+        match self {
+            Self::You => 0,
+            Self::Them => 1,
+        }
+    }
 }
 
 /// One finalized utterance.
@@ -50,23 +58,44 @@ pub struct Utterance {
     pub text: SharedString,
 }
 
+/// Text the engine is still revising.
+///
+/// A draft is not part of the retained transcript: the next commit for its
+/// speaker replaces it, and it is never written out.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Draft {
+    /// Who is speaking.
+    pub speaker: Speaker,
+    /// When the draft arrived.
+    pub at: SystemTime,
+    /// `at` as local `HH:MM:SS`, formatted once.
+    pub clock: SharedString,
+    /// Text so far, trimmed.
+    pub text: SharedString,
+}
+
 /// The utterances of a meeting, oldest first.
 ///
 /// Utterances with the same time keep their arrival order.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct MeetingTranscript {
     utterances: Vec<Utterance>,
+    /// At most one draft per speaker, indexed by [`Speaker::index`].
+    drafts: [Option<Draft>; 2],
     next_sequence: u64,
 }
 
 impl MeetingTranscript {
     /// Appends an utterance in time order, dropping one whose text is only
     /// whitespace.
+    ///
+    /// The speaker's draft is cleared: the commit is what the draft became.
     pub fn push(&mut self, speaker: Speaker, at: SystemTime, text: &str) {
         let text = text.trim();
         if text.is_empty() {
             return;
         }
+        self.drafts[speaker.index()] = None;
         let index = self
             .utterances
             .partition_point(|utterance| utterance.at <= at);
@@ -83,6 +112,18 @@ impl MeetingTranscript {
         self.next_sequence += 1;
     }
 
+    /// Sets the speaker's provisional text, or clears it when `text` is only
+    /// whitespace.
+    pub fn draft(&mut self, speaker: Speaker, at: SystemTime, text: &str) {
+        let text = text.trim();
+        self.drafts[speaker.index()] = (!text.is_empty()).then(|| Draft {
+            speaker,
+            at,
+            clock: SharedString::from(clock_time(at)),
+            text: SharedString::from(text),
+        });
+    }
+
     /// Starts a new take's transcript with `text`, or leaves the current
     /// transcript when `text` is only whitespace.
     ///
@@ -90,6 +131,7 @@ impl MeetingTranscript {
     pub fn replace(&mut self, speaker: Speaker, at: SystemTime, text: &str) -> bool {
         let mut candidate = Self {
             utterances: Vec::new(),
+            drafts: [None, None],
             next_sequence: self.next_sequence,
         };
         candidate.push(speaker, at, text);
@@ -106,10 +148,20 @@ impl MeetingTranscript {
         &self.utterances
     }
 
-    /// Whether nothing was retained.
+    /// The provisional text of each speaker that has some, below the thread.
+    pub fn drafts(&self) -> impl Iterator<Item = &Draft> {
+        self.drafts.iter().flatten()
+    }
+
+    /// Drops every provisional draft, keeping the retained transcript.
+    pub fn clear_drafts(&mut self) {
+        self.drafts = [None, None];
+    }
+
+    /// Whether no text is retained and none is in progress.
     #[must_use]
-    pub const fn is_empty(&self) -> bool {
-        self.utterances.is_empty()
+    pub fn is_empty(&self) -> bool {
+        self.utterances.is_empty() && self.drafts.iter().all(Option::is_none)
     }
 
     /// Number of retained utterances.
@@ -197,6 +249,46 @@ mod tests {
         transcript.push(Speaker::You, at(0), "   ");
         assert!(transcript.is_empty());
         assert_eq!(transcript.len(), 0);
+    }
+
+    #[test]
+    fn a_draft_is_text_in_progress_not_a_retained_utterance() {
+        let mut transcript = MeetingTranscript::default();
+        transcript.draft(Speaker::You, at(10), "  hello ");
+        assert_eq!(transcript.len(), 0);
+        assert!(!transcript.is_empty(), "the draft is text to show");
+        let draft = transcript.drafts().next().unwrap();
+        assert_eq!(draft.text, "hello");
+        assert_eq!(draft.speaker, Speaker::You);
+    }
+
+    #[test]
+    fn a_commit_clears_its_speakers_draft_and_keeps_the_other() {
+        let mut transcript = MeetingTranscript::default();
+        transcript.draft(Speaker::You, at(10), "mine");
+        transcript.draft(Speaker::Them, at(11), "theirs");
+        transcript.push(Speaker::You, at(10), "mine final");
+        assert_eq!(transcript.len(), 1);
+        let drafts: Vec<_> = transcript.drafts().collect();
+        assert_eq!(drafts.len(), 1);
+        assert_eq!(drafts[0].speaker, Speaker::Them);
+    }
+
+    #[test]
+    fn an_empty_draft_clears_the_speakers_text() {
+        let mut transcript = MeetingTranscript::default();
+        transcript.draft(Speaker::You, at(10), "hello");
+        transcript.draft(Speaker::You, at(12), "   ");
+        assert_eq!(transcript.drafts().count(), 0);
+        assert!(transcript.is_empty());
+    }
+
+    #[test]
+    fn a_new_take_drops_the_previous_drafts() {
+        let mut transcript = MeetingTranscript::default();
+        transcript.draft(Speaker::Them, at(10), "theirs");
+        transcript.clear_drafts();
+        assert_eq!(transcript.drafts().count(), 0);
     }
 
     #[test]

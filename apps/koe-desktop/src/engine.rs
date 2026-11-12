@@ -114,6 +114,15 @@ pub enum EngineEvent {
         /// Recognized text.
         text: String,
     },
+    /// Text a source's engine is still revising; empty text clears it.
+    Draft {
+        /// Source the draft belongs to.
+        source: Source,
+        /// Time the draft arrived.
+        at: SystemTime,
+        /// Recognized text so far.
+        text: String,
+    },
     /// The file is complete.
     Finished(Box<Completion>),
 }
@@ -571,6 +580,12 @@ fn finish_transcription(transcription: SourceTranscript, sender: &Sender<EngineE
     for segment in transcript.segments().iter().skip(emitted) {
         emit_utterance(sender, source, base, segment.start_ms(), segment.text());
     }
+    // The engine will not revise anything past this point.
+    let _ = sender.send(EngineEvent::Draft {
+        source,
+        at: SystemTime::now(),
+        text: String::new(),
+    });
 }
 
 fn drain(
@@ -583,9 +598,23 @@ fn drain(
     // The session pushes one segment per committed event in the same order, so
     // `emitted` is the prefix `finish_transcription` must skip.
     while let Some(event) = session.poll()? {
-        if let Event::Committed { text, start_ms, .. } = event {
-            *emitted += 1;
-            emit_utterance(sender, source, base, start_ms, &text);
+        match event {
+            Event::Committed { text, start_ms, .. } => {
+                *emitted += 1;
+                emit_utterance(sender, source, base, start_ms, &text);
+            }
+            // A volatile tail covers no span the engine will keep, so it is
+            // stamped when it arrives rather than at a segment offset.
+            Event::Volatile { text, .. } => {
+                let _ = sender.send(EngineEvent::Draft {
+                    source,
+                    at: SystemTime::now(),
+                    text: text.to_string(),
+                });
+            }
+            // `Event` is non-exhaustive; a kind this shell cannot place in a
+            // thread is dropped rather than guessed at.
+            _ => {}
         }
     }
     Ok(())
@@ -779,6 +808,14 @@ mod tests {
         events.try_iter().collect()
     }
 
+    /// The committed utterances, ignoring the empty draft that closes a source.
+    fn transcripts(events: Vec<EngineEvent>) -> Vec<EngineEvent> {
+        events
+            .into_iter()
+            .filter(|event| matches!(event, EngineEvent::Transcript { .. }))
+            .collect()
+    }
+
     #[test]
     fn a_commit_during_the_take_is_reported_once() {
         let script = Arc::new(Script::default());
@@ -795,9 +832,35 @@ mod tests {
         drain_until(&session, &sender, base, &mut emitted, 1).unwrap();
         finish_transcription(source_transcript(session, base, emitted), &sender);
         drop(sender);
-        let events = reported(&events);
+        let events = transcripts(reported(&events));
         assert_eq!(events.len(), 1);
         assert!(matches!(&events[0], EngineEvent::Transcript { text, .. } if text == "hello"));
+    }
+
+    #[test]
+    fn a_volatile_tail_is_reported_as_a_draft() {
+        let script = Arc::new(Script::default());
+        script
+            .events
+            .lock()
+            .unwrap()
+            .push_back(TranscribeEvent::Volatile { text: "hel".into() });
+        let session = live(script);
+        let (sender, events) = mpsc::channel();
+        let base = SystemTime::now();
+        let mut emitted = 0;
+        session.feed(&[0.5; 160]).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let draft = loop {
+            drain(&session, &sender, Source::Microphone, base, &mut emitted).unwrap();
+            if let Ok(event) = events.try_recv() {
+                break event;
+            }
+            assert!(Instant::now() < deadline, "timed out waiting for the draft");
+            thread::sleep(Duration::from_millis(1));
+        };
+        assert!(matches!(&draft, EngineEvent::Draft { text, .. } if text == "hel"));
+        assert_eq!(emitted, 0, "a draft is not a commit");
     }
 
     #[test]
@@ -817,7 +880,7 @@ mod tests {
         assert_eq!(emitted, 0);
         finish_transcription(source_transcript(session, base, emitted), &sender);
         drop(sender);
-        let events = reported(&events);
+        let events = transcripts(reported(&events));
         assert_eq!(events.len(), 1);
         assert!(matches!(&events[0], EngineEvent::Transcript { text, .. } if text == "late"));
     }
@@ -858,7 +921,7 @@ mod tests {
         ];
         assert_eq!(no_transcript_notice(&exits), None);
         drop(sender);
-        let events = reported(&events);
+        let events = transcripts(reported(&events));
         assert_eq!(events.len(), 1);
         assert!(matches!(&events[0], EngineEvent::Transcript { text, .. } if text == "kept"));
     }
@@ -892,7 +955,7 @@ mod tests {
         drain_until(&session, &sender, base, &mut emitted, 1).unwrap();
         finish_transcription(source_transcript(session, base, emitted), &sender);
         drop(sender);
-        let events = reported(&events);
+        let events = transcripts(reported(&events));
         assert_eq!(events.len(), 1);
         let EngineEvent::Transcript { at, text, .. } = &events[0] else {
             unreachable!("the drain only reports transcript events");

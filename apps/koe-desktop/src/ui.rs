@@ -3,8 +3,10 @@
 use std::time::Instant;
 
 use gpui::{
-    AnyElement, App, AppContext as _, Axis, Context, Entity, FontWeight, IntoElement,
-    ParentElement, Render, Role, SharedString, Styled as _, Subscription, Window, div, px, rgb,
+    AnyElement, App, AppContext as _, Axis, Context, ElementId, Entity, FontWeight,
+    InteractiveElement as _, IntoElement, ParentElement, Render, Role, ScrollHandle, SharedString,
+    StatefulInteractiveElement as _, Styled as _, Subscription, Window, div,
+    prelude::FluentBuilder as _, px, rgb,
 };
 use gpui_kit::component::{
     ActiveTheme as _, Disableable as _, Icon, IconName, IndexPath, Sizable as _, TitleBar,
@@ -15,7 +17,6 @@ use gpui_kit::component::{
     h_flex,
     input::{Input, InputEvent, InputState},
     message::{Message, MessageAlignment, MessageContent, MessageHeader},
-    message_scroller::{MessageScroller, MessageScrollerState},
     progress::Progress,
     scroll::ScrollableElement as _,
     searchable_list::SearchableVec,
@@ -64,11 +65,10 @@ pub struct MainView {
     hotkey_input: Entity<InputState>,
     model_input: Entity<InputState>,
     language_select: Entity<SelectState<LanguageItems>>,
-    /// The meeting thread's virtual-list bookkeeping.
-    messages: Entity<MessageScrollerState>,
-    /// Row count and first sequence the thread was last reconciled against.
-    thread_rows: usize,
-    thread_first: Option<u64>,
+    /// The meeting thread's scroll position.
+    thread_scroll: ScrollHandle,
+    /// Utterance count, draft count, and draft text length last scrolled for.
+    thread_signature: (usize, usize, usize),
     _subscriptions: Vec<Subscription>,
 }
 
@@ -77,7 +77,6 @@ impl MainView {
     pub fn new(shell: Entity<Shell>, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let (hotkey_input, model_input, language_select) =
             Self::settings_fields(&shell, window, cx);
-
 
         let mut subscriptions = Vec::new();
         subscriptions.push(cx.subscribe(&hotkey_input, {
@@ -122,50 +121,15 @@ impl MainView {
             }
         }));
 
-        let (thread_rows, thread_first) = {
-            let shell = shell.read(cx);
-            (
-                shell.transcript.len(),
-                shell
-                    .transcript
-                    .utterances()
-                    .first()
-                    .map(|utterance| utterance.sequence),
-            )
-        };
-        let messages = cx.new(|cx| MessageScrollerState::new(thread_rows, cx));
-
-        subscriptions.push(cx.observe(&shell, {
-            let messages = messages.clone();
-            move |view, shell, cx| {
-                let (rows, first) = {
-                    let shell = shell.read(cx);
-                    (
-                        shell.transcript.len(),
-                        shell
-                            .transcript
-                            .utterances()
-                            .first()
-                            .map(|utterance| utterance.sequence),
-                    )
-                };
-                view.sync_thread(&messages, rows, first, cx);
-                cx.notify();
-            }
-        }));
-        // The scroller raises its own jump-to-latest visibility from a
-        // notification on this state, which only reaches the window through
-        // this subscription.
-        subscriptions.push(cx.observe(&messages, |_, _, cx| cx.notify()));
+        cx.observe(&shell, |_, _, cx| cx.notify()).detach();
 
         Self {
             shell,
             hotkey_input,
             model_input,
             language_select,
-            messages,
-            thread_rows,
-            thread_first,
+            thread_scroll: ScrollHandle::default(),
+            thread_signature: (0, 0, 0),
             _subscriptions: subscriptions,
         }
     }
@@ -218,26 +182,6 @@ impl MainView {
         });
 
         (hotkey_input, model_input, language_select)
-    }
-
-    /// Rebuilds the meeting thread when the transcript changes.
-    ///
-    /// A batch model can insert an earlier utterance in the middle of the
-    /// list, which shifts every row after it, so the thread is reset rather
-    /// than appended to.
-    fn sync_thread(
-        &mut self,
-        messages: &Entity<MessageScrollerState>,
-        rows: usize,
-        first: Option<u64>,
-        cx: &mut Context<Self>,
-    ) {
-        if rows == self.thread_rows && first == self.thread_first {
-            return;
-        }
-        self.thread_rows = rows;
-        self.thread_first = first;
-        messages.update(cx, |state, cx| state.reset(rows, cx));
     }
 }
 
@@ -332,7 +276,7 @@ impl MainView {
     }
 
     /// The take controls over the meeting transcript, read as a message thread.
-    fn meeting_screen(&self, shell: &Shell, cx: &Context<Self>) -> AnyElement {
+    fn meeting_screen(&mut self, shell: &Shell, cx: &Context<Self>) -> AnyElement {
         v_flex()
             .flex_1()
             .min_w(px(0.0))
@@ -344,7 +288,7 @@ impl MainView {
     }
 
     /// The retained transcript, or the empty state that says what will fill it.
-    fn transcript_panel(&self, shell: &Shell, cx: &Context<Self>) -> AnyElement {
+    fn transcript_panel(&mut self, shell: &Shell, cx: &Context<Self>) -> AnyElement {
         let theme = cx.theme();
         let count = shell.transcript.len();
         let count_label = format!("{count} utterance{}", if count == 1 { "" } else { "s" });
@@ -353,6 +297,7 @@ impl MainView {
         } else {
             "Transcript"
         };
+        self.follow_latest(shell);
 
         let thread = if shell.transcript.is_empty() {
             v_flex()
@@ -371,7 +316,7 @@ impl MainView {
                 ))
                 .into_any_element()
         } else {
-            self.message_thread()
+            self.message_thread(shell)
         };
 
         v_flex()
@@ -410,40 +355,62 @@ impl MainView {
             .into_any_element()
     }
 
-    /// The retained utterances as chat rows, newest at the bottom.
-    fn message_thread(&self) -> AnyElement {
-        let shell = self.shell.clone();
-        MessageScroller::new(
-            "meeting-thread",
-            self.messages.clone(),
-            move |index, _window, cx| {
-                let shell = shell.read(cx);
-                let Some(utterance) = shell.transcript.utterances().get(index) else {
-                    return div().into_any_element();
-                };
-                Message::new()
-                    .id(("utterance", utterance.sequence))
-                    .role(Role::ListItem)
-                    .alignment(utterance_alignment(utterance.speaker))
-                    .header(
-                        MessageHeader::new()
-                            .child(utterance.speaker.label())
-                            .child("·")
-                            .child(utterance.clock.clone()),
-                    )
-                    .content(
-                        MessageContent::new().bubble(
-                            Bubble::new()
-                                .with_variant(bubble_variant(utterance.speaker))
-                                .child(utterance.text.clone()),
-                        ),
-                    )
-                    .into_any_element()
-            },
-        )
-        .scrollbar(true)
-        .jump_button(true)
-        .into_any_element()
+    /// Keeps the newest row in view as the take writes more.
+    fn follow_latest(&mut self, shell: &Shell) {
+        let drafts = shell.transcript.drafts().count();
+        let signature = (
+            shell.transcript.len(),
+            drafts,
+            shell
+                .transcript
+                .drafts()
+                .map(|draft| draft.text.len())
+                .sum::<usize>(),
+        );
+        if signature == self.thread_signature {
+            return;
+        }
+        self.thread_signature = signature;
+        let rows = shell.transcript.len() + drafts;
+        if rows > 0 {
+            self.thread_scroll.scroll_to_item(rows - 1);
+        }
+    }
+
+    /// The retained utterances and the drafts under them, newest at the bottom.
+    fn message_thread(&self, shell: &Shell) -> AnyElement {
+        let drafts = shell.transcript.drafts();
+        v_flex()
+            .id("meeting-thread")
+            .size_full()
+            .min_h(px(0.0))
+            .gap(px(12.0))
+            .p(px(14.0))
+            .overflow_y_scroll()
+            .track_scroll(&self.thread_scroll)
+            .children(shell.transcript.utterances().iter().map(|utterance| {
+                message_row(
+                    ("utterance", utterance.sequence),
+                    utterance.speaker,
+                    &utterance.clock,
+                    &utterance.text,
+                    bubble_variant(utterance.speaker),
+                    false,
+                )
+            }))
+            .children(drafts.map(|draft| {
+                message_row(
+                    ("draft", draft.speaker.index() as u64),
+                    draft.speaker,
+                    &draft.clock,
+                    &draft.text,
+                    BubbleVariant::Muted,
+                    true,
+                )
+            }))
+            // Last, so the row indices the scroll handle targets stay 0..rows.
+            .vertical_scrollbar(&self.thread_scroll)
+            .into_any_element()
     }
 
     /// The settings pages.
@@ -950,6 +917,39 @@ fn meter(name: &str, source: Source, levels: [f32; 2], live: Sources) -> impl In
                 .with_size(px(6.0))
                 .flex_1(),
         )
+}
+
+/// One transcript row: a finalized utterance or a draft the engine is revising.
+fn message_row(
+    id: impl Into<ElementId>,
+    speaker: Speaker,
+    clock: &SharedString,
+    text: &SharedString,
+    variant: BubbleVariant,
+    interim: bool,
+) -> AnyElement {
+    Message::new()
+        .id(id)
+        .role(Role::ListItem)
+        .alignment(utterance_alignment(speaker))
+        .header(
+            MessageHeader::new()
+                .child(speaker.label())
+                .child("·")
+                .child(clock.clone())
+                .children(interim.then(|| div().text_xs().italic().child("interim"))),
+        )
+        .content(
+            MessageContent::new().bubble(
+                Bubble::new().with_variant(variant).child(
+                    div()
+                        .when(interim, gpui::Styled::italic)
+                        .child(text.clone()),
+                ),
+            ),
+        )
+        .when(interim, |row| row.opacity(0.65))
+        .into_any_element()
 }
 
 /// Your own words sit at the trailing edge, the way a sent message does; the

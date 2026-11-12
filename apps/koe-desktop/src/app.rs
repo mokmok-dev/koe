@@ -297,6 +297,9 @@ impl Shell {
                         self.transcript.push(Speaker::of(source), at, &text);
                     }
                 }
+                EngineEvent::Draft { source, at, text } => {
+                    self.transcript.draft(Speaker::of(source), at, &text);
+                }
                 EngineEvent::Opened(source) => self.apply(Event::Opened(source)),
                 EngineEvent::Lost { source, message } => {
                     self.apply(Event::Lost { source, message });
@@ -390,6 +393,7 @@ impl Shell {
             // Until this take retains an utterance, the rows on screen belong
             // to an earlier take.
             self.transcript_pending = true;
+            self.transcript.clear_drafts();
             self.run(action);
         }
         cx.notify();
