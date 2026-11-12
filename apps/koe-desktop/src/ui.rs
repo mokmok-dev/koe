@@ -316,9 +316,7 @@ impl MainView {
             )
             .w(px(240.0)),
         )
-        .description(
-            "The speech model must support the chosen language; the backend rejects the rest.",
-        )
+        .description("The speech model must support the chosen language.")
         .keywords(["language", "locale", "speech"]);
 
         let source_item = |source: Source, title: &'static str| {
@@ -590,6 +588,10 @@ impl Render for MainView {
                 h_flex()
                     .flex_1()
                     .min_h(px(0.0))
+                    // `h_flex` centres its children; without the stretch the
+                    // settings page's scroll region collapses to its header
+                    // and the groups never paint.
+                    .items_stretch()
                     .child(sidebar)
                     .child(content),
             )
