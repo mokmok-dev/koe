@@ -114,6 +114,17 @@ pub const CHOICES: &[(&str, &str)] = &[
     ("yo", "Yoruba"),
 ];
 
+/// The tag to persist for the row `name`, or `None` when no row carries it.
+///
+/// A pick reaches the settings file only through here, so no tag outside the
+/// table can be written.
+#[must_use]
+pub fn tag_of(name: &str) -> Option<&'static str> {
+    CHOICES
+        .iter()
+        .find_map(|(tag, entry)| (*entry == name).then_some(*tag))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -137,5 +148,13 @@ mod tests {
                 assert_ne!(name, other_name);
             }
         }
+    }
+
+    #[test]
+    fn every_row_name_maps_to_its_tag() {
+        for (tag, name) in CHOICES {
+            assert_eq!(tag_of(name), Some(*tag));
+        }
+        assert_eq!(tag_of("Klingon"), None);
     }
 }

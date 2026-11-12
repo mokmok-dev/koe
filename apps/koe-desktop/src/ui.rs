@@ -7,7 +7,7 @@ use gpui::{
     ParentElement, Render, SharedString, Styled as _, Subscription, Window, div, px, rgb,
 };
 use gpui_kit::component::{
-    ActiveTheme as _, Disableable as _, Icon, IconName, Sizable as _, TitleBar,
+    ActiveTheme as _, Disableable as _, Icon, IconName, IndexPath, Sizable as _, TitleBar,
     alert::Alert,
     button::{Button, ButtonVariants as _},
     group_box::{GroupBox, GroupBoxVariant, GroupBoxVariants as _},
@@ -15,6 +15,8 @@ use gpui_kit::component::{
     input::{Input, InputEvent, InputState},
     progress::Progress,
     scroll::ScrollableElement as _,
+    searchable_list::SearchableVec,
+    select::{Select, SelectEvent, SelectState},
     setting::{SettingField, SettingGroup, SettingItem, SettingPage, Settings},
     sidebar::{Sidebar, SidebarHeader, SidebarMenuItem, SidebarToggleButton},
     status_bar::StatusBar,
@@ -37,6 +39,10 @@ const RED: u32 = 0x00FF_5A5F;
 const AMBER: u32 = 0x00F0_B429;
 const BLUE: u32 = 0x0058_A6FF;
 
+/// The language picker's rows: the display names, mapped back to the tags the
+/// settings file stores by [`language::tag_of`].
+type LanguageItems = SearchableVec<SharedString>;
+
 /// Builds a click handler that applies a shell mutation. It is `Clone` so that
 /// setting renderers, which run as `Fn`, can copy it before a control takes one.
 fn click(
@@ -53,21 +59,24 @@ pub struct MainView {
     shell: Entity<Shell>,
     hotkey_input: Entity<InputState>,
     model_input: Entity<InputState>,
+    language_select: Entity<SelectState<LanguageItems>>,
     _subscriptions: Vec<Subscription>,
 }
 
 impl MainView {
     /// Builds the view, seeds the settings fields, and re-renders on change.
     pub fn new(shell: Entity<Shell>, window: &mut Window, cx: &mut Context<Self>) -> Self {
-        let (hotkey_value, model_value) = {
+        let (hotkey_value, model_value, language_row) = {
             let shell = shell.read(cx);
             let settings = &shell.dictation_control.settings;
+            let saved = settings.language.as_deref().unwrap_or_default();
             (
                 hotkey::display(&settings.hotkey),
                 settings
                     .model
                     .as_ref()
                     .map_or_else(String::new, |model| model.display().to_string()),
+                language::CHOICES.iter().position(|(tag, _)| *tag == saved),
             )
         };
 
@@ -80,6 +89,19 @@ impl MainView {
             InputState::new(window, cx)
                 .placeholder("/path/to/model.gguf")
                 .default_value(model_value)
+        });
+
+        let language_items: Vec<SharedString> = language::CHOICES
+            .iter()
+            .map(|(_, name)| SharedString::from(*name))
+            .collect();
+        let language_select = cx.new(|cx| {
+            SelectState::new(LanguageItems::new(language_items), None, window, cx).searchable(true)
+        });
+        // Unlike the constructor, `set_selected_index` records the scroll that
+        // brings the stored language into view on the first open.
+        language_select.update(cx, |state, cx| {
+            state.set_selected_index(language_row.map(IndexPath::new), window, cx);
         });
 
         let mut subscriptions = Vec::new();
@@ -108,12 +130,29 @@ impl MainView {
                 }
             }
         }));
+        subscriptions.push(cx.subscribe(&language_select, {
+            let shell = shell.clone();
+            move |_, _, event: &SelectEvent<LanguageItems>, cx| {
+                let SelectEvent::Confirm(Some(name)) = event else {
+                    return;
+                };
+                let Some(tag) = language::tag_of(name) else {
+                    return;
+                };
+                let model = shell.read(cx).dictation_control.settings.model.clone();
+                let language = settings::value_or_none(tag).map(str::to_owned);
+                shell.update(cx, |shell, cx| {
+                    shell.apply_dictation_settings(model, language, cx);
+                });
+            }
+        }));
 
         cx.observe(&shell, |_, _, cx| cx.notify()).detach();
         Self {
             shell,
             hotkey_input,
             model_input,
+            language_select,
             _subscriptions: subscriptions,
         }
     }
@@ -294,26 +333,26 @@ impl MainView {
 
         let language_item = SettingItem::new(
             "Language",
-            SettingField::scrollable_dropdown(
-                language::CHOICES
+            SettingField::render({
+                let select = self.language_select.clone();
+                let saved = shell
+                    .dictation_control
+                    .settings
+                    .language
+                    .clone()
+                    .unwrap_or_default();
+                let label = language::CHOICES
                     .iter()
-                    .map(|(tag, name)| (SharedString::from(*tag), SharedString::from(*name)))
-                    .collect(),
-                {
-                    let saved = shell.dictation_control.settings.language.clone();
-                    move |_: &App| saved.as_deref().unwrap_or_default().into()
-                },
-                {
-                    let shell = entity.clone();
-                    move |picked: SharedString, cx: &mut App| {
-                        let model = shell.read(cx).dictation_control.settings.model.clone();
-                        let language = settings::value_or_none(&picked).map(str::to_owned);
-                        shell.update(cx, |shell, cx| {
-                            shell.apply_dictation_settings(model, language, cx);
-                        });
-                    }
-                },
-            ),
+                    .find(|(tag, _)| *tag == saved.as_str())
+                    .map_or_else(|| saved.clone(), |(_, name)| (*name).to_owned());
+                move |options, _, _| {
+                    Select::new(&select)
+                        .placeholder(label.clone())
+                        .search_placeholder("Search languages…")
+                        .accessibility_label("Language")
+                        .disabled(options.is_disabled())
+                }
+            }),
         )
         .description("The speech model must support the chosen language.")
         .layout(Axis::Vertical)
