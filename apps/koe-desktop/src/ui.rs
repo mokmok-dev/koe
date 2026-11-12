@@ -3,8 +3,8 @@
 use std::time::Instant;
 
 use gpui::{
-    AnyElement, App, AppContext as _, Context, Entity, FontWeight, IntoElement, ParentElement,
-    Render, Styled as _, Subscription, Window, div, px, rgb,
+    AnyElement, App, AppContext as _, Axis, Context, Entity, FontWeight, IntoElement,
+    ParentElement, Render, SharedString, Styled as _, Subscription, Window, div, px, rgb,
 };
 use gpui_kit::component::{
     ActiveTheme as _, Disableable as _, Icon, IconName, Sizable as _, TitleBar,
@@ -27,6 +27,7 @@ use crate::app::{Screen, Shell};
 use crate::dictation::Dictation;
 use crate::hotkey;
 use crate::hud;
+use crate::language;
 use crate::settings;
 use crate::state::{Done, Phase, Sources};
 
@@ -52,14 +53,13 @@ pub struct MainView {
     shell: Entity<Shell>,
     hotkey_input: Entity<InputState>,
     model_input: Entity<InputState>,
-    language_input: Entity<InputState>,
     _subscriptions: Vec<Subscription>,
 }
 
 impl MainView {
     /// Builds the view, seeds the settings fields, and re-renders on change.
     pub fn new(shell: Entity<Shell>, window: &mut Window, cx: &mut Context<Self>) -> Self {
-        let (hotkey_value, model_value, language_value) = {
+        let (hotkey_value, model_value) = {
             let shell = shell.read(cx);
             let settings = &shell.dictation_control.settings;
             (
@@ -68,7 +68,6 @@ impl MainView {
                     .model
                     .as_ref()
                     .map_or_else(String::new, |model| model.display().to_string()),
-                settings.language.clone().unwrap_or_default(),
             )
         };
 
@@ -81,11 +80,6 @@ impl MainView {
             InputState::new(window, cx)
                 .placeholder("/path/to/model.gguf")
                 .default_value(model_value)
-        });
-        let language_input = cx.new(|cx| {
-            InputState::new(window, cx)
-                .placeholder("ja")
-                .default_value(language_value)
         });
 
         let mut subscriptions = Vec::new();
@@ -103,29 +97,11 @@ impl MainView {
         subscriptions.push(cx.subscribe(&model_input, {
             let shell = shell.clone();
             let model_input = model_input.clone();
-            let language_input = language_input.clone();
             move |_, _, event: &InputEvent, cx| {
                 if matches!(event, InputEvent::Change) {
                     let model = settings::value_or_none(&model_input.read(cx).value())
                         .map(std::path::PathBuf::from);
-                    let language = settings::value_or_none(&language_input.read(cx).value())
-                        .map(str::to_owned);
-                    shell.update(cx, |shell, cx| {
-                        shell.apply_dictation_settings(model, language, cx);
-                    });
-                }
-            }
-        }));
-        subscriptions.push(cx.subscribe(&language_input, {
-            let shell = shell.clone();
-            let model_input = model_input.clone();
-            let language_input = language_input.clone();
-            move |_, _, event: &InputEvent, cx| {
-                if matches!(event, InputEvent::Change) {
-                    let model = settings::value_or_none(&model_input.read(cx).value())
-                        .map(std::path::PathBuf::from);
-                    let language = settings::value_or_none(&language_input.read(cx).value())
-                        .map(str::to_owned);
+                    let language = shell.read(cx).dictation_control.settings.language.clone();
                     shell.update(cx, |shell, cx| {
                         shell.apply_dictation_settings(model, language, cx);
                     });
@@ -138,7 +114,6 @@ impl MainView {
             shell,
             hotkey_input,
             model_input,
-            language_input,
             _subscriptions: subscriptions,
         }
     }
@@ -319,11 +294,30 @@ impl MainView {
 
         let language_item = SettingItem::new(
             "Language",
-            SettingField::render({
-                let input = self.language_input.clone();
-                move |_, _, _| Input::new(&input).aria_label("Language").w(px(240.0))
-            }),
-        );
+            SettingField::scrollable_dropdown(
+                language::CHOICES
+                    .iter()
+                    .map(|(tag, name)| (SharedString::from(*tag), SharedString::from(*name)))
+                    .collect(),
+                {
+                    let saved = shell.dictation_control.settings.language.clone();
+                    move |_: &App| saved.as_deref().unwrap_or_default().into()
+                },
+                {
+                    let shell = entity.clone();
+                    move |picked: SharedString, cx: &mut App| {
+                        let model = shell.read(cx).dictation_control.settings.model.clone();
+                        let language = settings::value_or_none(&picked).map(str::to_owned);
+                        shell.update(cx, |shell, cx| {
+                            shell.apply_dictation_settings(model, language, cx);
+                        });
+                    }
+                },
+            ),
+        )
+        .description("The speech model must support the chosen language.")
+        .layout(Axis::Vertical)
+        .keywords(["language", "locale", "speech"]);
 
         let source_item = |source: Source, title: &'static str| {
             SettingItem::new(
@@ -594,6 +588,10 @@ impl Render for MainView {
                 h_flex()
                     .flex_1()
                     .min_h(px(0.0))
+                    // `h_flex` centres its children; without the stretch the
+                    // settings page's scroll region collapses to its header
+                    // and the groups never paint.
+                    .items_stretch()
                     .child(sidebar)
                     .child(content),
             )
