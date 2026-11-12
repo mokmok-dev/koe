@@ -357,6 +357,75 @@ mod tests {
         assert!(!out.contains("recorded 0 frames"));
     }
 
+    #[test]
+    fn a_record_that_cannot_be_written_fails_the_command() {
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        let mut io = Io {
+            out: &mut out,
+            err: &mut err,
+        };
+        let saved = save_result(
+            Err(StoreError::Io {
+                operation: "write",
+                kind: std::io::ErrorKind::PermissionDenied,
+            }),
+            &mut io,
+        );
+        assert!(matches!(saved, Err(AppError::Store(_))));
+        assert!(out.is_empty());
+        assert!(err.is_empty());
+    }
+
+    #[test]
+    fn missing_transcript_text_warns_without_failing_the_command() {
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        let mut io = Io {
+            out: &mut out,
+            err: &mut err,
+        };
+        let saved = save_result(
+            Err(StoreError::TextNotWritten {
+                source: Box::new(StoreError::Io {
+                    operation: "write",
+                    kind: std::io::ErrorKind::PermissionDenied,
+                }),
+            }),
+            &mut io,
+        );
+        assert!(saved.is_ok());
+        assert!(out.is_empty());
+        assert_eq!(
+            String::from_utf8(err).unwrap(),
+            "warning: the transcript text file was not written: session store `write` failed: \
+             permission denied\n"
+        );
+    }
+
+    #[test]
+    fn a_save_failure_for_a_failed_take_warns() {
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        let mut io = Io {
+            out: &mut out,
+            err: &mut err,
+        };
+        warn_save(
+            Err(StoreError::Io {
+                operation: "write",
+                kind: std::io::ErrorKind::PermissionDenied,
+            }),
+            &mut io,
+        );
+        assert!(out.is_empty());
+        assert_eq!(
+            String::from_utf8(err).unwrap(),
+            "warning: the transcript was not saved: meeting session: session store `write` failed: \
+             permission denied\n"
+        );
+    }
+
     #[cfg(unix)]
     #[test]
     fn a_session_that_cannot_be_removed_is_reported() {
