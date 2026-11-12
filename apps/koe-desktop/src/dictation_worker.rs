@@ -211,7 +211,8 @@ fn capture(
     let options = plan
         .language
         .clone()
-        .map_or_else(Options::new, |language| Options::new().language(language));
+        .map_or_else(Options::new, |language| Options::new().language(language))
+        .live();
     let (sender, ready) = mpsc::channel::<Result<LiveSession, DesktopError>>();
     let model = plan.model.clone();
     let loader_stop = Arc::clone(stop);
