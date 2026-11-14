@@ -89,6 +89,7 @@ struct AudioComponentDescription {
     flags_mask: u32,
 }
 #[repr(C)]
+#[derive(Clone, Copy)]
 struct AudioStreamBasicDescription {
     sample_rate: f64,
     format_id: u32,
@@ -507,15 +508,27 @@ struct Shared {
     /// Last non-zero `AudioUnitRender` status, reported to the reader.
     last_error: AtomicI32,
     channels: usize,
+    /// The `AudioObject` the unit renders.
+    object: u32,
+    /// The rate the unit's client format carries, as [`rate_bits`].
+    rate: AtomicI32,
 }
 impl Shared {
-    fn new(channels: usize, unit: *mut c_void) -> Self {
+    fn new(
+        channels: usize,
+        unit: *mut c_void,
+        object: u32,
+        device_rate: u32,
+        spec_rate: u32,
+    ) -> Self {
         Self {
-            sink: Mutex::new(Sink::new(channels, QUEUE_FRAMES)),
+            sink: Mutex::new(Sink::new(channels, QUEUE_FRAMES, device_rate, spec_rate)),
             scratch: Mutex::new(vec![0.0; channels * CALLBACK_FRAMES]),
             unit: AtomicPtr::new(unit),
             last_error: AtomicI32::new(0),
             channels,
+            object,
+            rate: AtomicI32::new(rate_bits(device_rate)),
         }
     }
 }
@@ -535,6 +548,60 @@ impl Poll for Shared {
     fn rest(&self) {
         thread::sleep(RETRY);
     }
+
+    /// Matches the unit to the rate its device reports now.
+    ///
+    /// The HAL renders only while the unit's client format carries the device's
+    /// own rate. A device that changes rate under a running stream either keeps
+    /// rendering at the new rate with no error, which skews the frame clock, or
+    /// answers `kAudioUnitErr_CannotDoInCurrentContext` (-10863) and delivers
+    /// nothing. Both are fixed by rebuilding the unit at the rate the device
+    /// reports, so an unchanged rate costs one property read.
+    ///
+    /// `AudioOutputUnitStop` waits for an in-flight render, so this must run
+    /// without holding the sink or the scratch buffer; the callback takes both.
+    fn reconcile(&self) -> bool {
+        let unit = self.unit.load(Ordering::Acquire);
+        if unit.is_null() {
+            return false;
+        }
+        let Ok(rate) = device_rate(self.object) else {
+            return false;
+        };
+        if rate == bits_rate(self.rate.load(Ordering::Acquire)) && self.last_error() == 0 {
+            return true;
+        }
+        unsafe {
+            AudioOutputUnitStop(unit);
+            if AudioUnitUninitialize(unit) != 0 {
+                return false;
+            }
+        }
+        let format = format_at(self.channels, rate);
+        if configure_input(unit, self.object, &format, from_ref(self).cast_mut().cast()).is_err() {
+            return false;
+        }
+        // Convert the frames captured at the old rate and switch the sink
+        // before the unit starts, so no frame at the new rate is ever measured
+        // against the old one.
+        lock(&self.sink).set_device_rate(rate);
+        let started = unsafe { AudioUnitInitialize(unit) == 0 && AudioOutputUnitStart(unit) == 0 };
+        if started {
+            self.rate.store(rate_bits(rate), Ordering::Release);
+            self.last_error.store(0, Ordering::Release);
+        }
+        started
+    }
+}
+
+/// Rate stored in the shared word.
+fn rate_bits(rate: u32) -> i32 {
+    i32::try_from(rate).unwrap_or(i32::MAX)
+}
+
+/// Rate a shared word holds.
+fn bits_rate(bits: i32) -> u32 {
+    u32::try_from(bits).unwrap_or_default()
 }
 
 extern "C" fn render_callback(
@@ -615,16 +682,24 @@ impl Unit {
             Err(backend("AudioComponentInstanceNew", status))
         }
     }
-    fn set<T>(&self, property: u32, scope: u32, element: u32, data: &T) -> Result<(), Error> {
-        let size = u32::try_from(size_of::<T>())
-            .map_err(|_| backend("AudioUnitSetProperty", PARAMETER_ERROR))?;
-        let data = from_ref(data).cast();
-        let status = unsafe { AudioUnitSetProperty(self.0, property, scope, element, data, size) };
-        if status == 0 {
-            Ok(())
-        } else {
-            Err(backend("AudioUnitSetProperty", status))
-        }
+}
+/// Sets one unit property. Free of the owning [`Unit`], so a reader thread can
+/// rebuild a unit it does not own.
+fn set_property<T>(
+    unit: *mut c_void,
+    property: u32,
+    scope: u32,
+    element: u32,
+    data: &T,
+) -> Result<(), Error> {
+    let size = u32::try_from(size_of::<T>())
+        .map_err(|_| backend("AudioUnitSetProperty", PARAMETER_ERROR))?;
+    let data = from_ref(data).cast();
+    let status = unsafe { AudioUnitSetProperty(unit, property, scope, element, data, size) };
+    if status == 0 {
+        Ok(())
+    } else {
+        Err(backend("AudioUnitSetProperty", status))
     }
 }
 impl Drop for Unit {
@@ -649,6 +724,92 @@ impl RawStream for AudioStream {
     fn read(&mut self, out: &mut [f32]) -> Result<usize, Error> {
         pipeline::read_until(self.shared.as_ref(), self.shared.channels, out)
     }
+}
+
+/// The stream format the HAL accepts for `channels` interleaved `f32` frames at
+/// `rate`.
+fn format_at(channels: usize, rate: u32) -> AudioStreamBasicDescription {
+    let width = u32::try_from(channels).unwrap_or(1);
+    AudioStreamBasicDescription {
+        sample_rate: f64::from(rate),
+        format_id: FORMAT_LINEAR_PCM,
+        format_flags: FORMAT_FLAG_FLOAT | FORMAT_FLAG_PACKED | NATIVE_ENDIAN_FLAG,
+        bytes_per_packet: SAMPLE_BYTES * width,
+        frames_per_packet: 1,
+        bytes_per_frame: SAMPLE_BYTES * width,
+        channels_per_frame: width,
+        bits_per_channel: 8 * SAMPLE_BYTES,
+        reserved: 0,
+    }
+}
+
+/// The rate an `AudioObject` reports now.
+///
+/// The HAL renders only while the unit's client format carries the device's own
+/// rate, so callers ask the device instead of keeping the rate enumeration
+/// reported earlier.
+fn device_rate(object: u32) -> Result<u32, Error> {
+    let rate: f64 = value(object, &main(NOMINAL_SAMPLE_RATE, SCOPE_GLOBAL))?;
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    let rate = if rate >= 1.0 && rate <= f64::from(u32::MAX) {
+        rate as u32
+    } else {
+        return Err(backend("AudioObjectGetPropertyData", PARAMETER_ERROR));
+    };
+    Ok(rate)
+}
+
+/// Wires an uninitialized HAL unit to `object` in input mode and installs the
+/// render callback whose context is `reference`. Runs both when a stream opens
+/// and when the reader rebuilds the unit after its device changed format.
+fn configure_input(
+    unit: *mut c_void,
+    object: u32,
+    format: &AudioStreamBasicDescription,
+    reference: *mut c_void,
+) -> Result<(), Error> {
+    set_property(unit, UNIT_ENABLE_IO, UNIT_SCOPE_INPUT, INPUT_ELEMENT, &1u32)?;
+    set_property(
+        unit,
+        UNIT_ENABLE_IO,
+        UNIT_SCOPE_OUTPUT,
+        OUTPUT_ELEMENT,
+        &0u32,
+    )?;
+    set_property(
+        unit,
+        UNIT_CURRENT_DEVICE,
+        UNIT_SCOPE_GLOBAL,
+        ELEMENT_MAIN,
+        &object,
+    )?;
+    // The client side of the input element is its output scope: the device
+    // feeds the unit, which hands converted samples to the callback.
+    set_property(
+        unit,
+        UNIT_STREAM_FORMAT,
+        UNIT_SCOPE_OUTPUT,
+        INPUT_ELEMENT,
+        format,
+    )?;
+    let callback = RenderCallback {
+        input_proc: Some(render_callback),
+        reference,
+    };
+    set_property(
+        unit,
+        UNIT_INPUT_CALLBACK,
+        UNIT_SCOPE_GLOBAL,
+        ELEMENT_MAIN,
+        &callback,
+    )?;
+    set_property(
+        unit,
+        UNIT_MAX_FRAMES_PER_SLICE,
+        UNIT_SCOPE_GLOBAL,
+        ELEMENT_MAIN,
+        &u32::try_from(CALLBACK_FRAMES).unwrap_or(u32::MAX),
+    )
 }
 
 /// Lists the microphones and output devices `CoreAudio` reports.
@@ -676,7 +837,6 @@ pub fn devices() -> Result<Vec<DeviceInfo>, Error> {
 pub fn open(device: &DeviceInfo, spec: StreamSpec) -> Result<Box<dyn RawStream>, Error> {
     check_spec(device.source(), spec)?;
     let channels = usize::from(spec.channels());
-    let width = u32::try_from(channels).unwrap_or(1);
     let (object, aggregate, tap) = match resolve(device, &catalog()?)? {
         Target::Input(object) => (object, None, None),
         Target::Output => {
@@ -692,49 +852,22 @@ pub fn open(device: &DeviceInfo, spec: StreamSpec) -> Result<Box<dyn RawStream>,
         }
     };
     let unit = Unit::new_hal()?;
-    let shared = Arc::new(Shared::new(channels, unit.0));
-    unit.set(UNIT_ENABLE_IO, UNIT_SCOPE_INPUT, INPUT_ELEMENT, &1u32)?;
-    unit.set(UNIT_ENABLE_IO, UNIT_SCOPE_OUTPUT, OUTPUT_ELEMENT, &0u32)?;
-    unit.set(
-        UNIT_CURRENT_DEVICE,
-        UNIT_SCOPE_GLOBAL,
-        ELEMENT_MAIN,
-        &object,
-    )?;
-    let format = AudioStreamBasicDescription {
-        sample_rate: f64::from(spec.sample_rate()),
-        format_id: FORMAT_LINEAR_PCM,
-        format_flags: FORMAT_FLAG_FLOAT | FORMAT_FLAG_PACKED | NATIVE_ENDIAN_FLAG,
-        bytes_per_packet: SAMPLE_BYTES * width,
-        frames_per_packet: 1,
-        bytes_per_frame: SAMPLE_BYTES * width,
-        channels_per_frame: width,
-        bits_per_channel: 8 * SAMPLE_BYTES,
-        reserved: 0,
-    };
-    // The client side of the input element is its output scope: the device
-    // feeds the unit, which hands converted samples to the callback.
-    unit.set(
-        UNIT_STREAM_FORMAT,
-        UNIT_SCOPE_OUTPUT,
-        INPUT_ELEMENT,
+    // The HAL renders only at the device's own rate, so the unit asks for that
+    // and the sink converts to the rate the caller requested.
+    let rate = device_rate(object)?;
+    let format = format_at(channels, rate);
+    let shared = Arc::new(Shared::new(
+        channels,
+        unit.0,
+        object,
+        rate,
+        spec.sample_rate(),
+    ));
+    configure_input(
+        unit.0,
+        object,
         &format,
-    )?;
-    let callback = RenderCallback {
-        input_proc: Some(render_callback),
-        reference: Arc::as_ptr(&shared).cast_mut().cast(),
-    };
-    unit.set(
-        UNIT_INPUT_CALLBACK,
-        UNIT_SCOPE_GLOBAL,
-        ELEMENT_MAIN,
-        &callback,
-    )?;
-    unit.set(
-        UNIT_MAX_FRAMES_PER_SLICE,
-        UNIT_SCOPE_GLOBAL,
-        ELEMENT_MAIN,
-        &u32::try_from(CALLBACK_FRAMES).unwrap_or(u32::MAX),
+        Arc::as_ptr(&shared).cast_mut().cast(),
     )?;
     let status = unsafe { AudioUnitInitialize(unit.0) };
     if status != 0 {
