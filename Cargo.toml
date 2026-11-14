@@ -75,4 +75,4 @@ name = "koe"
 [workspace.package]
 edition = "2024"
 license = "MIT"
-version = "2026.11.1"
+version = "2026.11.2"
