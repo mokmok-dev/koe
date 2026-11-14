@@ -122,6 +122,9 @@ jobs:
           mkdir -p dist
           STAGE="$(mktemp -d)"
           ditto result/Koe.app "$STAGE/Koe.app"
+          # `ditto` keeps the store's read-only mode, and `codesign` has to
+          # rewrite the bundle to sign it.
+          chmod -R u+w "$STAGE/Koe.app"
           plutil -lint "$STAGE/Koe.app/Contents/Info.plist"
           ln -s /Applications "$STAGE/Applications"
           codesign --force --deep --options runtime --sign - "$STAGE/Koe.app"
