@@ -272,6 +272,46 @@
                 mkdir -p "$out/Koe.app/Contents/MacOS"
                 install -m755 ${desktop}/bin/koe-desktop "$out/Koe.app/Contents/MacOS/koe-desktop"
                 install -m644 ${infoPlist} "$out/Koe.app/Contents/Info.plist"
+
+                # `libc` links `iconv` on every Apple target, so the store path in
+                # that load command stops the bundle at launch. No koe symbol uses
+                # it. Every other library has to be one the system ships.
+                binutils=${pkgs.darwin.binutils-unwrapped}/bin
+                binary="$out/Koe.app/Contents/MacOS/koe-desktop"
+                chmod u+w "$binary"
+
+                # The list goes through a file, and its length is checked. A
+                # command substitution in a `for` list skips the loop when the
+                # tool fails, which would pass a bundle nothing looked at.
+                listing="$(mktemp)"
+                libraries="$(mktemp)"
+                "$binutils"/otool -L "$binary" > "$listing"
+                awk '/^[[:space:]]/ { print $1 }' "$listing" > "$libraries"
+                if [ ! -s "$libraries" ]; then
+                  echo "otool -L named no libraries in $binary" >&2
+                  exit 1
+                fi
+
+                while IFS= read -r library; do
+                  case "$library" in
+                    /System/* | /usr/lib/* | @*) ;;
+                    /nix/store/*/libiconv.2.dylib)
+                      "$binutils"/install_name_tool -change "$library" /usr/lib/libiconv.2.dylib "$binary"
+                      ;;
+                    *)
+                      echo "$binary loads $library, which a stock Mac does not ship" >&2
+                      exit 1
+                      ;;
+                  esac
+                done < "$libraries"
+
+                # The rewrite is only useful if it took effect, so read the
+                # load commands back instead of trusting the command above.
+                "$binutils"/otool -L "$binary" > "$listing"
+                if grep -qE '^[[:space:]]+/nix/store/' "$listing"; then
+                  echo "$binary still loads a Nix store library" >&2
+                  exit 1
+                fi
               '';
 
               # The binary records its Nix store libraries in DT_NEEDED, so this
