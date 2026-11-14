@@ -3579,7 +3579,7 @@ checksum = "e2db585e1d738fc771bf08a151420d3ed193d9d895a36df7f6f8a9456b911ddc"
 
 [[package]]
 name = "koe-capture"
-version = "2026.11.1"
+version = "2026.11.2"
 dependencies = [
  "koe-capture-core",
  "koe-capture-linux",
@@ -3589,21 +3589,21 @@ dependencies = [
 
 [[package]]
 name = "koe-capture-core"
-version = "2026.11.1"
+version = "2026.11.2"
 dependencies = [
  "proptest",
 ]
 
 [[package]]
 name = "koe-capture-linux"
-version = "2026.11.1"
+version = "2026.11.2"
 dependencies = [
  "koe-capture-core",
 ]
 
 [[package]]
 name = "koe-capture-macos"
-version = "2026.11.1"
+version = "2026.11.2"
 dependencies = [
  "koe-capture-core",
  "proptest",
@@ -3611,7 +3611,7 @@ dependencies = [
 
 [[package]]
 name = "koe-capture-windows"
-version = "2026.11.1"
+version = "2026.11.2"
 dependencies = [
  "koe-capture-core",
  "proptest",
@@ -3619,7 +3619,7 @@ dependencies = [
 
 [[package]]
 name = "koe-cli"
-version = "2026.11.1"
+version = "2026.11.2"
 dependencies = [
  "clap",
  "ctrlc",
@@ -3633,7 +3633,7 @@ dependencies = [
 
 [[package]]
 name = "koe-desktop"
-version = "2026.11.1"
+version = "2026.11.2"
 dependencies = [
  "arboard",
  "chrono",
@@ -3651,7 +3651,7 @@ dependencies = [
 
 [[package]]
 name = "koe-record"
-version = "2026.11.1"
+version = "2026.11.2"
 dependencies = [
  "koe-capture",
  "koe-capture-core",
@@ -3662,7 +3662,7 @@ dependencies = [
 
 [[package]]
 name = "koe-record-core"
-version = "2026.11.1"
+version = "2026.11.2"
 dependencies = [
  "koe-capture-core",
  "proptest",
@@ -3670,7 +3670,7 @@ dependencies = [
 
 [[package]]
 name = "koe-session"
-version = "2026.11.1"
+version = "2026.11.2"
 dependencies = [
  "koe-capture-core",
  "stateright",
@@ -3678,7 +3678,7 @@ dependencies = [
 
 [[package]]
 name = "koe-session-store"
-version = "2026.11.1"
+version = "2026.11.2"
 dependencies = [
  "koe-capture-core",
  "koe-session",
@@ -3688,7 +3688,7 @@ dependencies = [
 
 [[package]]
 name = "koe-transcribe"
-version = "2026.11.1"
+version = "2026.11.2"
 dependencies = [
  "koe-transcribe-core",
  "koe-transcribe-ggml",
@@ -3697,7 +3697,7 @@ dependencies = [
 
 [[package]]
 name = "koe-transcribe-core"
-version = "2026.11.1"
+version = "2026.11.2"
 dependencies = [
  "libm",
  "proptest",
@@ -3705,7 +3705,7 @@ dependencies = [
 
 [[package]]
 name = "koe-transcribe-ggml"
-version = "2026.11.1"
+version = "2026.11.2"
 dependencies = [
  "koe-transcribe-core",
  "transcribe-cpp",
@@ -3713,7 +3713,7 @@ dependencies = [
 
 [[package]]
 name = "koe-transcribe-macos"
-version = "2026.11.1"
+version = "2026.11.2"
 dependencies = [
  "koe-transcribe-core",
 ]
