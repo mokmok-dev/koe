@@ -115,6 +115,9 @@ jobs:
         # Ad-hoc signing keeps the build working without a Developer ID
         # certificate. The download is not notarized, so Gatekeeper needs the
         # quarantine attribute removed on first launch; README says how.
+        # `--options runtime` enables the hardened runtime, which denies audio
+        # input to a process without the audio-input entitlement before TCC is
+        # consulted, so the microphone would fail every render with -10863.
         env:
           VERSION: ${{ needs.version.outputs.version }}
         run: |
@@ -127,8 +130,11 @@ jobs:
           chmod -R u+w "$STAGE/Koe.app"
           plutil -lint "$STAGE/Koe.app/Contents/Info.plist"
           ln -s /Applications "$STAGE/Applications"
-          codesign --force --deep --options runtime --sign - "$STAGE/Koe.app"
+          codesign --force --deep --options runtime \
+            --entitlements apps/koe-desktop/macos/koe.entitlements \
+            --sign - "$STAGE/Koe.app"
           codesign --verify --strict --verbose=2 "$STAGE/Koe.app"
+          scripts/verify-macos-bundle.sh "$STAGE/Koe.app"
           ASSET="dist/koe-${VERSION}-aarch64-darwin.dmg"
           hdiutil create -volname koe -srcfolder "$STAGE" -ov -format UDZO "$ASSET"
           echo "asset=$ASSET" >> "$GITHUB_OUTPUT"

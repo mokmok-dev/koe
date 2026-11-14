@@ -68,8 +68,13 @@ your buffer. The buffer length must be a multiple of the channel count.
   earlier versions. The app bundle needs
   `NSMicrophoneUsageDescription` for the microphone and
   `NSAudioCaptureUsageDescription` for the tap, plus the Microphone and
-  Screen & System Audio Recording permissions. A bare `cargo run` binary has no
-  bundle, so TCC cannot grant it and capture stays silent.
+  Screen & System Audio Recording permissions. A bundle signed with the
+  hardened runtime additionally needs the
+  `com.apple.security.device.audio-input` entitlement; without it macOS
+  refuses audio input before it shows any permission prompt, so every
+  `AudioUnitRender` returns `-10863` even though the audio unit started and
+  the microphone is granted. A bare `cargo run` binary has no bundle, so TCC
+  cannot grant it and capture stays silent.
 - Windows: Windows 10 1703 or later for event-driven loopback. The requested
   `StreamSpec` must match the endpoint's native mix format; use the selected
   `DeviceInfo`'s `default_sample_rate()` and `channels()` with `open_device`.
