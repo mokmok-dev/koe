@@ -10,6 +10,9 @@ mod enumerate;
 #[cfg(any(target_os = "macos", test))]
 mod pipeline;
 
+#[cfg(any(target_os = "macos", test))]
+mod resample;
+
 #[cfg(target_os = "macos")]
 mod ffi;
 
