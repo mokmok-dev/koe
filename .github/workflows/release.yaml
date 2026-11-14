@@ -1,0 +1,181 @@
+# Builds the release assets from the flake. The flake owns the build, because a
+# `nix build` of the same derivation the checks already built hits the Nix cache
+# on the matching runner. This workflow adds only what a pure sandbox cannot do:
+# wrap the app in a signed DMG, and publish the release. A tag cut on a commit
+# CI has already built downloads its binaries instead of compiling them.
+name: release
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag to release, for example v2026.11.1. Defaults to the ref this run starts from."
+        required: false
+        type: string
+      platform:
+        description: "Platform to (re)build. Only 'all' publishes the release after every platform succeeds."
+        required: true
+        type: choice
+        default: all
+        options:
+          - all
+          - aarch64-darwin
+          - x86_64-linux
+concurrency:
+  group: release-${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
+  cancel-in-progress: false
+permissions:
+  contents: write
+  id-token: write
+jobs:
+  version:
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.meta.outputs.tag }}
+      version: ${{ steps.meta.outputs.version }}
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+          # The dispatch path checks that the named tag exists.
+          fetch-depth: 0
+      - name: Resolve the tag and the workspace version
+        id: meta
+        # The tag names an immutable tree, so a mismatch is a bug in the commit
+        # and never something this workflow repairs.
+        env:
+          TAG_INPUT: ${{ inputs.tag }}
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          TAG="${TAG_INPUT:-$REF_NAME}"
+          VERSION="${TAG#v}"
+          if [ -z "$VERSION" ] || [ "$TAG" = "$VERSION" ]; then
+            echo "tag must carry a v prefix, got '$TAG'" >&2
+            exit 1
+          fi
+          git rev-parse -q --verify "refs/tags/$TAG" >/dev/null || {
+            echo "tag $TAG does not exist" >&2
+            exit 1
+          }
+          WORKSPACE_VERSION="$(awk '
+            /^\[workspace\.package\]/ { in_wp = 1; next }
+            /^\[/ { in_wp = 0 }
+            in_wp && /^version[[:space:]]*=/ {
+              match($0, /"[^"]+"/)
+              print substr($0, RSTART + 1, RLENGTH - 2)
+              exit
+            }' Cargo.toml)"
+          if [ "$VERSION" != "$WORKSPACE_VERSION" ]; then
+            echo "tag $TAG does not match the workspace version $WORKSPACE_VERSION in Cargo.toml" >&2
+            exit 1
+          fi
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+  draft:
+    needs: version
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          ref: ${{ needs.version.outputs.tag }}
+      - name: Create the draft once
+        # A draft is invisible, so a failed platform leaves a recoverable draft
+        # rather than a published release with a missing asset.
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ needs.version.outputs.tag }}
+        run: |
+          set -euo pipefail
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "release $TAG already exists"
+          else
+            # The tag already exists, so `--verify-tag` points the release at
+            # its commit instead of letting gh create a new tag.
+            gh release create "$TAG" --draft --generate-notes --title "$TAG" --verify-tag
+          fi
+  darwin:
+    needs:
+      - version
+      - draft
+    if: ${{ github.event_name != 'workflow_dispatch' || inputs.platform == 'all' || inputs.platform == 'aarch64-darwin' }}
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          ref: ${{ needs.version.outputs.tag }}
+      - uses: DeterminateSystems/determinate-nix-action@v3.24.2
+      - uses: DeterminateSystems/flakehub-cache-action@v3.24.2
+      - name: Build the app bundle
+        run: nix build ".#packages.aarch64-darwin.koe-desktop-app" --out-link result
+      - name: Assemble and sign the DMG
+        id: dmg
+        # Ad-hoc signing keeps the build working without a Developer ID
+        # certificate. The download is not notarized, so Gatekeeper needs the
+        # quarantine attribute removed on first launch; README says how.
+        env:
+          VERSION: ${{ needs.version.outputs.version }}
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          STAGE="$(mktemp -d)"
+          ditto result/Koe.app "$STAGE/Koe.app"
+          plutil -lint "$STAGE/Koe.app/Contents/Info.plist"
+          ln -s /Applications "$STAGE/Applications"
+          codesign --force --deep --options runtime --sign - "$STAGE/Koe.app"
+          codesign --verify --strict --verbose=2 "$STAGE/Koe.app"
+          ASSET="dist/koe-${VERSION}-aarch64-darwin.dmg"
+          hdiutil create -volname koe -srcfolder "$STAGE" -ov -format UDZO "$ASSET"
+          echo "asset=$ASSET" >> "$GITHUB_OUTPUT"
+      - name: Upload to the draft
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ needs.version.outputs.tag }}
+          ASSET: ${{ steps.dmg.outputs.asset }}
+        run: gh release upload "$TAG" "$ASSET" --clobber
+  linux:
+    needs:
+      - version
+      - draft
+    if: ${{ github.event_name != 'workflow_dispatch' || inputs.platform == 'all' || inputs.platform == 'x86_64-linux' }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          ref: ${{ needs.version.outputs.tag }}
+      - uses: DeterminateSystems/determinate-nix-action@v3.24.2
+      - uses: DeterminateSystems/flakehub-cache-action@v3.24.2
+      - name: Build the tarball
+        id: tarball
+        run: |
+          set -euo pipefail
+          nix build ".#packages.x86_64-linux.koe-desktop-tarball" --out-link result
+          mkdir -p dist
+          cp -L result/*.tar.gz dist/
+          tar -tzf dist/*.tar.gz
+          echo "asset=$(ls dist/*.tar.gz)" >> "$GITHUB_OUTPUT"
+      - name: Upload to the draft
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ needs.version.outputs.tag }}
+          ASSET: ${{ steps.tarball.outputs.asset }}
+        run: gh release upload "$TAG" "$ASSET" --clobber
+  publish:
+    needs:
+      - version
+      - darwin
+      - linux
+    # A single-platform rebuild leaves the release as a draft for a human.
+    if: ${{ github.event_name == 'push' || inputs.platform == 'all' }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          ref: ${{ needs.version.outputs.tag }}
+      - name: Publish the draft
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ needs.version.outputs.tag }}
+        run: gh release edit "$TAG" --draft=false --latest

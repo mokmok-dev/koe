@@ -9,6 +9,10 @@ workflows:
         - 'determinatesystems/determinate-nix-action@v3.24.2'
         - 'determinatesystems/flakehub-cache-action@v3.24.2'
     '.github/workflows/nix.yaml': []
+    '.github/workflows/release.yaml':
+        - 'actions/checkout@v7.0.1'
+        - 'determinatesystems/determinate-nix-action@v3.24.2'
+        - 'determinatesystems/flakehub-cache-action@v3.24.2'
     '.github/workflows/windows.yaml':
         - 'actions/checkout@v7.0.1'
         - 'dtolnay/rust-toolchain@stable'
