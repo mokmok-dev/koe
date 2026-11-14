@@ -13,6 +13,24 @@ A privacy-first recording & transcription app.
 - Featherlight UI
 - Cross platform
 
+## Install
+
+Tagging a commit `v<version>` builds every platform's assets in GitHub Actions
+and attaches them to the release. The builds come from the flake's `packages`,
+so the release job downloads them from the Nix cache instead of compiling.
+
+The macOS release is a DMG holding `Koe.app`. It is ad-hoc signed and not
+notarized, so the first launch needs **Open** from the control-click menu, or
+`xattr -d com.apple.quarantine /Applications/Koe.app` before opening it.
+
+The Linux tarball holds `koe` and `koe-desktop`. Their dynamic libraries come
+from `/nix/store`, so the binaries run where that store is mounted. On NixOS or
+with Nix installed, install from the flake instead:
+
+```console
+nix profile install github:mokmok-dev/koe
+```
+
 ## Desktop app
 
 The desktop app shows the recording state in the menu bar and an overlay HUD
