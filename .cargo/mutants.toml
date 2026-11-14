@@ -35,7 +35,7 @@ exclude_re = [
   "koe-session/src/sources.rs:32:51: replace \\| with \\^",
 
   # Equivalent mutant: a directory fsync has no effect a test can observe.
-  "koe-session-store/src/record.rs:420:5: replace sync_directory with \\(\\)",
+  "koe-session-store/src/record.rs:442:5: replace sync_directory with \\(\\)",
 
   # Equivalent mutant: with an empty pending buffer the padding loop writes the
   # same silence packet, and a non-empty buffer short-circuits the `||` before
@@ -73,6 +73,3 @@ exclude_re = [
   # their mutants would report as missed with no test able to run them.
   "dictation_worker\\.rs:.*(Session::stop|Session::cancel|Drop for Session|replace pump ->|in finish|type_text|paste_text|replace snapshot ->|replace restore|paste_keyboard|send_paste_shortcut|type_unicode)"
 ]
-
-# Nextest skips doctests, so their coverage is absent from this gate.
-test_tool = "nextest"
