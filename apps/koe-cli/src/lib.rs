@@ -42,7 +42,7 @@ mod wav;
 mod fakes;
 
 /// Runs the command line and returns the process exit code.
-#[must_use]
+#[must_use = "the process must exit with the returned code"]
 pub fn main() -> ExitCode {
     let interrupt = Arc::new(AtomicBool::new(false));
     let _ = install_interrupt(&interrupt);

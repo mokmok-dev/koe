@@ -27,8 +27,7 @@ impl TempFile {
         static COUNTER: AtomicU64 = AtomicU64::new(0);
         let nanos = SystemTime::now()
             .duration_since(UNIX_EPOCH)
-            .map(|value| value.as_nanos())
-            .unwrap_or_default();
+            .map_or(0, |value| value.as_nanos());
         let serial = COUNTER.fetch_add(1, Ordering::Relaxed);
         let name = format!(
             "koe-record-{}-{nanos}-{serial}.{extension}",
