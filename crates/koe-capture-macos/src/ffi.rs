@@ -554,9 +554,9 @@ impl Poll for Shared {
     /// The HAL renders only while the unit's client format carries the device's
     /// own rate. A device that changes rate under a running stream either keeps
     /// rendering at the new rate with no error, which skews the frame clock, or
-    /// answers [`pipeline::UNIT_RECONFIGURING`] and delivers nothing. Both are
-    /// fixed by rebuilding the unit at the rate the device reports, so an
-    /// unchanged rate costs one property read.
+    /// answers `kAudioUnitErr_CannotDoInCurrentContext` (-10863) and delivers
+    /// nothing. Both are fixed by rebuilding the unit at the rate the device
+    /// reports, so an unchanged rate costs one property read.
     ///
     /// `AudioOutputUnitStop` waits for an in-flight render, so this must run
     /// without holding the sink or the scratch buffer; the callback takes both.

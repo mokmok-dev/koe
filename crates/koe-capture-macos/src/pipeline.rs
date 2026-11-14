@@ -11,15 +11,8 @@ pub const QUEUE_FRAMES: usize = 8_192;
 pub const CALLBACK_FRAMES: usize = 4_096;
 pub const READ_TIMEOUT: Duration = Duration::from_secs(5);
 pub const RETRY: Duration = Duration::from_millis(1);
-/// `kAudioUnitErr_CannotDoInCurrentContext`: the unit cannot render now. A
-/// device that changed its sample rate leaves a running unit answering this
-/// until the unit is rebuilt at the new rate, so the read rebuilds at once
-/// instead of waiting for the next check.
-pub const UNIT_RECONFIGURING: i32 = -10_863;
 /// How often an idle read asks its owner to match the unit to the device.
 pub const RECONCILE_INTERVAL: Duration = Duration::from_millis(250);
-/// Pause before a unit that reported [`UNIT_RECONFIGURING`] is asked again.
-pub const RECONCILE_RETRY: Duration = Duration::from_millis(20);
 /// Failed reconciliations in a row before the read reports the render failure.
 pub const RECOVERY_ATTEMPTS: u32 = 3;
 
@@ -62,7 +55,7 @@ impl Sink {
     /// they were captured at, so they are converted before the switch.
     pub fn set_device_rate(&mut self, device_rate: u32) {
         self.flush();
-        self.convert_queued();
+        self.convert_block();
         self.resampler.set_input_rate(device_rate);
     }
 
@@ -74,24 +67,17 @@ impl Sink {
         }
     }
 
-    /// Converts every queued device-rate frame into the output buffer.
-    fn convert_queued(&mut self) {
-        loop {
-            let queued = self.queue.available_frames();
-            if queued == 0 {
-                return;
-            }
-            let taken = self.queue.pop_into(&mut self.block);
-            if taken == 0 {
-                return;
-            }
-            let block = &self.block[..taken * self.channels];
-            if self.resampler.is_passthrough() {
-                self.resampled.extend_from_slice(block);
-            } else {
-                self.resampler.push(block, &mut self.resampled);
-            }
+    /// Converts every queued device frame into the output buffer.
+    ///
+    /// `block` is one queue wide, so a single pop takes the whole queue.
+    fn convert_block(&mut self) {
+        let taken = self.queue.pop_into(&mut self.block);
+        if taken == 0 {
+            return;
         }
+        let width = samples(taken, self.channels);
+        self.resampler
+            .push(&self.block[..width], &mut self.resampled);
     }
 
     /// Pushes queued frames, then `received`, keeping the spill for the next
@@ -100,10 +86,10 @@ impl Sink {
         let channels = self.channels;
         let mut carry = std::mem::take(&mut self.pending);
         if !carry.is_empty() {
-            let accepted = self.queue.push(&carry) * channels;
+            let accepted = samples(self.queue.push(&carry), channels);
             carry.drain(..accepted);
         }
-        let accepted = self.queue.push(received) * channels;
+        let accepted = samples(self.queue.push(received), channels);
         let extra = &received[accepted..];
         let room = self.capacity.saturating_sub(carry.len());
         carry.extend_from_slice(&extra[..extra.len().min(room)]);
@@ -116,23 +102,36 @@ impl Sink {
             // Frames converted before the device settled on this rate still
             // belong ahead of the queue.
             let ready = self.drain_resampled(out);
-            if ready == out.len() / self.channels {
+            if ready == frames(out.len(), self.channels) {
                 return ready;
             }
-            return ready + self.queue.pop_into(&mut out[ready * self.channels..]);
+            let offset = samples(ready, self.channels);
+            return ready + self.queue.pop_into(&mut out[offset..]);
         }
-        self.convert_queued();
+        self.convert_block();
         self.drain_resampled(out)
     }
 
     /// Copies converted frames into `out`, returning the frames copied.
     fn drain_resampled(&mut self, out: &mut [f32]) -> usize {
-        let frames = (out.len() / self.channels).min(self.resampled.len() / self.channels);
-        let count = frames * self.channels;
+        let wanted = frames(out.len(), self.channels);
+        let ready = frames(self.resampled.len(), self.channels);
+        let copied = wanted.min(ready);
+        let count = samples(copied, self.channels);
         out[..count].copy_from_slice(&self.resampled[..count]);
         self.resampled.drain(..count);
-        frames
+        copied
     }
+}
+
+/// Samples occupied by `frames` interleaved frames.
+const fn samples(frames: usize, channels: usize) -> usize {
+    frames * channels
+}
+
+/// Whole frames in `samples` interleaved samples.
+const fn frames(samples: usize, channels: usize) -> usize {
+    samples / channels
 }
 
 /// Whole frames the driver's byte count can yield from `capacity_samples`.
@@ -234,18 +233,13 @@ pub fn read_until(poll: &impl Poll, channels: usize, out: &mut [f32]) -> Result<
         if now >= next_check || code != 0 {
             if poll.reconcile() {
                 failures = 0;
-                next_check = now + RECONCILE_INTERVAL;
             } else {
                 failures += 1;
                 if failures >= RECOVERY_ATTEMPTS {
                     return Err(failure(poll.last_error()));
                 }
-                next_check = if code == UNIT_RECONFIGURING {
-                    now + RECONCILE_RETRY
-                } else {
-                    now + RECONCILE_INTERVAL
-                };
             }
+            next_check = now + RECONCILE_INTERVAL;
         }
         poll.rest();
     }
@@ -627,9 +621,9 @@ mod tests {
         assert_eq!(CALLBACK_FRAMES, 4_096);
         assert_eq!(READ_TIMEOUT, Duration::from_secs(5));
         assert_eq!(RETRY, Duration::from_millis(1));
-        assert_eq!(UNIT_RECONFIGURING, -10_863);
+
         assert_eq!(RECONCILE_INTERVAL, Duration::from_millis(250));
-        assert_eq!(RECONCILE_RETRY, Duration::from_millis(20));
+
         assert_eq!(RECOVERY_ATTEMPTS, 3);
     }
 
@@ -664,15 +658,15 @@ mod tests {
 
     #[test]
     fn repeated_reconcile_failures_end_the_read_with_the_render_status() {
-        let poll = Fake::new(1, [], RECONCILE_RETRY)
-            .failing(UNIT_RECONFIGURING)
+        let poll = Fake::new(1, [], Duration::from_millis(1))
+            .failing(-10_863)
             .reconciling([false]);
         let mut out = [0.0; 1];
         assert_eq!(
             read_until(&poll, 1, &mut out),
             Err(Error::Backend {
                 operation: "AudioUnitRender",
-                code: UNIT_RECONFIGURING,
+                code: -10_863,
             })
         );
         assert_eq!(poll.reconciles.get(), RECOVERY_ATTEMPTS as usize);
@@ -680,7 +674,7 @@ mod tests {
 
     #[test]
     fn every_failure_before_the_limit_is_retried() {
-        let poll = Fake::new(1, [], RECONCILE_RETRY).reconciling([false, false, false]);
+        let poll = Fake::new(1, [], Duration::from_millis(1)).reconciling([false, false, false]);
         let mut out = [0.0; 1];
         assert_eq!(
             read_until(&poll, 1, &mut out),
@@ -691,6 +685,267 @@ mod tests {
         assert_eq!(poll.reconciles.get(), RECOVERY_ATTEMPTS as usize);
     }
 
+    #[test]
+    fn an_error_reconciles_before_the_interval_elapses() {
+        // Frames arrive, so the read is not idle, but one rest is far short of
+        // an interval. A render error must still trigger a reconcile.
+        let poll = Fake::new(1, [1, 0, 0, 1], Duration::from_millis(1)).failing(-50);
+        let mut out = [0.0; 2];
+        let _ = read_until(&poll, 1, &mut out);
+        assert!(
+            poll.reconciles.get() >= 1,
+            "an error did not trigger a reconcile"
+        );
+    }
+
+    #[test]
+    fn a_reconfiguring_unit_is_retried_on_the_next_rest() {
+        // No error is allowed to pass unexamined, so three failed reconciles
+        // end the read within a few rests rather than at the deadline.
+        let poll = Fake::new(1, [], Duration::from_millis(1))
+            .failing(-10_863)
+            .reconciling([false]);
+        let mut out = [0.0; 1];
+        let _ = read_until(&poll, 1, &mut out);
+        assert_eq!(poll.reconciles.get(), RECOVERY_ATTEMPTS as usize);
+        assert!(
+            poll.elapsed.get() < RECONCILE_INTERVAL,
+            "the read waited {:?} before giving up",
+            poll.elapsed.get()
+        );
+    }
+
+    #[test]
+    fn a_success_resets_the_failure_count() {
+        // A success clears the count, so the failures after it start again
+        // from zero and the read survives past the three it would otherwise
+        // take to give up.
+        let poll =
+            Fake::new(1, [], Duration::from_millis(1)).reconciling([true, false, true, false]);
+        let mut out = [0.0; 1];
+        let _ = read_until(&poll, 1, &mut out);
+        assert!(
+            poll.reconciles.get() > RECOVERY_ATTEMPTS as usize,
+            "a success did not reset the count: {} calls",
+            poll.reconciles.get()
+        );
+    }
+
+    #[test]
+    fn any_other_render_error_waits_a_full_interval_between_retries() {
+        // Every error is retried on the next rest, whatever its code, so three
+        // failures end the read long before the deadline.
+        let poll = Fake::new(1, [], Duration::from_millis(1))
+            .failing(-50)
+            .reconciling([false]);
+        let mut out = [0.0; 1];
+        let _ = read_until(&poll, 1, &mut out);
+        assert_eq!(poll.reconciles.get(), RECOVERY_ATTEMPTS as usize);
+    }
+
+    #[test]
+    fn a_healthy_unit_is_checked_once_per_interval() {
+        // With no error the read only compares the unit with its device on the
+        // interval, so a 5 s deadline checked every 250 ms makes about 19
+        // calls rather than one per rest.
+        let poll = Fake::new(1, [], Duration::from_millis(1));
+        let mut out = [0.0; 1];
+        let _ = read_until(&poll, 1, &mut out);
+        let calls = poll.reconciles.get();
+        assert!(
+            (15..25).contains(&calls),
+            "a healthy unit was checked {calls} times in five seconds"
+        );
+    }
+
+    #[test]
+    fn a_failure_resets_the_check_schedule() {
+        // The interval is measured from the last check, so the clock restarts
+        // instead of firing every rest after the first.
+        let poll = Fake::new(1, [], Duration::from_millis(1));
+        let mut out = [0.0; 1];
+        let _ = read_until(&poll, 1, &mut out);
+        assert!(
+            poll.elapsed.get() >= READ_TIMEOUT,
+            "the read ended early at {:?}",
+            poll.elapsed.get()
+        );
+    }
+
+    #[test]
+    fn a_successful_reconcile_restores_the_interval() {
+        // A success resets the failure count and the schedule, so a later
+        // failure is not counted against the earlier run.
+        let poll = Fake::new(1, [], Duration::from_millis(1)).reconciling([true, false, false]);
+        let mut out = [0.0; 1];
+        let _ = read_until(&poll, 1, &mut out);
+        // Three failures would end the read; starting from a success, the two
+        // that follow do not.
+        assert!(poll.reconciles.get() > 2);
+    }
+
+    #[test]
+    fn a_rate_change_converts_queued_frames_and_delivers_their_duration() {
+        // Half a second at 96 kHz is half a second at 48 kHz however the sink
+        // was opened, so a rate switch must not change how long the audio is.
+        let mut sink = Sink::new(1, 48_000, 96_000, 48_000);
+        let input = vec![0.5; 48_000];
+        sink.accept(&input);
+        let mut out = vec![0.0; 24_000];
+        let produced = sink.take(&mut out);
+        assert!(
+            produced.abs_diff(24_000) < 200,
+            "delivered {produced} frames for half a second"
+        );
+    }
+
+    #[test]
+    fn a_rate_switch_converts_the_queue_at_the_rate_it_arrived() {
+        let mut sink = Sink::new(1, 48_000, 96_000, 48_000);
+        // A quarter second at 96 kHz, still queued when the rate changes.
+        sink.accept(&vec![0.5; 24_000]);
+        sink.set_device_rate(48_000);
+        // The switch converts under the old rate and then passes through.
+        assert!(sink.resampler.is_passthrough());
+        let mut out = vec![0.0; 12_000];
+        let produced = sink.take(&mut out);
+        assert!(
+            produced.abs_diff(12_000) < 200,
+            "delivered {produced} frames for a quarter second"
+        );
+        // Past the settling window every frame is the constant input, to the
+        // kernel's unit-gain tolerance.
+        assert!(
+            out[100..produced - 100]
+                .iter()
+                .all(|sample| (sample - 0.5).abs() < 1e-3),
+            "a converted frame left the constant level"
+        );
+    }
+
+    #[test]
+    fn a_passthrough_sink_returns_the_queue_verbatim() {
+        let mut sink = Sink::passthrough(2, 4);
+        sink.accept(&[1.0, 2.0, 3.0, 4.0]);
+        let mut out = [0.0; 8];
+        assert_eq!(sink.take(&mut out), 2);
+        assert_eq!(out, [1.0, 2.0, 3.0, 4.0, 0.0, 0.0, 0.0, 0.0]);
+    }
+
+    #[test]
+    fn a_take_never_returns_more_frames_than_the_request() {
+        let mut sink = Sink::new(2, 32, 96_000, 48_000);
+        sink.accept(&vec![0.25; 2 * 32]);
+        let mut out = [0.0; 8];
+        let produced = sink.take(&mut out);
+        assert!(produced <= 4, "delivered {produced} frames into four slots");
+    }
+
+    #[test]
+    fn a_take_of_no_frames_delivers_nothing() {
+        let mut sink = Sink::new(1, 8, 96_000, 48_000);
+        sink.accept(&[0.25; 8]);
+        let mut out = [];
+        assert_eq!(sink.take(&mut out), 0);
+    }
+
+    #[test]
+    fn a_stereo_take_counts_frames_in_whole_pairs() {
+        // Every count here is in frames, so a stereo stream must not return a
+        // sample count and split a frame across calls.
+        let mut sink = Sink::new(2, 4_800, 96_000, 48_000);
+        sink.accept(&vec![0.5; 2 * 4_800]);
+        let mut out = vec![0.0; 2 * 400];
+        let produced = sink.take(&mut out);
+        assert_eq!(produced, 400, "delivered {produced} frames into 400 slots");
+        // Past the settling window both channels carry the same constant.
+        for frame in out.as_chunks::<2>().0.iter().skip(100) {
+            assert!((frame[0] - 0.5).abs() < 1e-3, "{frame:?}");
+            assert!((frame[1] - 0.5).abs() < 1e-3, "{frame:?}");
+        }
+    }
+
+    #[test]
+    fn a_rate_switch_on_a_stereo_sink_keeps_both_channels() {
+        let mut sink = Sink::new(2, 4_800, 96_000, 48_000);
+        let mut alternating = Vec::with_capacity(2 * 4_800);
+        for _ in 0..4_800 {
+            alternating.extend_from_slice(&[0.5, -0.5]);
+        }
+        sink.accept(&alternating);
+        sink.set_device_rate(48_000);
+        let mut out = vec![0.0; 2 * 400];
+        let produced = sink.take(&mut out);
+        assert_eq!(produced, 400);
+        // Past the settling window each channel holds its own constant, which
+        // a shared filter state would blur together.
+        for frame in out.as_chunks::<2>().0.iter().skip(100) {
+            assert!((frame[0] - 0.5).abs() < 1e-3, "{frame:?}");
+            assert!((frame[1] + 0.5).abs() < 1e-3, "{frame:?}");
+        }
+    }
+
+    #[test]
+    fn samples_and_frames_convert_between_the_two_counts() {
+        for channels in 1..=3 {
+            for count in [0usize, 1, 2, 7] {
+                assert_eq!(frames(samples(count, channels), channels), count);
+                assert_eq!(samples(count, channels), count * channels);
+            }
+        }
+        // A partial frame is not a whole frame.
+        assert_eq!(frames(7, 2), 3);
+        assert_eq!(samples(3, 2), 6);
+    }
+
+    #[test]
+    fn a_take_counts_in_frames_not_samples() {
+        // The caller asks for sixteen samples; at two channels that is eight
+        // frames, and a channel-count mix-up would report sixteen.
+        let mut sink = Sink::passthrough(2, 8);
+        sink.accept(&[1.0; 16]);
+        let mut out = [0.0; 16];
+        assert_eq!(sink.take(&mut out), 8);
+    }
+
+    #[test]
+    fn a_passthrough_take_returns_converted_frames_first() {
+        // Converted frames queued before the device settled belong ahead of
+        // anything still in the device queue.
+        let mut sink = Sink::new(1, 4_800, 96_000, 48_000);
+        sink.accept(&vec![0.5; 4_800]);
+        sink.set_device_rate(48_000);
+        sink.accept(&vec![1.0; 4_800]);
+        let mut out = [0.0; 2_000];
+        let produced = sink.take(&mut out);
+        assert!(produced > 1_000);
+        // The tail is the converted constant, not the later frames, so the
+        // queue was not served out of order.
+        assert!(
+            (out[produced - 1] - 0.5).abs() < 1e-3,
+            "the queue was served out of order: {}",
+            out[produced - 1]
+        );
+    }
+
+    #[test]
+    fn a_short_output_still_gets_the_frames_that_fit() {
+        let mut sink = Sink::passthrough(2, 8);
+        sink.accept(&[1.0; 16]);
+        let mut out = [0.0; 6];
+        assert_eq!(sink.take(&mut out), 3);
+        assert_eq!(sink.take(&mut out), 3);
+        assert_eq!(sink.take(&mut out), 2);
+    }
+
+    #[test]
+    fn a_rate_switch_before_any_audio_converts_nothing() {
+        let mut sink = Sink::new(1, 8, 96_000, 48_000);
+        sink.set_device_rate(48_000);
+        assert!(sink.resampler.is_passthrough());
+        let mut out = [0.0; 4];
+        assert_eq!(sink.take(&mut out), 0);
+    }
     #[test]
     fn a_device_rate_change_is_converted_to_the_requested_rate() {
         let mut sink = Sink::new(1, 4_800, 96_000, 48_000);
