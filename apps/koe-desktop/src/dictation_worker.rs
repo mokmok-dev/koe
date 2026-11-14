@@ -26,8 +26,12 @@ use koe_transcribe::{AudioSpec, Event, LiveSession, LiveText, Options, Transcrib
 use crate::dictation::{DictationOutcome, DictationPlan};
 use crate::engine::SAMPLE_RATE;
 use crate::error::DesktopError;
+use crate::wake::Wake;
 
 /// Frames each microphone read delivers, one mono channel wide.
+///
+/// The session's queue is counted in chunks, so this block sets how far a
+/// slow engine may fall behind.
 const BLOCK_FRAMES: usize = 960;
 
 /// Frames a backlog may hold while the model loads: about a minute.
@@ -56,22 +60,25 @@ pub(crate) static MODEL_LOAD: Mutex<()> = Mutex::new(());
 /// The recognized text so far, shared between the dictation thread and the
 /// shell.
 ///
-/// The thread folds recognition events in and the shell reads the joined text
-/// on a tick. Both hold the lock only for that copy, so neither waits on
-/// inference.
+/// The lock is held only for a copy, so neither side waits on inference, and
+/// every fold marks the shell's [`Wake`].
 #[derive(Clone, Default)]
-struct LiveTranscript(Arc<Mutex<LiveText>>);
+struct LiveTranscript {
+    text: Arc<Mutex<LiveText>>,
+    wake: Wake,
+}
 
 impl LiveTranscript {
     fn apply(&self, event: &Event) {
-        self.0
+        self.text
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .apply(event);
+        self.wake.wake();
     }
 
     fn read(&self) -> String {
-        self.0
+        self.text
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .to_string()
@@ -86,7 +93,13 @@ impl LiveTranscript {
             start_ms: 0,
             end_ms: 0,
         });
-        *self.0.lock().unwrap_or_else(PoisonError::into_inner) = live;
+        *self.text.lock().unwrap_or_else(PoisonError::into_inner) = live;
+        self.wake.wake();
+    }
+
+    /// A handle the shell waits on for the next change.
+    fn wake(&self) -> Wake {
+        self.wake.clone()
     }
 }
 
@@ -150,6 +163,13 @@ impl Session {
         self.transcript.read()
     }
 
+    /// A wake the shell waits on to draw a new transcript without waiting for
+    /// its next tick.
+    #[must_use]
+    pub fn wake(&self) -> Wake {
+        self.transcript.wake()
+    }
+
     /// Takes the thread's report without blocking.
     #[must_use]
     pub fn poll(&self) -> Report {
@@ -157,6 +177,24 @@ impl Session {
             Ok(outcome) => Report::Done(outcome),
             Err(TryRecvError::Empty) => Report::Pending,
             Err(TryRecvError::Disconnected) => Report::Lost,
+        }
+    }
+
+    /// A session with no thread behind it, for a caller that only reads the
+    /// transcript side.
+    ///
+    /// The sender is dropped, so [`poll`](Self::poll) reports
+    /// [`Report::Lost`]: this is not a live session, and nothing may drive
+    /// `tick` with it.
+    #[cfg(test)]
+    pub(crate) fn detached() -> Self {
+        let (sender, events) = mpsc::channel();
+        drop(sender);
+        Self {
+            stop: Arc::new(AtomicBool::new(false)),
+            cancel: Arc::new(AtomicBool::new(false)),
+            events,
+            transcript: LiveTranscript::default(),
         }
     }
 }
@@ -665,6 +703,33 @@ mod tests {
             revision: 1,
         });
         assert_eq!(shell_side.read(), "hi");
+    }
+
+    #[test]
+    fn a_folded_event_wakes_the_shell() {
+        let transcript = LiveTranscript::default();
+        let shell_side = transcript.clone();
+        let wake = shell_side.wake();
+        assert!(!wake.consume());
+
+        transcript.apply(&Event::Volatile {
+            text: "hi".into(),
+            revision: 1,
+        });
+        assert!(wake.consume());
+        assert!(!wake.consume());
+    }
+
+    #[test]
+    fn a_commit_wakes_the_shell() {
+        let transcript = LiveTranscript::default();
+        let shell_side = transcript.clone();
+        let wake = shell_side.wake();
+        assert!(!wake.consume());
+
+        transcript.commit("done");
+        assert_eq!(shell_side.read(), "done");
+        assert!(wake.consume());
     }
 
     #[test]

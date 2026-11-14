@@ -8,8 +8,8 @@ use std::time::{Duration, Instant};
 #[cfg(target_os = "macos")]
 use gpui::ActivationPolicy;
 use gpui::{
-    AnyWindowHandle, App, AppContext as _, AsyncApp, Context, Entity, QuitMode, WindowBounds,
-    WindowDecorations, WindowId, WindowOptions, px, size,
+    AnyWindowHandle, App, AppContext as _, AsyncApp, Context, Entity, FutureExt, QuitMode,
+    WindowBounds, WindowDecorations, WindowId, WindowOptions, px, size,
 };
 use gpui_kit::component::{Theme, ThemeMode, TitleBar};
 use koe_session_store::{Error as StoreError, Transcripts};
@@ -25,6 +25,7 @@ use crate::state::{Action, Event, Phase, Sources};
 use crate::transcript::{self, MeetingTranscript, Speaker};
 use crate::tray::{Tray, TrayAction, TrayState, TrayStatus};
 use crate::ui::MainView;
+use crate::wake::Wake;
 
 /// How long a refused hotkey press stays in the HUD.
 ///
@@ -34,10 +35,10 @@ const REFUSAL_HOLD: Duration = Duration::from_secs(5);
 
 /// How often the shell looks at a running dictation.
 ///
-/// The dictation thread publishes a new transcript once per 20 ms audio block,
-/// and the speech models report tentative phrases between blocks. A tick
-/// slower than that samples the transcript instead of following it, which
-/// reads as words arriving a beat late.
+/// The loop sleeps on the dictation's wake, so a recognized phrase draws as
+/// soon as the thread folds it in. This tick is the fallback: it catches a
+/// change the wake does not cover — the elapsed seconds — and bounds how long
+/// a hotkey press waits in the queue, which a wake would not shorten.
 const DICTATION_TICK: Duration = Duration::from_millis(20);
 
 /// How often the shell looks at a running take or a dictation whose transcript
@@ -107,6 +108,8 @@ pub struct Tick {
     pub quit: bool,
     /// The HUD window to close once the shell lease is released.
     pub hud_close: Option<AnyWindowHandle>,
+    /// The dictation transcript to wake on, when the HUD draws one.
+    pub wake: Option<Wake>,
 }
 
 impl Default for Shell {
@@ -192,11 +195,13 @@ impl Shell {
             cx.notify();
         }
 
+        let (delay, wake) = self.sleep();
         let mut tick = Tick {
-            delay: Duration::from_millis(250),
+            delay,
             show: false,
             quit: false,
             hud_close: self.pending_hud_close.take(),
+            wake,
         };
         if self.quitting {
             let deadline_passed = self
@@ -207,22 +212,6 @@ impl Shell {
             {
                 tick.quit = true;
             }
-            tick.delay = ACTIVE_TICK;
-        } else if self.phase.is_active() {
-            tick.delay = ACTIVE_TICK;
-        } else if self.dictation_control.dictation.is_active() {
-            // Only the HUD reads the transcript; with `KOE_HUD=off` the slower
-            // tick keeps the tray and the state machine current for less work.
-            tick.delay = if self.hud_enabled {
-                DICTATION_TICK
-            } else {
-                ACTIVE_TICK
-            };
-        } else if self.dictation_control.hotkeys.is_some() {
-            // A press waits in the queue until the next tick. A dictation
-            // start is where the lost audio is speech, so the idle tick that
-            // polls for presses is five times faster than the tray's.
-            tick.delay = Duration::from_millis(50);
         }
         tick.show = self.pending_show;
         tick.quit |= self.pending_quit;
@@ -731,6 +720,31 @@ impl Shell {
             now,
         )
     }
+
+    /// How long the loop sleeps, and what may end that sleep early.
+    fn sleep(&self) -> (Duration, Option<Wake>) {
+        if self.quitting || self.phase.is_active() {
+            return (ACTIVE_TICK, None);
+        }
+        if self.dictation_control.dictation.is_active() {
+            if !self.hud_enabled {
+                return (ACTIVE_TICK, None);
+            }
+            let wake = self
+                .dictation_control
+                .session
+                .as_ref()
+                .map(dictation_worker::Session::wake);
+            return (DICTATION_TICK, wake);
+        }
+        if self.dictation_control.hotkeys.is_some() {
+            // A press waits in the queue until the next tick. A dictation
+            // start is where the lost audio is speech, so the idle tick that
+            // polls for presses is five times faster than the tray's.
+            return (Duration::from_millis(50), None);
+        }
+        (Duration::from_millis(250), None)
+    }
 }
 
 fn hud_enabled() -> bool {
@@ -819,7 +833,15 @@ pub fn run() {
                     if tick.quit {
                         cx.update(|cx| cx.quit());
                     }
-                    cx.background_executor().timer(tick.delay).await;
+                    match tick.wake {
+                        Some(wake) => {
+                            let _ = wake
+                                .wait()
+                                .with_timeout(tick.delay, cx.background_executor())
+                                .await;
+                        }
+                        None => cx.background_executor().timer(tick.delay).await,
+                    }
                 }
             })
             .detach();
@@ -836,6 +858,7 @@ mod tests {
     use koe_session_store::{Store, Transcripts};
 
     use super::*;
+    use crate::dictation::Dictation;
     use crate::state::Live;
 
     /// A shell holding one take in a fresh store under `root`, and the plan the
@@ -860,6 +883,71 @@ mod tests {
             failure: None,
             transcripts: Transcripts::new(),
         })
+    }
+
+    /// A shell in a running dictation, with the HUD enabled or not by the
+    /// argument.
+    ///
+    /// The thread's session is left unset; a caller that wants one sets it.
+    fn listening_shell(hud_enabled: bool) -> Shell {
+        let mut shell = Shell::new();
+        shell.hud_enabled = hud_enabled;
+        shell.dictation_control.dictation = Dictation::Listening {
+            started: Instant::now(),
+        };
+        shell
+    }
+
+    #[test]
+    fn a_hud_dictation_sleeps_on_the_transcript_wake() {
+        let mut shell = listening_shell(true);
+        shell.dictation_control.session = Some(dictation_worker::Session::detached());
+        let (delay, wake) = shell.sleep();
+        assert_eq!(delay, DICTATION_TICK);
+        assert!(wake.is_some());
+    }
+
+    #[test]
+    fn a_dictation_with_no_hud_keeps_the_slow_tick_and_no_wake() {
+        let mut shell = listening_shell(false);
+        shell.dictation_control.session = Some(dictation_worker::Session::detached());
+        let (delay, wake) = shell.sleep();
+        assert_eq!(delay, ACTIVE_TICK);
+        assert!(wake.is_none());
+    }
+
+    #[test]
+    fn a_hud_dictation_with_no_session_still_ticks() {
+        // Nothing in production reaches this — a started thread sets the
+        // session and a failed start ends the dictation — so this pins the
+        // fallback: with no session there is nothing to wait on, and the
+        // elapsed seconds still move on the dictation tick.
+        let shell = listening_shell(true);
+        let (delay, wake) = shell.sleep();
+        assert_eq!(delay, DICTATION_TICK);
+        assert!(wake.is_none());
+    }
+
+    #[test]
+    fn a_running_take_sleeps_no_wake() {
+        let root = tempfile::tempdir().unwrap();
+        let (mut shell, _plan) = shell_with_take(root.path());
+        shell.hud_enabled = true;
+        shell.dictation_control.session = Some(dictation_worker::Session::detached());
+        let (delay, wake) = shell.sleep();
+        assert_eq!(delay, ACTIVE_TICK);
+        assert!(wake.is_none());
+    }
+
+    #[test]
+    fn a_quitting_shell_sleeps_no_wake() {
+        let mut shell = listening_shell(true);
+        shell.quitting = true;
+        shell.quit_deadline = Some(Instant::now() + Duration::from_secs(30));
+        shell.dictation_control.session = Some(dictation_worker::Session::detached());
+        let (delay, wake) = shell.sleep();
+        assert_eq!(delay, ACTIVE_TICK);
+        assert!(wake.is_none());
     }
 
     #[test]
