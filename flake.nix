@@ -73,6 +73,48 @@
             vulkan-loader
             wayland
           ];
+
+          src = pkgs.lib.cleanSourceWith {
+            src = ./.;
+            filter =
+              path: _type:
+              let
+                name = baseNameOf path;
+              in
+              !(builtins.elem name [
+                "target"
+                ".direnv"
+              ])
+              && !(pkgs.lib.hasPrefix "result" name);
+          };
+
+          platformFeature = if pkgs.stdenv.hostPlatform.isDarwin then "macos" else "linux";
+
+          cargoCommonArgs = {
+            inherit src;
+            pname = "koe";
+            strictDeps = true;
+            # The Darwin stdenv has no swiftc, and the macOS speech shim
+            # cannot be built without it.
+            nativeBuildInputs = [
+              pkgs.cmake
+            ]
+            ++ pkgs.lib.optional pkgs.stdenv.hostPlatform.isLinux pkgs.pkg-config
+            ++ pkgs.lib.optional pkgs.stdenv.hostPlatform.isDarwin pkgs.swift;
+          }
+          // pkgs.lib.optionalAttrs pkgs.stdenv.hostPlatform.isLinux {
+            buildInputs = [
+              pkgs.libpulseaudio
+              pkgs.libxkbcommon
+            ]
+            ++ guiPackages;
+            LD_LIBRARY_PATH = pkgs.lib.makeLibraryPath [
+              pkgs.libpulseaudio
+              pkgs.libxkbcommon
+            ];
+          };
+
+          inherit (craneLib.crateNameFromCargoToml { src = ./.; }) version;
         in
         {
           _module.args = {
@@ -84,45 +126,6 @@
 
           checks =
             let
-              src = pkgs.lib.cleanSourceWith {
-                src = ./.;
-                filter =
-                  path: _type:
-                  let
-                    name = baseNameOf path;
-                  in
-                  !(builtins.elem name [
-                    "target"
-                    ".direnv"
-                  ])
-                  && !(pkgs.lib.hasPrefix "result" name);
-              };
-
-              platformFeature = if pkgs.stdenv.hostPlatform.isDarwin then "macos" else "linux";
-
-              cargoCommonArgs = {
-                inherit src;
-                pname = "koe";
-                strictDeps = true;
-                # The Darwin stdenv has no swiftc, and the macOS speech shim
-                # cannot be built without it.
-                nativeBuildInputs = [
-                  pkgs.cmake
-                ]
-                ++ pkgs.lib.optional pkgs.stdenv.hostPlatform.isLinux pkgs.pkg-config
-                ++ pkgs.lib.optional pkgs.stdenv.hostPlatform.isDarwin pkgs.swift;
-              }
-              // pkgs.lib.optionalAttrs pkgs.stdenv.hostPlatform.isLinux {
-                buildInputs = [
-                  pkgs.libpulseaudio
-                  pkgs.libxkbcommon
-                ]
-                ++ guiPackages;
-                LD_LIBRARY_PATH = pkgs.lib.makeLibraryPath [
-                  pkgs.libpulseaudio
-                  pkgs.libxkbcommon
-                ];
-              };
               cargoArtifacts = craneLib.buildDepsOnly cargoCommonArgs;
 
               # The facades reject `--all-features` and accept exactly one
@@ -194,6 +197,106 @@
                 '';
                 installPhase = "mkdir -p $out";
               };
+            };
+
+          packages =
+            let
+              # The facades reject `--all-features` and accept exactly one
+              # platform feature, so a release build names the host one.
+              releaseFeatures = "koe-capture/${platformFeature},koe-transcribe/${platformFeature},koe-cli/${platformFeature},koe-desktop/${platformFeature}";
+
+              # A release artifact tree is distinct from the debug tree the
+              # checks build, so it is its own cache entry.
+              releaseArtifacts = craneLib.buildDepsOnly (
+                cargoCommonArgs
+                // {
+                  pname = "koe-deps-release";
+                  doCheck = false;
+                  CARGO_PROFILE = "release";
+                  cargoExtraArgs = "--locked --workspace --features ${releaseFeatures}";
+                }
+              );
+
+              releasePackage =
+                package: binary:
+                craneLib.buildPackage (
+                  cargoCommonArgs
+                  // {
+                    pname = binary;
+                    inherit version;
+                    cargoArtifacts = releaseArtifacts;
+                    doCheck = false;
+                    CARGO_PROFILE = "release";
+                    cargoExtraArgs = "--locked --package ${package} --features ${platformFeature}";
+                  }
+                );
+
+              cli = releasePackage "koe-cli" "koe";
+              desktop = releasePackage "koe-desktop" "koe-desktop";
+
+              # `TCC` cannot grant the microphone or the system audio to a bare
+              # binary, so the app ships as a bundle. The app sets its own
+              # accessory activation policy at runtime.
+              infoPlist = pkgs.writeText "koe-Info.plist" ''
+                <?xml version="1.0" encoding="UTF-8"?>
+                <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+                <plist version="1.0">
+                <dict>
+                  <key>CFBundleIdentifier</key>
+                  <string>dev.mokmok.koe</string>
+                  <key>CFBundleName</key>
+                  <string>koe</string>
+                  <key>CFBundleDisplayName</key>
+                  <string>koe</string>
+                  <key>CFBundleExecutable</key>
+                  <string>koe-desktop</string>
+                  <key>CFBundlePackageType</key>
+                  <string>APPL</string>
+                  <key>CFBundleShortVersionString</key>
+                  <string>${version}</string>
+                  <key>CFBundleVersion</key>
+                  <string>${version}</string>
+                  <key>LSMinimumSystemVersion</key>
+                  <string>14.2</string>
+                  <key>NSHighResolutionCapable</key>
+                  <true/>
+                  <key>NSMicrophoneUsageDescription</key>
+                  <string>koe records the microphone to transcribe your meeting and dictation on this Mac.</string>
+                  <key>NSAudioCaptureUsageDescription</key>
+                  <string>koe records the system audio to transcribe the other side of your meeting on this Mac.</string>
+                </dict>
+                </plist>
+              '';
+
+              desktopApp = pkgs.runCommandLocal "koe-app-${version}" { } ''
+                mkdir -p "$out/Koe.app/Contents/MacOS"
+                install -m755 ${desktop}/bin/koe-desktop "$out/Koe.app/Contents/MacOS/koe-desktop"
+                install -m644 ${infoPlist} "$out/Koe.app/Contents/Info.plist"
+              '';
+
+              # The binary records its Nix store libraries in DT_NEEDED, so this
+              # asset runs where that store is mounted.
+              desktopTarball = pkgs.runCommandLocal "koe-desktop-${version}-${system}" { } ''
+                mkdir -p staging
+                install -m755 ${desktop}/bin/koe-desktop staging/koe-desktop
+                install -m755 ${cli}/bin/koe staging/koe
+                install -m644 ${./README.md} staging/README.md
+                mkdir -p "$out"
+                tar --format=ustar --sort=name --owner=0 --group=0 --numeric-owner \
+                  --mtime=@0 --directory staging --create . \
+                  | gzip -n > "$out/koe-desktop-${version}-${system}.tar.gz"
+              '';
+            in
+            {
+              koe-cli = cli;
+              koe-desktop = desktop;
+              default = desktop;
+            }
+            // pkgs.lib.optionalAttrs pkgs.stdenv.hostPlatform.isDarwin {
+              koe-desktop-app = desktopApp;
+            }
+            // pkgs.lib.optionalAttrs pkgs.stdenv.hostPlatform.isLinux {
+              koe-desktop-tarball = desktopTarball;
             };
 
           devShells.default = pkgs.mkShellNoCC {
