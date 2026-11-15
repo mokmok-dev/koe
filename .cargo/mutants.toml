@@ -20,9 +20,10 @@ exclude_globs = [
   "apps/koe-desktop/src/settings.rs",
 ]
 
-# The CLI integration tests link the app and spawn its binary for every
-# mutant. On a loaded runner that link can outlast the 20-second floor even
-# when the test itself fails at once, which would report a false timeout.
+# Building the desktop test binary links the whole GPUI tree and takes about ten
+# seconds on an idle host, so a loaded runner can spend longer than the
+# 20-second floor on the link alone and report a test that fails at once as a
+# timeout.
 minimum_test_timeout = 60
 
 exclude_re = [

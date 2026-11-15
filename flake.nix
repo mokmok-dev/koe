@@ -130,7 +130,7 @@
 
               # The facades reject `--all-features` and accept exactly one
               # platform feature, so the host feature is named per package.
-              hostFeatures = "koe-capture/${platformFeature},koe-transcribe/${platformFeature},koe-cli/${platformFeature},koe-desktop/${platformFeature}";
+              hostFeatures = "koe-capture/${platformFeature},koe-transcribe/${platformFeature},koe-desktop/${platformFeature}";
               # `clippy` and `test` share this so a narrower set cannot `cfg`
               # platform code out while the gate stays green.
               hostWorkspaceArgs = "--workspace --features ${hostFeatures}";
@@ -192,7 +192,7 @@
             let
               # The facades reject `--all-features` and accept exactly one
               # platform feature, so a release build names the host one.
-              releaseFeatures = "koe-capture/${platformFeature},koe-transcribe/${platformFeature},koe-cli/${platformFeature},koe-desktop/${platformFeature}";
+              releaseFeatures = "koe-capture/${platformFeature},koe-transcribe/${platformFeature},koe-desktop/${platformFeature}";
 
               # A release artifact tree is distinct from the debug tree the
               # checks build, so it is its own cache entry.
@@ -220,7 +220,6 @@
                   }
                 );
 
-              cli = releasePackage "koe-cli" "koe";
               desktop = releasePackage "koe-desktop" "koe-desktop";
 
               # `TCC` cannot grant the microphone or the system audio to a bare
@@ -308,7 +307,6 @@
               desktopTarball = pkgs.runCommandLocal "koe-desktop-${version}-${system}" { } ''
                 mkdir -p staging
                 install -m755 ${desktop}/bin/koe-desktop staging/koe-desktop
-                install -m755 ${cli}/bin/koe staging/koe
                 install -m644 ${./README.md} staging/README.md
                 mkdir -p "$out"
                 tar --format=ustar --sort=name --owner=0 --group=0 --numeric-owner \
@@ -317,7 +315,6 @@
               '';
             in
             {
-              koe-cli = cli;
               koe-desktop = desktop;
               default = desktop;
             }
