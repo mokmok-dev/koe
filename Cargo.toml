@@ -1,6 +1,5 @@
 [workspace]
 members = [
-  "apps/koe-cli",
   "apps/koe-desktop",
   "crates/koe-capture",
   "crates/koe-capture-core",
@@ -19,15 +18,6 @@ members = [
 resolver = "3"
 
 [workspace.dependencies]
-clap = { version = "4.6.7", default-features = false, features = [
-  "derive",
-  "error-context",
-  "help",
-  "std",
-  "suggestions",
-  "usage"
-] }
-ctrlc = "3.5.2"
 gpui-kit = "0.9.0"
 koe-capture = { path = "crates/koe-capture" }
 koe-capture-core = { path = "crates/koe-capture-core" }
