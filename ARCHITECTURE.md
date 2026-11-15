@@ -6,9 +6,11 @@ This file explains how the parts of the desktop app move. Read it before you cha
 
 It sits at the repo root so it is the first architecture file a reader finds beside `README.md`. The desktop README's Layout section links here too.
 
-Every claim here was read from the source at commit `85ed6b7`. Entries name symbols rather than line numbers, because line numbers drift and a symbol survives a rename of its neighbours. Section 6 gives the commands that check this file against the code.
+Every claim here was read from the source at commit `a53cded`. Entries name symbols rather than line numbers, because line numbers drift and a symbol survives a rename of its neighbours. Section 6 gives the commands that check this file against the code.
 
-Each diagram stays under 1000 units wide. Measured on the rendered page, every diagram at 1000 or less fills its frame exactly, and every diagram wider than that had its bottom cut off, by 262px on the threads figure and 1090px on the sequence figure. The labels are short and stacked to stay under that width. Section 6 measures a rewrite before you commit it.
+Each diagram stays under 1000 units wide. Every diagram at 1000 or less fills its frame exactly on the rendered page. A wider diagram had its bottom cut off there: the threads figure at 1053 units lost about a fifth of its height, and the sequence figure at 2108 units lost about half. The labels are short and stacked to stay under that width. Section 6 measures a rewrite before you commit it.
+
+Three details below are stated for the platform they hold on. `global-hotkey` runs a manager thread on X11 only: the macOS backend installs a Carbon and event-tap handler on the main run loop, and the Windows backend uses a hidden window plus a watcher thread per press. `tray-icon`'s menu-watcher thread belongs to its Linux `ksni` backend, and this crate builds `tray-icon` with `default-features = false` elsewhere, so macOS and Windows run no such thread.
 
 ## 1. Threads and lifetimes
 
@@ -18,16 +20,18 @@ Three lifetimes cover every thread. The process runs the GPUI loop, the frame lo
 | --- | --- | --- | --- | --- | --- |
 | GPUI main | `app::run` | process | GPUI | the platform event loop | `cx.quit()` |
 | frame loop | `cx.spawn` in `app::run` | process | nobody, the task is detached | `timer(delay)` or `Wake::wait` | never, `cx.quit()` ends the process |
-| `koe-recorder` | `engine::Session::start` | one take | `engine::Session` | joining its capture threads | the file is finalized and every session is finished |
+| `koe-recorder` | `engine::Session::start` | one take | nobody, the handle is dropped; `engine::Session` holds only the stop flag and the event receiver | joining its capture threads | the file is finalized and every session is finished |
 | capture thread, one per source | `scope.spawn` in `engine::run` | one take, one per source | `thread::scope` | `CaptureStream::read` | the stop flag is set and the blocking read returns |
 | `koe-transcript-model` | `engine::spawn_transcription` | one take | nobody, the handle is dropped | `MODEL_LOAD`, then `Transcriber::new` | a stop check, or the work finishes |
 | `koe-transcribe` | `actor::Task::spawn` | one stream, one per `LiveSession` | `LiveSession.handle` | `commands.recv()` | `Command::End`, or the command channel closes when `LiveSession` drops |
-| `koe-dictation` | `dictation_worker::Session::start` | one dictation | `dictation_worker::Session` | `CaptureStream::read` | the stop or cancel flag is set and the read returns |
+| `koe-dictation` | `dictation_worker::Session::start` | one dictation | nobody, the handle is dropped; `dictation_worker::Session` holds only the flags and the report receiver | `CaptureStream::read` | the stop or cancel flag is set and the read returns |
 | `koe-dictation-model` | `dictation_worker::capture` | one dictation | nobody, the handle is dropped | `MODEL_LOAD`, then `Transcriber::new` | a stop check, or the work finishes |
 | CoreAudio render callback | `render_callback` in `koe-capture-macos` | one capture stream | the HAL | invoked once per audio buffer | `AudioOutputUnitStop` in `Unit::drop`, when the stream drops |
-| `global-hotkey` manager | `Hotkeys::new` | process | `Hotkeys` | a 50 ms poll inside the library | `Drop` asks it to stop, and does not join it |
+| `global-hotkey` manager, X11 | `Hotkeys::new` | process | `Hotkeys` | a 50 ms poll inside the library | `Drop` asks it to stop, and does not join it |
 
-Two more threads come from libraries. `tray-icon`'s menu watcher is joined when `TrayIcon` drops. GPUI's background executor owns its own workers and timer thread.
+The recorder and dictation threads run to completion on their own. Neither `engine::Session` nor `dictation_worker::Session` can join its thread, so dropping a session asks it to stop and returns. `koe-transcribe` is the one worker whose handle a session keeps, which is why `LiveSession::finish` can wait for it.
+
+Two more threads come from libraries. GPUI's background executor owns its own workers and timer thread, and `tray-icon`'s Linux backend runs a menu watcher that is joined when `TrayIcon` drops.
 
 On Linux the capture read is `pa_simple_read` on the capture thread itself, so a Linux take spawns no extra thread for audio.
 
@@ -92,13 +96,14 @@ sequenceDiagram
     autonumber
     participant SH as Shell
     participant PH as Phase
-    participant RC as Recorder
+    participant RC as Recorder, capture
     participant TR as Transcribe
 
     Note over SH: start pressed
     SH->>PH: Event::Start(plan)
     PH-->>SH: Action::Start
     SH->>RC: Session::start
+    RC->>RC: scope spawns capture
     RC-->>SH: Opened
     SH->>PH: Event::Opened
     PH-->>SH: Arming to Recording
@@ -125,21 +130,25 @@ sequenceDiagram
     PH-->>SH: Done
 ```
 
+`feed`, the block loop, and `Opened` all run on a capture thread, not on `koe-recorder`. The recorder spawns one capture thread per source and later joins them. The diagram puts both in one column because a sequence line cannot show one thread spawning another, and a fifth column pushes the figure past the width GitHub draws.
+
 The shutdown order matters and the code comments say why. The capture threads stop first. The recorder finalizes the file next. Every recognition session finishes last, because `LiveSession::finish` can block inside the engine, and a stuck flush must not leave the audio file unfinalized.
 
 ## 3. Event types by layer
 
-Seven rows cover every type that crosses a thread boundary. Each layer restates what it needs in its own vocabulary.
+Seven rows cover every type that carries an event or a command across a thread boundary. Five more cross a boundary once, as the value a thread is started with or the result it produces, and they are listed after the table. Each layer restates what it needs in its own vocabulary.
 
 | Type | Crate and module | Variants | Produced by | Consumed by |
 | --- | --- | --- | --- | --- |
 | `EngineEvent` | `koe-transcribe-core`, recognition | `Committed`, `Volatile` | the speech backend | the actor, through `EngineSession::poll` |
 | `Event` | `koe-transcribe-core`, recognition | `Committed { text, start_ms, end_ms }`, `Volatile { text, revision }` | the actor's `drain` | `LiveSession::poll` on the caller's thread |
 | `Command` | `koe-transcribe`, session control | `Audio(Vec<f32>)`, `End` | `LiveSession::feed` and `finish` | the actor's `recv` loop |
-| `EngineEvent` | `koe-desktop::engine`, desktop | `Opened`, `Lost`, `Warning`, `Transcript`, `Draft`, `Finished` | the recorder, capture, and model threads | `Shell::poll_engine` |
+| `EngineEvent` | `koe-desktop::engine`, desktop | `Opened`, `Lost`, `Warning`, `Transcript`, `Draft`, `Finished` | the recorder and capture threads | `Shell::poll_engine` |
 | `state::Event` and `state::Action` | `koe-desktop::state`, state machine | `Start`, `Opened`, `Lost`, `Stop`, `Pause`, `Resume`, `Finished`, `Dismiss`, and `Start`, `Stop`, `Delete`, `Pause`, `Resume` | the shell, the tray, and the recorder's events | `Phase::reduce`, then `Shell::run` |
 | `DictationEvent` and `DictationAction` | `koe-desktop::dictation`, state machine | `Finished`, `Dismiss`, and `Start`, `Stop`, `Cancel`, `Refuse` | the worker report and the window | `Dictation::reduce`, then `DictationControl::run` |
-| `Report` | `koe-desktop::dictation_worker`, dictation worker | `Pending`, `Done(DictationOutcome)`, `Lost` | `koe-dictation` | `DictationControl::poll` |
+| `Report` | `koe-desktop::dictation_worker`, dictation worker | `Pending`, `Done(Box<DictationOutcome>)`, `Lost` | `koe-dictation` | `DictationControl::poll` |
+
+The values that cross once are the plan a thread starts with and the result it hands back. `SessionPlan` and `TranscriptionPlan` go from the shell into `engine::Session::start`, and `SessionPlan` carries a `TranscriptionPlan` holding the `Model` the model thread loads. `DictationPlan` does the same for a dictation. `Completion` comes back on `EngineEvent::Finished`, and `DictationOutcome` comes back on `Report::Done`.
 
 Two more types carry intent toward the shell. `tray::TrayAction` (`Start`, `Stop`, `CancelDictation`, `Show`, `ShowSettings`, `OpenFolder`, `Quit`) comes from the menu. `dictation_control::Press` (`Refused`, `Failed`) is the answer to one hotkey press. `Report` lives in the desktop worker. The recognition crates have no `Report`, and the press type is in `dictation_control`, not `hotkey`.
 
@@ -201,10 +210,10 @@ Which thread holds which end of each type. A dash means the thread never touches
 | GPUI main, the UI | `state::Event` into `Phase::reduce`, `DictationEvent` into `Dictation::reduce` | `EngineEvent` through `Session::poll`, `Report` through `DictationControl::poll`, `TrayAction`, press counts | `Shell::run` for each `Action` |
 | frame loop | nothing | nothing, it only calls `Shell::tick` | `Shell::tick`, `Wake::wait` |
 | `koe-recorder` | `Finished`, the `Draft` with empty text that clears a source's tail, and the `Warning` for a dead capture thread, a missing transcript, an incomplete one, or dropped audio | nothing | the joins, `Recorder::finish`, `LiveSession::finish` |
-| capture thread | `Opened`, `Lost`, `Transcript`, `Draft`, and the `Warning` for a dropped backlog or a stopped transcription | `Event` through `LiveSession::poll`, and the ready channel's `Result<LiveSession, String>` | `CaptureStream::read`, `Recorder::write` |
+| capture thread | `Opened`, `Lost`, `Transcript`, `Draft`, and the `Warning` for a dropped backlog or a stopped transcription | `Event` through `LiveSession::poll`, and the ready channel's `Result<LiveSession, String>` | `CaptureStream::read`, `Recorder::write`, `LiveSession::feed` |
 | `koe-transcript-model` | only the ready channel's `Result<LiveSession, String>`. The capture thread turns its error into the `Warning`, and the recorder turns a failed spawn into one | nothing | `Transcriber::new` and `transcriber.live` |
 | `koe-transcribe` | `Event`, the reply `Transcript` or `Incomplete`, `EngineEvent` from the backend | `Command` | `EngineSession::feed`, `finish`, and `poll` |
-| `koe-dictation` | `Report::Done`, `Command::Audio` and `Command::End` through `feed` and `finish` | `Event` through `LiveSession::poll` | the platform's text insertion |
+| `koe-dictation` | `Report::Done`, and `Command::Audio` and `Command::End` through `LiveSession::feed` and `finish` | `Event` through `LiveSession::poll` | the platform's text insertion |
 | `koe-dictation-model` | the ready channel's `Result<LiveSession, DesktopError>` | nothing | `Transcriber::new` and `transcriber.live` |
 | CoreAudio render callback | nothing | nothing | fills the capture pipeline's sink, so the capture thread's `read` has audio |
 | `global-hotkey` manager | press ids into the process-wide queue | nothing | the press count that `Hotkeys::presses` drains |
@@ -216,7 +225,7 @@ The recognition types stop at the actor. `Command` travels down into `koe-transc
 
 | Channel | Kind | Sender | Receiver |
 | --- | --- | --- | --- |
-| take events | unbounded `mpsc` | recorder, capture threads, model thread | `engine::Session.events` |
+| take events | unbounded `mpsc` | recorder and capture threads | `engine::Session.events` |
 | model ready, one per source | unbounded `mpsc` | `koe-transcript-model` | that source's capture thread |
 | dictation report | unbounded `mpsc`, one message | `koe-dictation` | `dictation_worker::Session.events` |
 | dictation model ready | unbounded `mpsc`, one message | `koe-dictation-model` | the `koe-dictation` thread |
@@ -250,6 +259,9 @@ stateDiagram-v2
     Arming --> Stopping: Stop
     Recording --> Stopping: Stop
     Paused --> Stopping: Stop
+    Arming --> Done: Finished, thread failed
+    Recording --> Done: Finished, before Stop
+    Paused --> Done: Finished, before Stop
     Stopping --> Done: Finished
     Done --> Idle: Dismiss
 ```
@@ -259,6 +271,7 @@ The variants carry payloads. `Arming` holds `live` and the `pending` sources. `R
 Rows that a linear `Idle` to `Done` story gets wrong.
 
 - `Done` is a start state. `Done` plus `Start` arms a new take, and a refused start puts the same `Done` back.
+- `Finished` reaches `Done` from four phases, not one. The usual path is `Stopping`, but `Arming`, `Recording`, and `Paused` each take it directly. A start that cannot spawn a thread finishes out of `Arming` on the spot, because `Shell::run` reduces `Event::Finished` after `engine::Session::start` fails.
 - `Stopping` has three causes. `Stop` gives `User`. The last `Lost` gives `AllSourcesLost` from either `Recording` or `Paused`. The last arming answer with nothing live gives `StartFailed`. `Stop` in `Stopping` is an explicit no-op, so the engine gets exactly one `Stop` per take.
 - Pause survives losing a source. `Paused` plus `Lost` stays paused until every source is gone.
 - A take stopped while paused keeps its frozen clock through `Stopping`, because `Live::elapsed` subtracts the open pause interval.
@@ -352,7 +365,7 @@ grep -n 'fn sleep\|TICK\|Duration::from_millis' apps/koe-desktop/src/app.rs
 grep -n 'fn reduce\|fn toggle\|fn cancel' apps/koe-desktop/src/state.rs apps/koe-desktop/src/dictation.rs
 ```
 
-The last match in the first grep is a thread that `wake.rs` starts inside a test. Every other match should have a row in section 1.
+The first match in the first grep is `thread::spawn` inside a `wake.rs` test, so read the output and skip it. Every other match is a thread in section 1, and the last is `koe-transcribe` in `crates/koe-transcribe/src/actor.rs`.
 
 Measure a rewritten diagram before you commit it. GitHub renders with Mermaid 12.2 at `securityLevel: "strict"`, `maxTextSize: 50000`, `maxEdges: 500`, and `layout: "elk"`. Render with that configuration, read the `viewBox` width of the SVG, and keep it at 1000 or less.
 
