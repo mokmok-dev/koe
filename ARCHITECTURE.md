@@ -379,7 +379,7 @@ nix shell nixpkgs#mermaid-cli --command mmdc -i /tmp/diagram.mmd -o /tmp/diagram
 grep -o 'viewBox="[^"]*"' /tmp/diagram.svg | head -1
 ```
 
-That local number is a rough lower bound and it uses the right layout, since the packaged `mermaid-cli` is 12.0.0 and its default is `elk`, the same as GitHub's 12.2. It is still not the same run. GitHub drew a Phase diagram measured at 918 locally at 1010, past the frame, and lost its bottom. The local number catches a figure that is clearly too wide. The live page is the check that decides.
+That local number is a rough lower bound, measured with the right layout: the packaged `mermaid-cli` is 12.0.0 and its default is `elk`, the same layout GitHub runs on 12.2. It is still not the same run. A Phase diagram that this command measured at 930 was drawn at 1010 on GitHub, past the frame, and lost its bottom. The local number catches a figure that is clearly too wide. The live page is the check that decides.
 
 A sequence diagram gets wider with each `participant`, and no message shortening brings five of them under the frame width, so keep a sequence diagram to four or fewer columns.
 
