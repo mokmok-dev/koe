@@ -8,7 +8,7 @@ It sits at the repo root so it is the first architecture file a reader finds bes
 
 Every claim here was read from the source at commit `a53cded`. Entries name symbols rather than line numbers, because line numbers drift and a symbol survives a rename of its neighbours. Section 6 gives the commands that check this file against the code.
 
-Each diagram stays under 1000 units wide. The wider ones were drawn taller than their frame on the rendered page and lost their bottom, the threads figure at 1053 units and the sequence figure at 2108. The labels are short and stacked to stay under that width. Section 6 measures a rewrite before you commit it.
+Each diagram stays well inside the frame GitHub draws it in, which is about 981 units wide at a 1400 pixel viewport. A diagram wider than that is drawn taller than its frame and loses its bottom, which happened to the threads figure and the sequence figure before their labels were shortened. Section 6 measures a rewrite before you commit it.
 
 Three details below are stated for the platform they hold on. `global-hotkey` runs a manager thread on X11 only: the macOS backend installs a Carbon and event-tap handler on the main run loop, and the Windows backend uses a hidden window plus a watcher thread per press. `tray-icon`'s menu-watcher thread belongs to its Linux `ksni` backend, and this crate builds `tray-icon` with `default-features = false` elsewhere, so macOS and Windows run no such thread.
 
@@ -144,11 +144,13 @@ Seven rows cover every type that carries an event or a command across a thread b
 | `EngineEvent` | `koe-desktop::engine`, desktop | `Opened`, `Lost`, `Warning`, `Transcript`, `Draft`, `Finished` | the recorder and capture threads | `Shell::poll_engine` |
 | `state::Event` and `state::Action` | `koe-desktop::state`, state machine | `Start`, `Opened`, `Lost`, `Stop`, `Pause`, `Resume`, `Finished`, `Dismiss`, and `Start`, `Stop`, `Delete`, `Pause`, `Resume` | the shell, the tray, and the recorder's events | `Phase::reduce`, then `Shell::run` |
 | `DictationEvent` and `DictationAction` | `koe-desktop::dictation`, state machine | `Finished`, `Dismiss`, and `Start`, `Stop`, `Cancel`, `Refuse` | the worker report and the window | `Dictation::reduce`, then `DictationControl::run` |
-| `Report` | `koe-desktop::dictation_worker`, dictation worker | `Pending`, `Done(Box<DictationOutcome>)`, `Lost` | `koe-dictation` | `DictationControl::poll` |
+| `Report` | `koe-desktop::dictation_worker`, dictation worker | `Pending`, `Done(Box<DictationOutcome>)`, `Lost` | `Session::poll`, on the thread that calls it | `DictationControl::poll` |
+
+`Report` is not a message. `Session::poll` builds it on the calling thread from what the channel holds, so `Pending` is an empty channel and `Lost` is a closed one. The thread sends `Box<DictationOutcome>`, and `Report` is the shape the shell reads that through.
 
 The values that cross once are the plan a thread starts with and the result it hands back. `SessionPlan` and `TranscriptionPlan` go from the shell into `engine::Session::start`, and `SessionPlan` carries a `TranscriptionPlan` holding the `Model` the model thread loads. `DictationPlan` does the same for a dictation. `Completion` comes back on `EngineEvent::Finished`, and `DictationOutcome` comes back on `Report::Done`.
 
-Two more types carry intent toward the shell. `tray::TrayAction` (`Start`, `Stop`, `CancelDictation`, `Show`, `ShowSettings`, `OpenFolder`, `Quit`) comes from the menu. `dictation_control::Press` (`Refused`, `Failed`) is the answer to one hotkey press. `Report` lives in the desktop worker. The recognition crates have no `Report`, and the press type is in `dictation_control`, not `hotkey`.
+Two more types carry intent toward the shell. `tray::TrayAction` (`Start`, `Stop`, `CancelDictation`, `Show`, `ShowSettings`, `OpenFolder`, `Quit`) comes from the menu. `dictation_control::Press` (`Refused`, `Failed`) is the answer to one hotkey press. The recognition crates have no `Report`, and the press type is in `dictation_control`, not `hotkey`.
 
 ```mermaid
 flowchart TD
@@ -211,11 +213,11 @@ Which thread holds which end of each type. A dash means the thread never touches
 | capture thread | `Opened`, `Lost`, `Transcript`, `Draft`, and the `Warning` for a dropped backlog or a stopped transcription | `Event` through `LiveSession::poll`, and the ready channel's `Result<LiveSession, String>` | `CaptureStream::read`, `Recorder::write`, `LiveSession::feed` |
 | `koe-transcript-model` | only the ready channel's `Result<LiveSession, String>`. The capture thread turns its error into the `Warning`, and the recorder turns a failed spawn into one | nothing | `Transcriber::new` and `transcriber.live` |
 | `koe-transcribe` | `Event`, the reply `Transcript` or `Incomplete` | `Command`, and the speech backend's `EngineEvent` | `EngineSession::feed`, `finish`, and `poll` |
-| `koe-dictation` | `Report::Done`, and `Command::Audio` and `Command::End` through `LiveSession::feed` and `finish` | `Event` through `LiveSession::poll` | the platform's text insertion |
+| `koe-dictation` | `Box<DictationOutcome>`, and `Command::Audio` and `Command::End` through `LiveSession::feed` and `finish` | `Event` through `LiveSession::poll` | the platform's text insertion |
 | `koe-dictation-model` | the ready channel's `Result<LiveSession, DesktopError>` | nothing | `Transcriber::new` and `transcriber.live` |
 | CoreAudio render callback | nothing | nothing | fills the capture pipeline's sink, so the capture thread's `read` has audio |
 | `global-hotkey` manager | press ids into the process-wide queue | nothing | the press count that `Hotkeys::presses` drains |
-| `tray-icon` menu watcher | `TrayAction` into the tray queue | nothing | nothing in koe |
+| `tray-icon` menu watcher and its ksni service thread | `TrayAction` into the tray queue, from the menu event handler | nothing | nothing in koe |
 
 The recognition types stop at the actor. `Command` travels down into `koe-transcribe` and `Event` travels back up, and neither reaches the shell. The desktop layer restates what it needs as `engine::EngineEvent`. The dictation path does hand one recognition type to the shell, as plain text: `LiveText` becomes the `String` the HUD reads, so no `Event` value is stored in the shell.
 
@@ -251,6 +253,7 @@ stateDiagram-v2
     Arming --> Recording: one live
     Arming --> Stopping: none live
     Recording --> Recording: Lost
+    Paused --> Paused: Lost
     Recording --> Stopping: last Lost
     Paused --> Stopping: last Lost
     Recording --> Paused: Pause
@@ -258,6 +261,7 @@ stateDiagram-v2
     Arming --> Stopping: Stop
     Recording --> Stopping: Stop
     Paused --> Stopping: Stop
+    Stopping --> Stopping: Stop, ignored
     Arming --> Done: Finished
     Recording --> Done: Finished
     Paused --> Done: Finished
@@ -366,7 +370,7 @@ grep -n 'fn reduce\|fn toggle\|fn cancel' apps/koe-desktop/src/state.rs apps/koe
 
 The first match in the first grep is `thread::spawn` inside a `wake.rs` test, so read the output and skip it. Every other match is a thread in section 1, and the last is `koe-transcribe` in `crates/koe-transcribe/src/actor.rs`.
 
-Measure a rewritten diagram before you commit it, then confirm it on the rendered page. Keep the width under 950, measured with `mmdc`'s default layout.
+Measure a rewritten diagram before you commit it, then confirm it on the rendered page. Aim for a local measurement of 700 or less.
 
 ```console
 cd "$(git rev-parse --show-toplevel)"
@@ -375,7 +379,7 @@ nix shell nixpkgs#mermaid-cli --command mmdc -i /tmp/diagram.mmd -o /tmp/diagram
 grep -o 'viewBox="[^"]*"' /tmp/diagram.svg | head -1
 ```
 
-That local number is a lower bound, not the truth. GitHub renders Mermaid 12.2 with the `elk` layout, while the packaged `mermaid-cli` is 12.0.0 and uses `dagre`. On the six diagrams here `dagre` lands within about 12 units of a local `elk` run, and GitHub's own `elk` run came out around 10% wider than the local one. A state diagram at 930 locally was drawn at 1010 on GitHub, past the 981 a frame holds, and lost its bottom. The lesson is the live check, not the number.
+That local number is a rough lower bound. GitHub renders Mermaid 12.2 with the `elk` layout, while the packaged `mermaid-cli` is 12.0.0 and uses `dagre`. On these diagrams the two local layouts differ by up to about 70 units, and GitHub's own run came out wider than either. A Phase diagram measured at 918 locally was drawn at 1010 on GitHub and lost its bottom. The local number tells you a figure is too wide long before GitHub does, and the live page is the check that decides.
 
 A sequence diagram gets wider with each `participant`, and no message shortening brings five of them under 1000, so keep a sequence diagram to four or fewer columns.
 
