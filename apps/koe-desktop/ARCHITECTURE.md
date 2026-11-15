@@ -8,6 +8,8 @@ The diagrams live here rather than under the README's Layout section for two rea
 
 Every claim here was read from the source at commit `85ed6b7`. Entries name symbols rather than line numbers, because line numbers drift and a symbol survives a rename of its neighbours. Section 6 gives the commands that check this file against the code.
 
+Each diagram stays under 1000 units wide. Measured on the rendered page, every diagram at 1000 or less fills its frame exactly, and every diagram wider than that had its bottom cut off, by 262px on the threads figure and 1090px on the sequence figure. The labels are short and stacked to stay under that width. Section 6 measures a rewrite before you commit it.
+
 ## 1. Threads and lifetimes
 
 Three lifetimes cover every thread. The process runs the GPUI loop, the frame loop, the hotkey manager, and the tray watcher. A take runs a recorder thread, one capture thread per source, one model thread, and one recognition thread per source. A dictation runs one worker thread, one model thread, and one recognition thread.
@@ -31,43 +33,41 @@ On Linux the capture read is `pa_simple_read` on the capture thread itself, so a
 
 ```mermaid
 flowchart TD
-    subgraph proc["Process lifetime"]
-        UI["GPUI main thread<br/>app::run"]
-        LOOP["frame loop<br/>cx.spawn in app::run"]
-        HK["global-hotkey manager<br/>hotkey::Hotkeys"]
-        TRAY["tray-icon menu watcher<br/>tray::Tray"]
+    subgraph proc["Process"]
+        UI["GPUI main<br/>app::run"]
+        LOOP["frame loop<br/>cx.spawn"]
+        HK["hotkey<br/>manager"]
+        TRAY["tray<br/>watcher"]
     end
 
     subgraph take["One take"]
-        REC["koe-recorder<br/>engine::Session::start"]
-        SRC["capture thread, one per source<br/>thread::scope in engine::run"]
-        MODEL["koe-transcript-model<br/>engine::spawn_transcription"]
-        TR["koe-transcribe<br/>actor::Task::spawn"]
-        HAL["CoreAudio render callback<br/>koe-capture-macos render_callback"]
+        REC["koe-recorder<br/>engine::Session"]
+        SRC["capture<br/>per source"]
+        MODEL["transcript<br/>model"]
+        TR["koe-transcribe"]
+        HAL["render<br/>callback"]
     end
 
     subgraph dict["One dictation"]
-        DICT["koe-dictation<br/>dictation_worker::Session::start"]
-        DMODEL["koe-dictation-model<br/>dictation_worker::capture"]
-        DTR["koe-transcribe<br/>one per LiveSession"]
+        DICT["koe-dictation"]
+        DMODEL["dictation<br/>model"]
+        DTR["koe-transcribe"]
     end
 
     UI --> LOOP
-    LOOP -->|"Shell::tick, then sleep"| UI
-    LOOP -->|"Session::start"| REC
-    LOOP -->|"Session::start"| DICT
-    HK -->|"GlobalHotKeyEvent, press queue"| LOOP
-    TRAY -->|"TrayAction queue"| LOOP
-
-    REC -->|"thread::scope"| SRC
+    LOOP -->|"tick"| UI
+    HK -->|"presses"| LOOP
+    TRAY -->|"actions"| LOOP
+    LOOP -->|"start"| REC
+    LOOP -->|"start"| DICT
+    REC -->|"scope"| SRC
     REC -->|"spawn"| MODEL
-    MODEL -->|"Transcriber::live starts it"| TR
-    SRC -->|"feed, then finish"| TR
-    HAL -->|"renders into the queue that read drains"| SRC
-
+    MODEL -->|"live"| TR
+    SRC -->|"feed"| TR
+    HAL -->|"queue"| SRC
     DICT -->|"spawn"| DMODEL
-    DMODEL -->|"Transcriber::live starts it"| DTR
-    DICT -->|"feed, then finish"| DTR
+    DMODEL -->|"live"| DTR
+    DICT -->|"feed"| DTR
 ```
 
 ### Which thread waits on which
@@ -90,52 +90,39 @@ The normal path of one microphone take. `Level`, `Warning`, and the second sourc
 ```mermaid
 sequenceDiagram
     autonumber
-    actor U as User
-    participant SH as Shell, UI thread
+    participant SH as Shell
     participant PH as Phase
-    participant RC as koe-recorder
-    participant CP as capture thread
-    participant TR as koe-transcribe
-    participant MD as koe-transcript-model
+    participant RC as Recorder
+    participant TR as Transcribe
 
-    U->>SH: start
+    Note over SH: start pressed
     SH->>PH: Event::Start(plan)
     PH-->>SH: Action::Start
-    SH->>RC: Session::start(plan)
-    RC->>MD: spawn
-    MD->>MD: take MODEL_LOAD, open the model
-    RC->>CP: thread::scope spawn
-    CP->>CP: koe_capture::open
-    CP-->>SH: EngineEvent::Opened [mpsc]
-    SH->>PH: Event::Opened(source)
+    SH->>RC: Session::start
+    RC-->>SH: Opened
+    SH->>PH: Event::Opened
     PH-->>SH: Arming to Recording
 
-    loop every capture block
-        CP->>CP: CaptureStream::read
-        CP->>CP: Recorder::write
-        MD-->>CP: LiveSession over the ready channel
-        CP->>TR: LiveSession::feed, try_send
-        TR-->>CP: Event::Committed or Volatile
-        CP-->>SH: EngineEvent::Transcript, Draft, Level [mpsc]
+    loop each block
+        RC->>TR: feed
+        TR-->>RC: Committed
+        RC-->>SH: Transcript, Draft
     end
 
-    loop every tick while the phase is active
-        SH->>RC: Session::poll, try_recv
+    loop each tick
+        SH->>RC: poll
     end
 
-    U->>SH: stop
+    Note over SH: stop pressed
     SH->>PH: Event::Stop
     PH-->>SH: Action::Stop
-    SH->>RC: Session::stop, sets the atomic flag
-    CP->>CP: next block sees the flag and breaks
-    CP-->>RC: SourceExit, holding the LiveSession
-    RC->>RC: join every capture thread
-    RC->>RC: Recorder::finish
-    RC->>TR: LiveSession::finish, Command::End then join
-    TR-->>RC: Result of Transcript or Incomplete
-    RC-->>SH: EngineEvent::Finished(Completion)
-    SH->>PH: Event::Finished(completion)
-    PH-->>SH: Done, plus Action::Delete when no frames were written
+    SH->>RC: stop flag
+    RC->>RC: join, finalize
+    RC->>TR: End, join
+    TR-->>RC: Transcript
+    RC-->>SH: Finished
+    SH->>PH: Event::Finished
+    PH-->>SH: Done
 ```
 
 The shutdown order matters and the code comments say why. The capture threads stop first. The recorder finalizes the file next. Every recognition session finishes last, because `LiveSession::finish` can block inside the engine, and a stuck flush must not leave the audio file unfinalized.
@@ -157,46 +144,31 @@ Seven rows cover every type that crosses a thread boundary. Each layer restates 
 Two more types carry intent toward the shell. `tray::TrayAction` (`Start`, `Stop`, `CancelDictation`, `Show`, `ShowSettings`, `OpenFolder`, `Quit`) comes from the menu. `dictation_control::Press` (`Refused`, `Failed`) is the answer to one hotkey press. `Report` lives in the desktop worker. The recognition crates have no `Report`, and the press type is in `dictation_control`, not `hotkey`.
 
 ```mermaid
-flowchart LR
-    subgraph rec["Recognition, koe-transcribe-core"]
-        CE["EngineEvent<br/>Committed, Volatile"]
-        CEv["Event<br/>Committed, Volatile with revision"]
-    end
+flowchart TD
+    CMD["session: Command<br/>Audio, End"]
+    CE["recognition: EngineEvent<br/>Committed, Volatile"]
+    CEv["recognition: Event<br/>with revision"]
+    REPLY["session: reply<br/>Transcript"]
+    DE["desktop: EngineEvent<br/>Opened, Lost, Level<br/>Warning, Transcript<br/>Draft, Finished"]
+    SE["machine: state Event<br/>and Action"]
+    DDE["machine: DictationEvent<br/>and Action"]
+    REPT["worker: Report<br/>Pending, Done, Lost"]
+    PRESS["worker: Press<br/>Refused, Failed"]
+    TA["source: TrayAction"]
+    HKEV["source: GlobalHotKeyEvent"]
+    SURF["surface: window,<br/>HUD, tray"]
 
-    subgraph ses["Session control, koe-transcribe"]
-        CMD["Command<br/>Audio, End"]
-        REPLY["reply<br/>Transcript or Incomplete"]
-    end
-
-    subgraph desk["Desktop, koe-desktop::engine"]
-        DE["EngineEvent<br/>Opened, Lost, Level, Warning<br/>Transcript, Draft, Finished"]
-    end
-
-    subgraph mach["State machines, state and dictation"]
-        SE["state::Event and Action"]
-        DDE["DictationEvent and Action"]
-    end
-
-    subgraph work["Worker control"]
-        REPT["Report<br/>Pending, Done, Lost"]
-        PRESS["Press<br/>Refused, Failed"]
-    end
-
-    TA["TrayAction"]
-    HKEV["GlobalHotKeyEvent"]
-    SURF["window, HUD, tray"]
-
-    CMD -->|"feeds and ends the actor"| CE
-    CE -->|"actor::Task::drain"| CEv
-    CEv -->|"engine::drain"| DE
-    CEv -->|"LiveText::apply, dictation only"| SURF
-    REPLY -->|"LiveSession::finish"| DE
-    DE -->|"Shell::poll_engine"| SE
-    DE -->|"Shell::poll_engine"| SURF
-    REPT -->|"DictationControl::poll"| DDE
-    PRESS -->|"Shell::tick"| SURF
-    TA -->|"Shell::handle_tray"| SE
-    HKEV -->|"DictationControl::toggle"| PRESS
+    CMD --> CE
+    CE -->|"actor drain"| CEv
+    CEv -->|"engine drain"| DE
+    CEv -->|"LiveText"| SURF
+    REPLY --> DE
+    DE -->|"poll_engine"| SE
+    DE -->|"poll_engine"| SURF
+    REPT -->|"control poll"| DDE
+    PRESS --> SURF
+    TA -->|"handle_tray"| SE
+    HKEV -->|"toggle"| PRESS
 ```
 
 ### Conversions
@@ -267,18 +239,18 @@ The recognition command queue is the only bounded data channel a producer can ov
 ```mermaid
 stateDiagram-v2
     [*] --> Idle
-    Idle --> Arming: Start(plan)
-    Done --> Arming: Start(plan)
-    Arming --> Arming: Opened or Lost, a source is still pending
-    Arming --> Recording: every source answered, one is live
-    Arming --> Stopping: every source answered, none is live, StartFailed
-    Recording --> Stopping: Lost, last live source, AllSourcesLost
-    Paused --> Stopping: Lost, last live source, AllSourcesLost
+    Idle --> Arming: Start
+    Done --> Arming: Start
+    Arming --> Arming: source pending
+    Arming --> Recording: one live
+    Arming --> Stopping: none live
+    Recording --> Stopping: last Lost
+    Paused --> Stopping: last Lost
     Recording --> Paused: Pause
     Paused --> Recording: Resume
-    Arming --> Stopping: Stop, User
-    Recording --> Stopping: Stop, User
-    Paused --> Stopping: Stop, User
+    Arming --> Stopping: Stop
+    Recording --> Stopping: Stop
+    Paused --> Stopping: Stop
     Stopping --> Done: Finished
     Done --> Idle: Dismiss
 ```
@@ -382,6 +354,16 @@ grep -n 'fn reduce\|fn toggle\|fn cancel' apps/koe-desktop/src/state.rs apps/koe
 ```
 
 The last match in the first grep is a thread that `wake.rs` starts inside a test. Every other match should have a row in section 1.
+
+Measure a rewritten diagram before you commit it. GitHub renders with Mermaid 12.2 at `securityLevel: "strict"`, `maxTextSize: 50000`, `maxEdges: 500`, and `layout: "elk"`. Render with that configuration, read the `viewBox` width of the SVG, and keep it at 1000 or less.
+
+```console
+# mermaid-cli 12 renders as GitHub does; read width and height from the SVG
+nix shell nixpkgs#mermaid-cli --command mmdc -i /tmp/diagram.mmd -o /tmp/diagram.svg
+grep -o 'viewBox="[^"]*"' /tmp/diagram.svg | head -1
+```
+
+A sequence diagram gets wider with each `participant`, and no message shortening brings five of them under 1000, so keep a sequence diagram to four or fewer columns.
 
 `cargo test -p koe-desktop --features linux` covers the state machines and the sleep branches, so a transition or tick change that this file has not caught will usually fail there first.
 
