@@ -186,6 +186,26 @@ mod tests {
     }
 
     #[test]
+    fn a_dropped_wait_leaves_no_waker_to_release() {
+        let wake = Wake::default();
+        let counts = Arc::new(Counts::default());
+        let waker = Waker::from(Arc::clone(&counts));
+        let mut cx = Context::from_waker(&waker);
+        {
+            let mut notified = pin!(wake.wait());
+            assert!(notified.as_mut().poll(&mut cx).is_pending());
+        }
+        // The loop moved on — its timer won the wait — so the waker it
+        // registered is gone and a later result must not reschedule that
+        // future. The flag below is still set, so the next wait returns at
+        // once and the result is not lost.
+        wake.wake();
+        assert_eq!(counts.0.load(Ordering::SeqCst), 0);
+        let mut next = pin!(wake.wait());
+        assert!(next.as_mut().poll(&mut cx).is_ready());
+    }
+
+    #[test]
     fn consuming_the_pending_wake_clears_it() {
         let wake = Wake::default();
         assert!(!wake.consume());

@@ -733,6 +733,27 @@ mod tests {
     }
 
     #[test]
+    fn a_session_hands_out_the_wake_its_transcript_marks() {
+        let thread_side = LiveTranscript::default();
+        let (_sender, events) = std::sync::mpsc::channel();
+        let session = Session {
+            stop: Arc::new(AtomicBool::new(false)),
+            cancel: Arc::new(AtomicBool::new(false)),
+            events,
+            transcript: thread_side.clone(),
+        };
+        let shell_side = session.wake();
+        assert!(!shell_side.consume());
+        // A fold through the session's own transcript must reach the wake this
+        // session handed out, not a fresh one.
+        thread_side.apply(&Event::Volatile {
+            text: "hi".into(),
+            revision: 1,
+        });
+        assert!(shell_side.consume());
+    }
+
+    #[test]
     fn a_session_reports_the_transcript_its_thread_publishes() {
         let thread_side = LiveTranscript::default();
         let (_sender, events) = std::sync::mpsc::channel();
