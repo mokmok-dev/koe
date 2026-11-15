@@ -185,6 +185,9 @@ impl Shell {
         }
         changed |= presses > 0;
         changed |= self.poll_engine();
+        // The take panel's timer advances once a second, and a silent take
+        // sends no engine event, so the active phase asks for a repaint.
+        changed |= self.phase.is_active();
         if let Some(message) = self.dictation_control.poll() {
             self.notice = Some(message);
             changed = true;
