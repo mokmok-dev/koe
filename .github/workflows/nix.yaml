@@ -13,7 +13,8 @@ concurrency:
   cancel-in-progress: true
 jobs:
   DeterminateCI:
-    uses: DeterminateSystems/ci/.github/workflows/workflow.yml@main
+    # Pinned to a commit because the upstream repo publishes no tags.
+    uses: DeterminateSystems/ci/.github/workflows/workflow.yml@5cab898d6bd3b3e63204d665b76c7fb3d7724e96
     permissions:
       id-token: write
       contents: read
