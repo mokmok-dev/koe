@@ -109,15 +109,6 @@ impl Sources {
             .into_iter()
             .filter(move |source| self.contains(*source))
     }
-
-    /// Index of `source` in the per-source level arrays.
-    #[must_use]
-    pub const fn index(source: Source) -> usize {
-        match source {
-            Source::Microphone => 0,
-            Source::SystemAudio => 1,
-        }
-    }
 }
 
 impl From<Source> for Sources {
@@ -995,8 +986,6 @@ mod tests {
         );
         assert_eq!(Sources::from(Source::Microphone), Sources::MICROPHONE);
         assert_eq!(Sources::from(Source::SystemAudio), Sources::SYSTEM_AUDIO);
-        assert_eq!(Sources::index(Source::Microphone), 0);
-        assert_eq!(Sources::index(Source::SystemAudio), 1);
     }
 
     #[test]

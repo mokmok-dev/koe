@@ -28,9 +28,6 @@ pub const SAMPLE_RATE: u32 = 48_000;
 /// Frames each capture thread hands the recorder per read.
 const BLOCK_FRAMES: usize = 960;
 
-/// How often a source reports its peak level.
-const LEVEL_INTERVAL: Duration = Duration::from_millis(100);
-
 /// What the UI asked the recorder to write.
 #[derive(Clone, Debug)]
 pub struct SessionPlan {
@@ -96,13 +93,6 @@ pub enum EngineEvent {
         source: Source,
         /// Why it went away.
         message: String,
-    },
-    /// The peak sample of a block, for the HUD meter.
-    Level {
-        /// Source the level came from.
-        source: Source,
-        /// Peak absolute sample in `0.0..=1.0`.
-        level: f32,
     },
     /// A non-fatal problem the user should see.
     Warning(String),
@@ -381,7 +371,7 @@ fn spawn_transcription(
 
 #[allow(
     clippy::too_many_lines,
-    reason = "one loop owns the recorder, the level probe, and the transcription of one source; splitting it would scatter the state each block updates"
+    reason = "one loop owns the recorder and the transcription of one source; splitting it would scatter the state each block updates"
 )]
 fn pump(
     source: Source,
@@ -418,7 +408,6 @@ fn pump(
     if let Some(stream) = stream.as_mut() {
         let channels = usize::from(spec.channels());
         let mut buffer = vec![0.0_f32; channels * BLOCK_FRAMES];
-        let mut last_level = Instant::now();
         loop {
             if stop.load(Ordering::Acquire) {
                 break;
@@ -469,13 +458,6 @@ fn pump(
                         started = true;
                     }
                     let paused_now = paused.load(Ordering::Acquire);
-                    if last_level.elapsed() >= LEVEL_INTERVAL {
-                        last_level = Instant::now();
-                        let _ = sender.send(EngineEvent::Level {
-                            source,
-                            level: if paused_now { 0.0 } else { peak(samples) },
-                        });
-                    }
                     if paused_now {
                         // Keep draining so the platform does not back up; the
                         // resume shifts the transcript clock past the gap.
@@ -727,13 +709,6 @@ fn audio_ms(samples: usize, channels: usize, rate: u32) -> u64 {
 
 fn warn(sender: &Sender<EngineEvent>, message: String) {
     let _ = sender.send(EngineEvent::Warning(message));
-}
-
-fn peak(samples: &[f32]) -> f32 {
-    samples
-        .iter()
-        .map(|sample| sample.abs())
-        .fold(0.0_f32, f32::max)
 }
 
 fn finish(
@@ -1127,11 +1102,5 @@ mod tests {
             SessionPlan::meeting(PathBuf::from("take.ogg"), Sources::EMPTY),
             Err(DesktopError::NoSources)
         ));
-    }
-
-    #[test]
-    fn peak_tracks_the_largest_absolute_sample() {
-        assert!((peak(&[0.1, -0.8, 0.3]) - 0.8).abs() < f32::EPSILON);
-        assert_eq!(peak(&[]), 0.0);
     }
 }

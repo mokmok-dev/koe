@@ -17,7 +17,6 @@ use gpui_kit::component::{
     h_flex,
     input::{Input, InputEvent, InputState},
     message::{Message, MessageAlignment, MessageContent, MessageHeader},
-    progress::Progress,
     scroll::ScrollableElement as _,
     searchable_list::SearchableVec,
     select::{Select, SelectEvent, SelectState},
@@ -35,7 +34,7 @@ use crate::hotkey;
 use crate::hud;
 use crate::language;
 use crate::settings;
-use crate::state::{Done, Phase, Sources};
+use crate::state::{Done, Phase};
 use crate::transcript::Speaker;
 
 const LIVE: u32 = 0x007E_E787;
@@ -187,17 +186,14 @@ impl MainView {
 
 impl MainView {
     /// The take controls shared by the meeting and recorder screens: the phase
-    /// card, the meters, and the start or stop button.
+    /// card and the start or stop button.
     fn take_panel(&self, shell: &Shell, cx: &Context<Self>) -> AnyElement {
         let entity = self.shell.clone();
         let theme = cx.theme();
         let phase = &shell.phase;
-        let active = phase.is_active();
         let can_start = phase.can_start();
         let can_stop = phase.can_stop();
         let elapsed = phase.elapsed(Instant::now());
-        let live = phase.live();
-        let levels = shell.levels;
         let detail = detail(phase);
         let tone = phase_tone(phase);
 
@@ -233,42 +229,34 @@ impl MainView {
             .gap(px(14.0))
             .child(
                 GroupBox::new().outline().child(
-                    v_flex()
-                        .gap(px(10.0))
-                        .child(
-                            h_flex()
-                                .items_center()
-                                .gap(px(10.0))
-                                .child(div().size(px(14.0)).rounded_full().bg(tone))
-                                .child(
-                                    v_flex()
-                                        .flex_1()
-                                        .child(
-                                            div()
-                                                .text_base()
-                                                .font_weight(FontWeight::SEMIBOLD)
-                                                .child(phase.label()),
-                                        )
-                                        .child(
-                                            div()
-                                                .text_xs()
-                                                .text_color(theme.muted_foreground)
-                                                .child(detail),
-                                        ),
-                                )
-                                .children(elapsed.map(|elapsed| {
-                                    div()
-                                        .text_2xl()
-                                        .font_family("monospace")
-                                        .child(hud::elapsed_text(elapsed))
-                                })),
-                        )
-                        .children(active.then(|| {
-                            v_flex()
-                                .gap_2()
-                                .child(meter("Mic", Source::Microphone, levels, live))
-                                .child(meter("System", Source::SystemAudio, levels, live))
-                        })),
+                    v_flex().gap(px(10.0)).child(
+                        h_flex()
+                            .items_center()
+                            .gap(px(10.0))
+                            .child(div().size(px(14.0)).rounded_full().bg(tone))
+                            .child(
+                                v_flex()
+                                    .flex_1()
+                                    .child(
+                                        div()
+                                            .text_base()
+                                            .font_weight(FontWeight::SEMIBOLD)
+                                            .child(phase.label()),
+                                    )
+                                    .child(
+                                        div()
+                                            .text_xs()
+                                            .text_color(theme.muted_foreground)
+                                            .child(detail),
+                                    ),
+                            )
+                            .children(elapsed.map(|elapsed| {
+                                div()
+                                    .text_2xl()
+                                    .font_family("monospace")
+                                    .child(hud::elapsed_text(elapsed))
+                            })),
+                    ),
                 ),
             )
             .child(primary)
@@ -890,33 +878,6 @@ fn model_hint(text: &str, shell: &Shell) -> String {
         }
     }
     "The GGUF file dictation and meeting transcripts use".to_owned()
-}
-
-fn meter(name: &str, source: Source, levels: [f32; 2], live: Sources) -> impl IntoElement {
-    let index = Sources::index(source);
-    let level = levels[index];
-    let level = if level.is_finite() {
-        level.clamp(0.0, 1.0)
-    } else {
-        0.0
-    };
-    h_flex()
-        .items_center()
-        .gap_2()
-        .child(
-            div()
-                .w(px(56.0))
-                .text_xs()
-                .text_color(rgb(IDLE))
-                .child(name.to_owned()),
-        )
-        .child(
-            Progress::new(format!("meter-{index}"))
-                .value(level * 100.0)
-                .color(rgb(if live.contains(source) { LIVE } else { IDLE }))
-                .with_size(px(6.0))
-                .flex_1(),
-        )
 }
 
 /// One transcript row: a finalized utterance or a draft the engine is revising.
