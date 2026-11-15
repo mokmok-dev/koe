@@ -1,10 +1,10 @@
 # koe desktop architecture
 
-This file explains how the parts of the desktop app move. Read it before you change `src/app.rs`, `src/engine.rs`, `src/dictation_worker.rs`, or `src/state.rs`.
+This file explains how the parts of the desktop app move. Read it before you change `apps/koe-desktop/src/app.rs`, `apps/koe-desktop/src/engine.rs`, `apps/koe-desktop/src/dictation_worker.rs`, or `apps/koe-desktop/src/state.rs`.
 
-`README.md` says what the app does and why it is built on GPUI and `tray-icon`. This file says which thread does what, which event type crosses which boundary, and which thread waits on which.
+`apps/koe-desktop/README.md` says what the app does and why it is built on GPUI and `tray-icon`. This file says which thread does what, which event type crosses which boundary, and which thread waits on which.
 
-The diagrams live here rather than under the README's Layout section for two reasons. They add about 70 lines of Mermaid on top of five tables, which would push the README's Layout table off the screen for a reader looking up a file's role. And the README is the page a user reads to install and run the app, so the runtime model belongs one link away. The Layout section links here instead.
+It sits at the repo root so it is the first architecture file a reader finds beside `README.md`. The desktop README's Layout section links here too.
 
 Every claim here was read from the source at commit `85ed6b7`. Entries name symbols rather than line numbers, because line numbers drift and a symbol survives a rename of its neighbours. Section 6 gives the commands that check this file against the code.
 
@@ -85,7 +85,7 @@ A panic in `koe-recorder` before it sends `Finished` leaves the shell with `sess
 
 ## 2. One take, end to end
 
-The normal path of one microphone take. `Level`, `Warning`, and the second source are left out.
+The normal path of one microphone take. `Warning` and the second source are left out.
 
 ```mermaid
 sequenceDiagram
@@ -136,7 +136,7 @@ Seven rows cover every type that crosses a thread boundary. Each layer restates 
 | `EngineEvent` | `koe-transcribe-core`, recognition | `Committed`, `Volatile` | the speech backend | the actor, through `EngineSession::poll` |
 | `Event` | `koe-transcribe-core`, recognition | `Committed { text, start_ms, end_ms }`, `Volatile { text, revision }` | the actor's `drain` | `LiveSession::poll` on the caller's thread |
 | `Command` | `koe-transcribe`, session control | `Audio(Vec<f32>)`, `End` | `LiveSession::feed` and `finish` | the actor's `recv` loop |
-| `EngineEvent` | `koe-desktop::engine`, desktop | `Opened`, `Lost`, `Level`, `Warning`, `Transcript`, `Draft`, `Finished` | the recorder, capture, and model threads | `Shell::poll_engine` |
+| `EngineEvent` | `koe-desktop::engine`, desktop | `Opened`, `Lost`, `Warning`, `Transcript`, `Draft`, `Finished` | the recorder, capture, and model threads | `Shell::poll_engine` |
 | `state::Event` and `state::Action` | `koe-desktop::state`, state machine | `Start`, `Opened`, `Lost`, `Stop`, `Pause`, `Resume`, `Finished`, `Dismiss`, and `Start`, `Stop`, `Delete`, `Pause`, `Resume` | the shell, the tray, and the recorder's events | `Phase::reduce`, then `Shell::run` |
 | `DictationEvent` and `DictationAction` | `koe-desktop::dictation`, state machine | `Finished`, `Dismiss`, and `Start`, `Stop`, `Cancel`, `Refuse` | the worker report and the window | `Dictation::reduce`, then `DictationControl::run` |
 | `Report` | `koe-desktop::dictation_worker`, dictation worker | `Pending`, `Done(DictationOutcome)`, `Lost` | `koe-dictation` | `DictationControl::poll` |
@@ -149,7 +149,7 @@ flowchart TD
     CE["recognition: EngineEvent<br/>Committed, Volatile"]
     CEv["recognition: Event<br/>with revision"]
     REPLY["session: reply<br/>Transcript"]
-    DE["desktop: EngineEvent<br/>Opened, Lost, Level<br/>Warning, Transcript<br/>Draft, Finished"]
+    DE["desktop: EngineEvent<br/>Opened, Lost, Warning<br/>Transcript, Draft,<br/>Finished"]
     SE["machine: state Event<br/>and Action"]
     DDE["machine: DictationEvent<br/>and Action"]
     REPT["worker: Report<br/>Pending, Done, Lost"]
@@ -184,11 +184,10 @@ flowchart TD
 | a segment past the last emitted one | `EngineEvent::Transcript` | `engine::finish_transcription` | replays what a batch model reports at the stop |
 | end of a source | `EngineEvent::Draft` with empty text | `engine::finish_transcription` | the empty text is the clear signal |
 | a device or recorder error | `EngineEvent::Lost` | `engine::pump` | the error's `Display` becomes `message` |
-| the peak of a block | `EngineEvent::Level` | `engine::pump` | every 100 ms, zero while paused |
 | `EngineEvent::Opened` | `state::Event::Opened` | `Shell::poll_engine` | unchanged |
 | `EngineEvent::Lost` | `state::Event::Lost` | `Shell::poll_engine` | also sets the window notice |
 | `EngineEvent::Finished` | `state::Event::Finished` | `Shell::poll_engine` | saves the transcripts first, then reduces |
-| `EngineEvent::Level`, `Warning`, `Transcript`, `Draft` | shell fields | `Shell::poll_engine` | drawn and never reduced into the phase |
+| `EngineEvent::Warning`, `Transcript`, `Draft` | shell fields | `Shell::poll_engine` | drawn and never reduced into the phase |
 | `Report::Done` | `DictationEvent::Finished` | `DictationControl::poll` | unchanged |
 | `Report::Lost` | `DictationEvent::Finished` | `DictationControl::poll` | synthesizes a `Thread` failure so no state waits forever |
 | `Report::Pending` | nothing | `DictationControl::poll` | returns early |
@@ -202,7 +201,7 @@ Which thread holds which end of each type. A dash means the thread never touches
 | GPUI main, the UI | `state::Event` into `Phase::reduce`, `DictationEvent` into `Dictation::reduce` | `EngineEvent` through `Session::poll`, `Report` through `DictationControl::poll`, `TrayAction`, press counts | `Shell::run` for each `Action` |
 | frame loop | nothing | nothing, it only calls `Shell::tick` | `Shell::tick`, `Wake::wait` |
 | `koe-recorder` | `Finished`, the `Draft` with empty text that clears a source's tail, and the `Warning` for a dead capture thread, a missing transcript, an incomplete one, or dropped audio | nothing | the joins, `Recorder::finish`, `LiveSession::finish` |
-| capture thread | `Opened`, `Lost`, `Level`, `Transcript`, `Draft`, and the `Warning` for a dropped backlog or a stopped transcription | `Event` through `LiveSession::poll`, and the ready channel's `Result<LiveSession, String>` | `CaptureStream::read`, `Recorder::write` |
+| capture thread | `Opened`, `Lost`, `Transcript`, `Draft`, and the `Warning` for a dropped backlog or a stopped transcription | `Event` through `LiveSession::poll`, and the ready channel's `Result<LiveSession, String>` | `CaptureStream::read`, `Recorder::write` |
 | `koe-transcript-model` | only the ready channel's `Result<LiveSession, String>`. The capture thread turns its error into the `Warning`, and the recorder turns a failed spawn into one | nothing | `Transcriber::new` and `transcriber.live` |
 | `koe-transcribe` | `Event`, the reply `Transcript` or `Incomplete`, `EngineEvent` from the backend | `Command` | `EngineSession::feed`, `finish`, and `poll` |
 | `koe-dictation` | `Report::Done`, `Command::Audio` and `Command::End` through `feed` and `finish` | `Event` through `LiveSession::poll` | the platform's text insertion |
@@ -331,7 +330,7 @@ flowchart TD
 
 `Wake` is one pending flag and one waker slot, with no queue. `LiveTranscript::apply` marks it after every folded recognition event, and `LiveTranscript::commit` marks it after the final inference. Both run on `koe-dictation`, so the dictation transcript is the only thing that shortens a sleep.
 
-A take has no wake at all. Its progress and transcript are sampled at the 100 ms tick. So the meeting UI lags a commit by up to 100 ms, and `EngineEvent::Transcript` reaches the window on the same sample.
+A take has no wake at all. Its progress and transcript are sampled at the 100 ms tick, and `Shell::tick` repaints on every tick while the phase is active, because a silent take sends no event and the timer still moves. So the meeting UI lags a commit by up to 100 ms, and `EngineEvent::Transcript` reaches the window on the same sample.
 
 ## 6. Keeping this file true
 
@@ -367,4 +366,4 @@ A sequence diagram gets wider with each `participant`, and no message shortening
 
 `cargo test -p koe-desktop --features linux` covers the state machines and the sleep branches, so a transition or tick change that this file has not caught will usually fail there first.
 
-Two changes are already scheduled and will stale this file. Removing `EngineEvent::Level` removes a variant from the layer table, one conversion row, one column of the thread matrix, and the `levels` field that `Shell::poll_engine` and `ui.rs` read. Moving a take onto a wake would add a row to section 5 and a sender to section 1.
+Two changes would stale this file. Moving a take onto a wake would add a row to section 5 and a sender to section 1. Adding a variant to `EngineEvent` touches the layer table, the diagram in section 3, and the thread matrix.

@@ -50,7 +50,8 @@ has a recorder screen and a settings screen that holds the source, format,
 folder, and dictation controls. The tray icon and the overlay
 show the state while the window is hidden. See
 [`apps/koe-desktop/README.md`](apps/koe-desktop/README.md) for the framework
-choice and the platform limits.
+choice and the platform limits, and [`ARCHITECTURE.md`](ARCHITECTURE.md) for
+the threads, event types, and state machines behind the desktop app.
 
 While koe sits in the background, a configurable global hotkey (the default is
 `Ctrl+Shift+Space`) starts dictation from the microphone; press it again and
