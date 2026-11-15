@@ -25,7 +25,7 @@ The frame loop is the one loop that is not a thread. `app::run` starts it with `
 | capture thread, one per source | `scope.spawn` in `engine::run` | one take, one per source | `thread::scope` | `CaptureStream::read` | the stop flag is set and the blocking read returns |
 | `koe-transcript-model` | `engine::spawn_transcription` | one take | nobody, the handle is dropped | `MODEL_LOAD`, then `Transcriber::new` | a stop check, or the work finishes |
 | `koe-transcribe` | `actor::Task::spawn` | one stream, one per `LiveSession` | `LiveSession.handle` | `commands.recv()` | `Command::End`, or the command channel closes when `LiveSession` drops |
-| `koe-dictation` | `dictation_worker::Session::start` | one dictation | nobody, the handle is dropped; `dictation_worker::Session` holds the stop and cancel flags, the report receiver, and the shared live transcript | `CaptureStream::read` | the stop or cancel flag is set and the read returns |
+| `koe-dictation` | `dictation_worker::Session::start` | one dictation | nobody, the handle is dropped; `dictation_worker::Session` holds the stop and cancel flags, the report receiver, and the shared live transcript | `CaptureStream::read` | the read returns after the flag is set; the thread then runs the final inference and types the text |
 | `koe-dictation-model` | `dictation_worker::capture` | one dictation | nobody, the handle is dropped | `MODEL_LOAD`, then `Transcriber::new` | a stop check, or the work finishes |
 | CoreAudio render callback | `render_callback` in `koe-capture-macos` | one capture stream | the HAL | invoked once per audio buffer | `AudioOutputUnitStop` in `Unit::drop`, when the stream drops |
 | `global-hotkey` manager, X11 | `Hotkeys::new` | process | `Hotkeys` | a 50 ms poll inside the library | `Drop` asks it to stop, and does not join it |
@@ -217,7 +217,7 @@ Which thread holds which end of each type. A dash means the thread never touches
 | `koe-dictation-model` | the ready channel's `Result<LiveSession, DesktopError>` | nothing | `Transcriber::new` and `transcriber.live` |
 | CoreAudio render callback | nothing | nothing | fills the capture pipeline's sink, so the capture thread's `read` has audio |
 | `global-hotkey` manager | press ids into the process-wide queue | nothing | the press count that `Hotkeys::presses` drains |
-| `tray-icon` menu watcher and its ksni service thread | `TrayAction` into the tray queue, from the menu event handler | nothing | nothing in koe |
+| ksni service thread, and the menu watcher beside it | `TrayAction` into the tray queue, from the menu's activate handler on the service thread. The watcher only forwards menu changes | nothing | nothing in koe |
 
 The recognition types stop at the actor. `Command` travels down into `koe-transcribe` and `Event` travels back up, and neither reaches the shell. The desktop layer restates what it needs as `engine::EngineEvent`. The dictation path does hand one recognition type to the shell, as plain text: `LiveText` becomes the `String` the HUD reads, so no `Event` value is stored in the shell.
 
@@ -236,7 +236,7 @@ The recognition types stop at the actor. `Command` travels down into `koe-transc
 | tray actions | `Arc<Mutex<VecDeque>>` | the library's menu handler | `Tray::poll` |
 | hotkey presses | process-wide `OnceLock<Arc<Mutex<VecDeque>>>` | the library's event handler | `Hotkeys::presses` |
 
-The recognition command queue is the only bounded data channel a producer can overflow. When it is full, `LiveSession::feed` drops the chunk and counts the frames in `pending` and `total`. The actor then feeds silence for those frames so engine timestamps keep matching the recording, and the desktop reports the total as an incomplete-transcript warning.
+The recognition command queue is the only bounded data channel a producer can overflow. When it is full, `LiveSession::feed` drops the chunk and counts the frames in `pending` and `total`. The actor then feeds silence for those frames so engine timestamps keep matching the recording, and the desktop reports the total in its own `Warning`, separate from the one an `Incomplete` transcript produces.
 
 ## 4. State machines
 
@@ -273,7 +273,7 @@ The variants carry payloads. `Arming` holds `live` and the `pending` sources. `R
 
 Rows that a linear `Idle` to `Done` story gets wrong.
 
-- `Done` is a start state. `Done` plus `Start` arms a new take, and a refused start puts the same `Done` back.
+- `Done` is a start state. `Done` plus `Start` arms a new take, and a refused start puts the same `Done` back. `Idle` and `Done` both refuse a `Start` whose source set is empty, and that arm leaves the phase as it was, so the figure draws it only once.
 - `Finished` reaches `Done` from four phases, not one. The usual path is `Stopping`, but `Arming`, `Recording`, and `Paused` each take it directly. A start that cannot spawn a thread finishes out of `Arming` on the spot, because `Shell::run` reduces `Event::Finished` after `engine::Session::start` fails.
 - `Stopping` has three causes. `Stop` gives `User`. The last `Lost` gives `AllSourcesLost` from either `Recording` or `Paused`. The last arming answer with nothing live gives `StartFailed`. `Stop` in `Stopping` is an explicit no-op, so the engine gets exactly one `Stop` per take.
 - Pause survives losing a source. `Paused` plus `Lost` stays paused until every source is gone.
@@ -379,9 +379,9 @@ nix shell nixpkgs#mermaid-cli --command mmdc -i /tmp/diagram.mmd -o /tmp/diagram
 grep -o 'viewBox="[^"]*"' /tmp/diagram.svg | head -1
 ```
 
-That local number is a rough lower bound. GitHub renders Mermaid 12.2 with the `elk` layout, while the packaged `mermaid-cli` is 12.0.0 and uses `dagre`. On these diagrams the two local layouts differ by up to about 70 units, and GitHub's own run came out wider than either. A Phase diagram measured at 918 locally was drawn at 1010 on GitHub and lost its bottom. The local number tells you a figure is too wide long before GitHub does, and the live page is the check that decides.
+That local number is a rough lower bound and it uses the right layout, since the packaged `mermaid-cli` is 12.0.0 and its default is `elk`, the same as GitHub's 12.2. It is still not the same run. GitHub drew a Phase diagram measured at 918 locally at 1010, past the frame, and lost its bottom. The local number catches a figure that is clearly too wide. The live page is the check that decides.
 
-A sequence diagram gets wider with each `participant`, and no message shortening brings five of them under 1000, so keep a sequence diagram to four or fewer columns.
+A sequence diagram gets wider with each `participant`, and no message shortening brings five of them under the frame width, so keep a sequence diagram to four or fewer columns.
 
 `cargo test -p koe-desktop --features linux` covers the state machines and the sleep branches, so a transition or tick change that this file has not caught will usually fail there first.
 
