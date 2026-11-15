@@ -23,8 +23,8 @@ The macOS release is a DMG holding `Koe.app`. It is ad-hoc signed and not
 notarized, so the first launch needs **Open** from the control-click menu, or
 `xattr -d com.apple.quarantine /Applications/Koe.app` before opening it.
 
-The Linux tarball holds `koe` and `koe-desktop`. Their dynamic libraries come
-from `/nix/store`, so the binaries run where that store is mounted. On NixOS or
+The Linux tarball holds `koe-desktop` and this README. Its dynamic libraries come
+from `/nix/store`, so the binary runs where that store is mounted. On NixOS or
 with Nix installed, install from the flake instead:
 
 ```console
@@ -67,40 +67,3 @@ input method cannot mangle it; a GGUF model file is required. macOS and
 Windows type Unicode key events; macOS uses the system speech model and
 needs the accessibility permission. The binding, model, and language persist
 in a settings file and are edited in the window.
-
-## Command line
-
-The `koe` CLI records the microphone and the system audio into one file or one
-meeting session, and transcribes 16-bit PCM WAV files offline. Build it with the
-backend for the host:
-
-```console
-cargo run -p koe-cli --features linux -- devices
-cargo run -p koe-cli --features linux -- record take.ogg --source both --model model.gguf
-cargo run -p koe-cli --features linux -- meeting --root meetings --model model.gguf
-cargo run -p koe-cli --features linux -- transcribe take.wav --model model.gguf --language ja
-```
-
-Use `--features macos` or `--features windows` on those platforms. `record`
-writes Ogg Opus (`.ogg`, `.oga`, `.opus`) or WAV (`.wav`) and stops after
-`--duration` or on Ctrl-C. It also writes a transcript beside the audio, by
-default next to the output with a `.txt` extension. The transcript file is
-created when recording starts and completed when it stops. If one source
-delivers no audio, `record` keeps the other source recording and warns. A
-transcription fault prints a warning and keeps the audio and the committed
-text. Pass `--model` for GGUF transcription, `--transcript` to choose the
-path, `--timestamps` to add time ranges, or `--no-transcribe` to record only.
-`transcribe` reads 16-bit PCM WAV and prints committed text, keeping the text
-it received when the engine fails partway. On macOS, omit `--model` to use the
-system speech model.
-
-`meeting` records and transcribes a meeting into a session directory instead of
-a bare file: `<root>/<epoch milliseconds>/` holds the audio as `meeting.ogg`,
-the `session` record that names it and carries the transcripts, and
-`transcript.txt` as one `[start..end] source: text` line per segment. The
-command always writes Ogg Opus; the desktop app uses the same layout with the
-extension its format setting selects. `--root` defaults to
-`$KOE_RECORDINGS_DIR`, then `recordings` in the current directory. It takes the
-same capture and transcription options as `record` except `--transcript` and
-`--timestamps`. A take that records no audio, or a recorder that cannot start,
-leaves no session behind.
