@@ -81,6 +81,8 @@ A dictation captures only the microphone, holds no file, and ends by inserting t
 | `src/settings.rs` | Source, format, session creation, and the persisted dictation settings |
 | `src/error.rs` | Typed failures and their messages |
 
+[`ARCHITECTURE.md`](../../ARCHITECTURE.md) maps the threads, the event types by layer, the two state machines, and the tick schedule, with Mermaid diagrams you can paste into a ticket.
+
 ## Verify
 
 ```console
