@@ -19,6 +19,7 @@ pub mod state;
 pub mod transcript;
 pub mod tray;
 pub mod ui;
+pub mod wake;
 
 // GPUI macros emit `::gpui::` paths, which resolve through this alias when
 // GPUI is consumed only through the Kit facade.
