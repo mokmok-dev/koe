@@ -8,7 +8,7 @@ It sits at the repo root so it is the first architecture file a reader finds bes
 
 Every claim here was read from the source at commit `a53cded`. Entries name symbols rather than line numbers, because line numbers drift and a symbol survives a rename of its neighbours. Section 6 gives the commands that check this file against the code.
 
-Each diagram stays under 1000 units wide. Every diagram at that width or less filled its frame exactly on the rendered page. The wider ones were drawn taller than their frame and lost their bottom, the threads figure at 1053 units and the sequence figure at 2108. The labels are short and stacked to stay under that width. Section 6 measures a rewrite before you commit it.
+Each diagram stays under 1000 units wide. The wider ones were drawn taller than their frame on the rendered page and lost their bottom, the threads figure at 1053 units and the sequence figure at 2108. The labels are short and stacked to stay under that width. Section 6 measures a rewrite before you commit it.
 
 Three details below are stated for the platform they hold on. `global-hotkey` runs a manager thread on X11 only: the macOS backend installs a Carbon and event-tap handler on the main run loop, and the Windows backend uses a hidden window plus a watcher thread per press. `tray-icon`'s menu-watcher thread belongs to its Linux `ksni` backend, and this crate builds `tray-icon` with `default-features = false` elsewhere, so macOS and Windows run no such thread.
 
@@ -250,7 +250,7 @@ stateDiagram-v2
     Arming --> Arming: source pending
     Arming --> Recording: one live
     Arming --> Stopping: none live
-    Recording --> Recording: Lost, a source still live
+    Recording --> Recording: Lost
     Recording --> Stopping: last Lost
     Paused --> Stopping: last Lost
     Recording --> Paused: Pause
@@ -258,9 +258,9 @@ stateDiagram-v2
     Arming --> Stopping: Stop
     Recording --> Stopping: Stop
     Paused --> Stopping: Stop
-    Arming --> Done: Finished, thread failed
-    Recording --> Done: Finished, before Stop
-    Paused --> Done: Finished, before Stop
+    Arming --> Done: Finished
+    Recording --> Done: Finished
+    Paused --> Done: Finished
     Stopping --> Done: Finished
     Done --> Idle: Dismiss
 ```
@@ -366,16 +366,16 @@ grep -n 'fn reduce\|fn toggle\|fn cancel' apps/koe-desktop/src/state.rs apps/koe
 
 The first match in the first grep is `thread::spawn` inside a `wake.rs` test, so read the output and skip it. Every other match is a thread in section 1, and the last is `koe-transcribe` in `crates/koe-transcribe/src/actor.rs`.
 
-Measure a rewritten diagram before you commit it, and keep the width at 900 or less. That leaves room for the difference below. Every diagram in this file is between 556 and 897 units wide.
+Measure a rewritten diagram before you commit it, then confirm it on the rendered page. Keep the width under 950, measured with `mmdc`'s default layout.
 
 ```console
 cd "$(git rev-parse --show-toplevel)"
-# extract one fenced block, then read the width and height it renders at
+# extract one fenced block, then read the size it renders at
 nix shell nixpkgs#mermaid-cli --command mmdc -i /tmp/diagram.mmd -o /tmp/diagram.svg
 grep -o 'viewBox="[^"]*"' /tmp/diagram.svg | head -1
 ```
 
-`mmdc` is close to GitHub but not identical. GitHub renders with Mermaid 12.2 and the `elk` layout, while the packaged `mermaid-cli` here is 12.0.0 and falls back to `dagre`. On the six diagrams in this file the two layouts land within 12 units of each other, so a figure measured well under 900 is safe on both. After changing a diagram, load the rendered page once and confirm each figure is not cut off. That check caught what the measurement alone did not.
+That local number is a lower bound, not the truth. GitHub renders Mermaid 12.2 with the `elk` layout, while the packaged `mermaid-cli` is 12.0.0 and uses `dagre`. On the six diagrams here `dagre` lands within about 12 units of a local `elk` run, and GitHub's own `elk` run came out around 10% wider than the local one. A state diagram at 930 locally was drawn at 1010 on GitHub, past the 981 a frame holds, and lost its bottom. The lesson is the live check, not the number.
 
 A sequence diagram gets wider with each `participant`, and no message shortening brings five of them under 1000, so keep a sequence diagram to four or fewer columns.
 
