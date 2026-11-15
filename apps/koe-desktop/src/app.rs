@@ -21,7 +21,7 @@ use crate::engine::{self, Completion, EngineEvent, TranscriptionPlan};
 use crate::hud::{self, HudState};
 use crate::overlay;
 use crate::settings::{self, Settings, Take};
-use crate::state::{Action, Event, Phase, Sources};
+use crate::state::{Action, Event, Phase};
 use crate::transcript::{self, MeetingTranscript, Speaker};
 use crate::tray::{Tray, TrayAction, TrayState, TrayStatus};
 use crate::ui::MainView;
@@ -78,7 +78,6 @@ pub struct Shell {
     pub(crate) take: Option<Take>,
     pub(crate) transcript: MeetingTranscript,
     pub(crate) transcript_pending: bool,
-    pub(crate) levels: [f32; 2],
     pub(crate) tray: Option<Tray>,
     pub(crate) tray_error: Option<String>,
     pub(crate) notice: Option<String>,
@@ -132,7 +131,6 @@ impl Shell {
             take: None,
             transcript: MeetingTranscript::default(),
             transcript_pending: false,
-            levels: [0.0; 2],
             tray: None,
             tray_error: None,
             notice: warning,
@@ -185,6 +183,9 @@ impl Shell {
         }
         changed |= presses > 0;
         changed |= self.poll_engine();
+        // The take panel's timer advances once a second, and a silent take
+        // sends no engine event, so the active phase asks for a repaint.
+        changed |= self.phase.is_active();
         if let Some(message) = self.dictation_control.poll() {
             self.notice = Some(message);
             changed = true;
@@ -275,10 +276,6 @@ impl Shell {
         let changed = !events.is_empty();
         for event in events {
             match event {
-                EngineEvent::Level { source, level } => {
-                    let slot = &mut self.levels[Sources::index(source)];
-                    *slot = if level > *slot { level } else { *slot * 0.82 };
-                }
                 EngineEvent::Warning(message) => self.notice = Some(message),
                 EngineEvent::Transcript { source, at, text } => {
                     if self.transcript_pending {
@@ -299,7 +296,6 @@ impl Shell {
                 }
                 EngineEvent::Finished(completion) => {
                     self.session = None;
-                    self.levels = [0.0; 2];
                     self.save_transcripts(&completion.transcripts);
                     // A recorder that never created its file left nothing to
                     // keep; a partial take keeps its session.
@@ -334,7 +330,6 @@ impl Shell {
                 match engine::Session::start(plan) {
                     Ok(session) => {
                         self.session = Some(session);
-                        self.levels = [0.0; 2];
                     }
                     Err(error) => {
                         self.session = None;
