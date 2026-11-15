@@ -8,7 +8,7 @@
 
 use std::ffi::c_void;
 use std::marker::PhantomData;
-use std::ptr::{from_ref, null, null_mut};
+use std::ptr::{NonNull, from_ref, null, null_mut};
 use std::slice;
 use std::time::Instant;
 
@@ -290,17 +290,21 @@ impl Drop for Com {
 }
 
 /// Frees memory the platform allocated with `CoTaskMemAlloc`.
-struct CoTaskMem<T>(*mut T);
+struct CoTaskMem<T>(NonNull<T>);
 
 impl<T> CoTaskMem<T> {
+    fn new(pointer: *mut T) -> Option<Self> {
+        NonNull::new(pointer).map(Self)
+    }
+
     const fn as_ptr(&self) -> *mut T {
-        self.0
+        self.0.as_ptr()
     }
 }
 
 impl<T> Drop for CoTaskMem<T> {
     fn drop(&mut self) {
-        unsafe { CoTaskMemFree(self.0.cast()) };
+        unsafe { CoTaskMemFree(self.0.as_ptr().cast()) };
     }
 }
 
@@ -452,10 +456,7 @@ impl Owned<DeviceVtable> {
         let vtable = unsafe { self.vtable() };
         let status = unsafe { (vtable.get_id)(self.as_ptr(), &raw mut pointer) };
         check("IMMDevice::GetId", status)?;
-        if pointer.is_null() {
-            return Err(invariant("IMMDevice::GetId"));
-        }
-        let id = CoTaskMem(pointer);
+        let id = CoTaskMem::new(pointer).ok_or_else(|| invariant("IMMDevice::GetId"))?;
         unsafe { wide_string(id.as_ptr()) }.ok_or_else(|| invariant("IMMDevice::GetId"))
     }
 
@@ -516,10 +517,7 @@ unsafe fn mix_format(
     let vtable = unsafe { client.vtable() };
     let status = unsafe { (vtable.get_mix_format)(client.as_ptr(), &raw mut pointer) };
     check(operation, status)?;
-    if pointer.is_null() {
-        return Err(invariant(operation));
-    }
-    let memory = CoTaskMem(pointer);
+    let memory = CoTaskMem::new(pointer).ok_or_else(|| invariant(operation))?;
     let base = unsafe { memory.as_ptr().read() };
     if base.channels == 0 {
         return Err(invariant(operation));
