@@ -46,8 +46,8 @@ cargo run -p koe-desktop --features linux
 ```
 
 Use `--features macos` or `--features windows` on those platforms. The window
-has a recorder screen and a settings screen that holds the source, format,
-folder, and dictation controls. The tray icon and the overlay
+has a recorder screen and a settings screen that holds the microphone, the
+source, format, folder, and dictation controls. The tray icon and the overlay
 show the state while the window is hidden. See
 [`apps/koe-desktop/README.md`](apps/koe-desktop/README.md) for the framework
 choice and the platform limits, and [`ARCHITECTURE.md`](ARCHITECTURE.md) for
