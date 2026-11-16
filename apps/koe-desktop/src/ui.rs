@@ -82,8 +82,10 @@ const MISSING_MICROPHONE: &str =
 /// platform order.
 ///
 /// Two devices can report the same name, so a repeated name gains its id to
-/// stay distinguishable.
-fn microphone_items(inputs: &Inputs) -> Vec<MicrophoneItem> {
+/// stay distinguishable. A saved device the listing lacks keeps a row of its
+/// own at the end, so confirming the picker leaves the saved choice alone
+/// until the device returns.
+fn microphone_items(inputs: &Inputs, saved: Option<&DeviceId>) -> Vec<MicrophoneItem> {
     let devices = match inputs {
         Inputs::Listed(devices) => devices.as_slice(),
         Inputs::Unlisted | Inputs::Listing | Inputs::Failed(_) => &[],
@@ -96,6 +98,14 @@ fn microphone_items(inputs: &Inputs) -> Vec<MicrophoneItem> {
         label: microphone_label(devices, device).into(),
         device: Some(device.id().clone()),
     }));
+    if let Some(saved) = saved
+        && devices.iter().all(|device| device.id() != saved)
+    {
+        rows.push(MicrophoneItem {
+            label: format!("{saved} (not connected)").into(),
+            device: Some(saved.clone()),
+        });
+    }
     rows
 }
 
@@ -115,7 +125,7 @@ fn microphone_label(devices: &[DeviceInfo], device: &DeviceInfo) -> String {
 }
 
 /// The row the picker selects: the saved device, or the default row when the
-/// save names none or names a device the list does not report.
+/// save names none. A saved device the listing lacks has a row of its own.
 fn microphone_row(rows: &[MicrophoneItem], saved: Option<&DeviceId>) -> usize {
     saved
         .and_then(|saved| {
@@ -304,7 +314,7 @@ impl MainView {
         let (listed, saved, rows, selected) = {
             let shell = shell.read(cx);
             let saved = shell.dictation_control.settings.microphone.clone();
-            let rows = microphone_items(&shell.inputs);
+            let rows = microphone_items(&shell.inputs, saved.as_ref());
             let selected = microphone_row(&rows, saved.as_ref());
             (shell.inputs.clone(), saved, rows, selected)
         };
@@ -331,32 +341,31 @@ impl MainView {
 
     /// Rebuilds the microphone picker's rows when the listing or the saved
     /// device changed, and keeps the selected row on the saved one.
-    ///
-    /// A running listing keeps the rows it is about to replace, so the refresh
-    /// that follows a choice does not empty the picker while the audio server
-    /// is asked.
     fn sync_microphone_rows(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let (inputs, saved) = {
+        let rebuild = {
             let shell = self.shell.read(cx);
-            (
-                shell.inputs.clone(),
-                shell.dictation_control.settings.microphone.clone(),
-            )
+            let saved = &shell.dictation_control.settings.microphone;
+            // A listing that is still running, or that failed, keeps the rows
+            // it cannot replace: the picker never empties while the audio
+            // server is asked, and a transient failure leaves the last good
+            // list up while the hint reports it.
+            let listed = match &shell.inputs {
+                Inputs::Listing | Inputs::Failed(_) => &self.microphone_rows.0,
+                inputs => inputs,
+            };
+            (listed != &self.microphone_rows.0 || saved != &self.microphone_rows.1)
+                .then(|| (listed.clone(), saved.clone()))
         };
-        let built = match (&inputs, &self.microphone_rows) {
-            (Inputs::Listing, previous) => previous.0.clone(),
-            _ => inputs,
-        };
-        let signature = (built.clone(), saved.clone());
-        if self.microphone_rows == signature {
+        let Some((listed, saved)) = rebuild else {
             return;
-        }
-        self.microphone_rows = signature;
-        let rows = microphone_items(&built);
-        let selected = IndexPath::new(microphone_row(&rows, saved.as_ref()));
+        };
+        let rows = microphone_items(&listed, saved.as_ref());
+        let selected = microphone_row(&rows, saved.as_ref());
+        let selected_value = rows[selected].device.clone();
+        self.microphone_rows = (listed, saved);
         self.microphone_select.update(cx, |state, cx| {
             state.set_items(MicrophoneItems::new(rows), window, cx);
-            state.set_selected_index(Some(selected), window, cx);
+            state.set_selected_value(&selected_value, window, cx);
         });
     }
 }
@@ -957,6 +966,7 @@ impl Render for MainView {
                 .p(px(22.0))
                 .gap(px(14.0))
                 .child(self.meeting_screen(shell, cx))
+                .children(alerts)
                 .into_any_element(),
             Screen::Recorder => v_flex()
                 .flex_1()
@@ -1318,7 +1328,7 @@ mod tests {
             device("hw:1,0", "Studio Mic", false),
             device("hw:0,0", "Built-in Microphone", true),
         ]);
-        let rows = microphone_items(&inputs);
+        let rows = microphone_items(&inputs, None);
         assert_eq!(rows[0].label.as_ref(), DEFAULT_MICROPHONE);
         assert_eq!(rows[0].device, None);
         assert_eq!(rows[1].label.as_ref(), "Studio Mic");
@@ -1333,7 +1343,7 @@ mod tests {
             device("hw:2,0", "USB Audio", false),
             device("hw:0,0", "Built-in Microphone", true),
         ]);
-        let rows = microphone_items(&inputs);
+        let rows = microphone_items(&inputs, None);
         assert_eq!(rows[1].label.as_ref(), "USB Audio (hw:1,0)");
         assert_eq!(rows[2].label.as_ref(), "USB Audio (hw:2,0)");
         assert_eq!(rows[3].label.as_ref(), "Built-in Microphone");
@@ -1345,10 +1355,25 @@ mod tests {
             device("hw:1,0", "Studio Mic", false),
             device("hw:0,0", "Built-in Microphone", true),
         ]);
-        let rows = microphone_items(&inputs);
+        let rows = microphone_items(&inputs, None);
         assert_eq!(microphone_row(&rows, None), 0);
         assert_eq!(microphone_row(&rows, Some(&id("hw:1,0"))), 1);
         assert_eq!(microphone_row(&rows, Some(&id("hw:9,0"))), 0);
+    }
+
+    #[test]
+    fn a_saved_device_the_list_lacks_keeps_its_own_row() {
+        let inputs = Inputs::Listed(vec![
+            device("hw:1,0", "Studio Mic", false),
+            device("hw:0,0", "Built-in Microphone", true),
+        ]);
+        let saved = id("hw:9,0");
+        let rows = microphone_items(&inputs, Some(&saved));
+        // The listed devices keep their order, so the missing one goes last.
+        assert_eq!(rows.len(), 4);
+        assert_eq!(rows[3].label.as_ref(), "hw:9,0 (not connected)");
+        assert_eq!(rows[3].device, Some(saved.clone()));
+        assert_eq!(microphone_row(&rows, Some(&saved)), 3);
     }
 
     #[test]
@@ -1358,7 +1383,7 @@ mod tests {
             Inputs::Listing,
             Inputs::Failed("no audio server".to_owned()),
         ] {
-            let rows = microphone_items(&inputs);
+            let rows = microphone_items(&inputs, None);
             assert_eq!(rows.len(), 1);
             assert_eq!(rows[0].device, None);
         }
@@ -1399,6 +1424,5 @@ mod tests {
             microphone_hint(&inputs, Some(&id("hw:9,0"))).as_deref(),
             Some(MISSING_MICROPHONE)
         );
-        assert!(MISSING_MICROPHONE.contains("not connected"));
     }
 }

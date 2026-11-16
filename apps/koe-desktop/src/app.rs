@@ -85,6 +85,8 @@ pub struct Shell {
     pub(crate) dictation_control: DictationControl,
     /// The microphones the platform reported, and how that list stands.
     pub(crate) inputs: Inputs,
+    /// Bumped by every listing, so a result only lands on the one that asked.
+    input_epoch: u64,
     last_tray: Option<TrayState>,
     quitting: bool,
     quit_deadline: Option<Instant>,
@@ -153,6 +155,7 @@ impl Shell {
             notice: warning,
             dictation_control,
             inputs: Inputs::Unlisted,
+            input_epoch: 0,
             last_tray: None,
             quitting: false,
             quit_deadline: None,
@@ -173,9 +176,6 @@ impl Shell {
         let mut changed = false;
         changed |= self.ensure_tray();
         changed |= self.ensure_dictation();
-        if matches!(self.inputs, Inputs::Unlisted) {
-            self.refresh_inputs(cx);
-        }
         let actions = self.tray.as_ref().map(Tray::poll).unwrap_or_default();
         for action in actions {
             if std::env::var_os("KOE_TRAY_DEBUG").is_some() {
@@ -522,10 +522,11 @@ impl Shell {
     ///
     /// The listing opens an audio server connection with its own timeouts, so
     /// it never runs on the UI thread; the result lands on the next frame.
+    /// Every call starts its own listing, and only the newest one lands, so a
+    /// Refresh pressed during a slow listing is answered instead of ignored.
     pub fn refresh_inputs(&mut self, cx: &mut Context<Self>) {
-        if matches!(self.inputs, Inputs::Listing) {
-            return;
-        }
+        self.input_epoch += 1;
+        let epoch = self.input_epoch;
         self.inputs = Inputs::Listing;
         cx.notify();
         cx.spawn(async move |shell, cx: &mut AsyncApp| {
@@ -542,10 +543,8 @@ impl Shell {
                 ),
                 Err(error) => Inputs::Failed(error.to_string()),
             };
-            // Only the listing this result came from is still `Listing`; a
-            // refresh started meanwhile owns the state instead.
             let _ = shell.update(cx, |shell, cx| {
-                if matches!(shell.inputs, Inputs::Listing) {
+                if shell.input_epoch == epoch {
                     shell.inputs = inputs;
                     cx.notify();
                 }
@@ -560,7 +559,6 @@ impl Shell {
         if let Some(message) = self.save_microphone(microphone) {
             self.notice = Some(message);
         }
-        self.refresh_inputs(cx);
         cx.notify();
     }
 
@@ -658,8 +656,7 @@ impl Shell {
             // The menu item opens the window on its settings screen.
             TrayAction::Show => self.show_window(),
             TrayAction::ShowSettings => {
-                self.screen = Screen::Settings;
-                self.refresh_inputs(cx);
+                self.show_settings(cx);
                 self.show_window();
             }
             TrayAction::OpenFolder => self.open_folder(cx),

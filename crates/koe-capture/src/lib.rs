@@ -27,7 +27,7 @@ mod platform;
 
 pub use koe_capture_core::{
     CaptureStream, DeviceId, DeviceInfo, Error, MAX_CHANNELS, MAX_SAMPLE_RATE, MIN_SAMPLE_RATE,
-    Resolution, Source, StreamSpec, select_or_default,
+    Source, StreamSpec, select_or_default,
 };
 
 use koe_capture_core::select;
@@ -67,8 +67,9 @@ pub fn open(spec: &StreamSpec) -> Result<CaptureStream, Error> {
 
 /// Opens `spec`'s source on `requested`, or on that source's default.
 ///
-/// Returns the resolution so a caller that saved a device can tell the user
-/// when a different one was opened.
+/// The second value is `true` when the saved device was gone or named the
+/// other source and the default opened instead, so a caller can tell the user
+/// what is recording.
 ///
 /// # Errors
 ///
@@ -76,11 +77,11 @@ pub fn open(spec: &StreamSpec) -> Result<CaptureStream, Error> {
 pub fn open_requested(
     spec: &StreamSpec,
     requested: Option<&DeviceId>,
-) -> Result<(CaptureStream, Resolution), Error> {
+) -> Result<(CaptureStream, bool), Error> {
     let devices = platform::devices()?;
-    let (device, resolution) = select_or_default(&devices, spec.source(), requested)?;
+    let (device, fell_back) = select_or_default(&devices, spec.source(), requested)?;
     let stream = open_device(device, spec)?;
-    Ok((stream, resolution))
+    Ok((stream, fell_back))
 }
 
 /// Opens a specific capture device.

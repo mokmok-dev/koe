@@ -270,13 +270,17 @@ impl DictationControl {
     ///
     /// # Errors
     ///
-    /// Returns the save error when the settings file cannot be written.
+    /// Returns the save error when the settings file cannot be written; the
+    /// previous device is still the one this control holds.
     pub fn apply_microphone(&mut self, microphone: Option<DeviceId>) -> Result<bool, DesktopError> {
         if microphone == self.settings.microphone {
             return Ok(false);
         }
-        self.settings.microphone = microphone;
-        self.settings.save(&self.settings_path)?;
+        let previous = std::mem::replace(&mut self.settings.microphone, microphone);
+        if let Err(error) = self.settings.save(&self.settings_path) {
+            self.settings.microphone = previous;
+            return Err(error);
+        }
         Ok(true)
     }
 
@@ -475,6 +479,22 @@ mod tests {
         assert_eq!(control.settings.microphone, None);
         let (loaded, _) = DictationSettings::load(&path);
         assert_eq!(loaded.microphone, None);
+    }
+
+    #[test]
+    fn a_failed_save_keeps_the_microphone_the_control_held() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join(settings::SETTINGS_FILE);
+        let mut control = control(root.path());
+        let chosen = DeviceId::new("hw:1,0").unwrap();
+        assert!(control.apply_microphone(Some(chosen.clone())).unwrap());
+
+        // A directory where the file belongs makes the write fail.
+        std::fs::remove_file(&path).unwrap();
+        std::fs::create_dir(&path).unwrap();
+
+        assert!(control.apply_microphone(None).is_err());
+        assert_eq!(control.settings.microphone, Some(chosen));
     }
 
     #[test]

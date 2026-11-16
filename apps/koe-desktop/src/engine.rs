@@ -12,7 +12,7 @@ use std::sync::{Arc, Mutex, PoisonError};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime};
 
-use koe_capture::{DeviceId, Resolution, Source, StreamSpec};
+use koe_capture::{DeviceId, Source, StreamSpec};
 use koe_record::{Channels, Recorder, RecordingSpec, Summary};
 use koe_session_store::Transcripts;
 use koe_transcribe::{AudioSpec, Event, LiveSession, Model, Options, Transcriber, Transcript};
@@ -422,8 +422,8 @@ fn pump(
     let mut paused_since = None;
     let mut paused_total = Duration::ZERO;
     let mut stream = match koe_capture::open_requested(&spec, requested) {
-        Ok((stream, resolution)) => {
-            if resolution == Resolution::Missing {
+        Ok((stream, fell_back)) => {
+            if fell_back {
                 let _ = sender.send(EngineEvent::Warning(fallback_notice(
                     stream.device().name(),
                 )));
@@ -806,14 +806,6 @@ mod tests {
     fn a_meeting_plan_starts_on_the_platform_microphone() {
         let plan = SessionPlan::meeting(PathBuf::from("take.ogg"), Sources::MEETING).unwrap();
         assert_eq!(plan.microphone, None);
-    }
-
-    #[test]
-    fn a_plan_carries_the_microphone_the_shell_set() {
-        let mut plan = SessionPlan::meeting(PathBuf::from("take.ogg"), Sources::MEETING).unwrap();
-        let chosen = DeviceId::new("hw:2,0").unwrap();
-        plan.microphone = Some(chosen.clone());
-        assert_eq!(plan.microphone, Some(chosen));
     }
 
     #[test]

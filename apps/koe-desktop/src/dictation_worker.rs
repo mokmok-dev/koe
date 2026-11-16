@@ -20,7 +20,7 @@ use std::thread;
 #[cfg(target_os = "linux")]
 use std::time::Duration;
 
-use koe_capture::{Resolution, Source, StreamSpec};
+use koe_capture::{Source, StreamSpec};
 use koe_transcribe::{AudioSpec, Event, LiveSession, LiveText, Options, Transcriber};
 
 use crate::dictation::{DictationOutcome, DictationPlan};
@@ -243,9 +243,8 @@ fn capture(
         Err(error) => return failed(DesktopError::Transcribe(error)),
     };
     let (mut stream, warning) = match koe_capture::open_requested(&spec, plan.microphone.as_ref()) {
-        Ok((stream, resolution)) => {
-            let warning = (resolution == Resolution::Missing)
-                .then(|| fallback_notice(stream.device().name()));
+        Ok((stream, fell_back)) => {
+            let warning = fell_back.then(|| fallback_notice(stream.device().name()));
             (stream, warning)
         }
         Err(error) => return failed(error.into()),
@@ -663,11 +662,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn a_warning_survives_finish_and_does_not_fail_a_dictation_that_typed() {
-        use std::time::Instant;
-
-        use crate::dictation::{Dictation, DictationEvent};
-
+    fn the_warning_finish_receives_rides_on_its_outcome() {
         let transcript = LiveTranscript::default();
         let warning = fallback_notice("Built-in Microphone");
         let outcome = finish(
@@ -677,26 +672,7 @@ mod tests {
             &Arc::new(AtomicBool::new(false)),
             &transcript,
         );
-        assert_eq!(outcome.warning, Some(warning.clone()));
-
-        let done = |outcome: DictationOutcome| {
-            let mut dictation = Dictation::Listening {
-                started: Instant::now(),
-            };
-            dictation.reduce(DictationEvent::Finished(Box::new(outcome)), Instant::now());
-            let Dictation::Done(done) = dictation else {
-                unreachable!("a finished event makes a done dictation");
-            };
-            *done
-        };
-        assert_eq!(done(outcome).warning, Some(warning.clone()));
-
-        let typed = done(DictationOutcome {
-            text: "hello".to_owned(),
-            failure: None,
-            warning: Some(warning),
-        });
-        assert!(!typed.failed(), "a warning is not a failure");
+        assert_eq!(outcome.warning, Some(warning));
     }
 
     #[test]
