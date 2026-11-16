@@ -84,6 +84,22 @@ impl DictationDone {
     pub const fn failed(&self) -> bool {
         self.failure.is_some() || self.text.is_empty()
     }
+
+    /// The sentence to show once the dictation ends.
+    ///
+    /// A failure outranks a warning, because it says why nothing was typed.
+    /// A warning outranks the empty-text sentence: a silent room and a missing
+    /// microphone both end with no text, and the microphone is the one the
+    /// user can act on.
+    #[must_use]
+    pub fn notice(&self) -> String {
+        match (&self.failure, &self.warning, self.text.is_empty()) {
+            (Some(failure), _, _) => failure.to_string(),
+            (None, Some(warning), _) => warning.clone(),
+            (None, None, true) => "Dictation heard nothing".to_owned(),
+            (None, None, false) => format!("Typed {}", self.text),
+        }
+    }
 }
 
 /// Where the dictation is.
@@ -471,6 +487,47 @@ mod tests {
         };
         assert_eq!(done.warning, Some(warning));
         assert!(!done.failed(), "a typed dictation is not a failure");
+    }
+
+    fn finished(text: &str, failure: Option<DesktopError>, warning: Option<&str>) -> DictationDone {
+        DictationDone {
+            text: text.to_owned(),
+            failure,
+            duration: Duration::from_secs(1),
+            warning: warning.map(str::to_owned),
+        }
+    }
+
+    #[test]
+    fn a_failure_says_why_nothing_was_typed() {
+        let failure = DesktopError::Dictation("the microphone never opened".to_owned());
+        assert_eq!(
+            finished("", Some(failure), Some("a warning")).notice(),
+            "dictation failed: the microphone never opened"
+        );
+    }
+
+    #[test]
+    fn a_warning_outranks_the_empty_text_sentence() {
+        let warning = "The saved microphone is not connected.";
+        assert_eq!(
+            finished("", None, Some(warning)).notice(),
+            warning,
+            "a silent room and a missing microphone both end with no text"
+        );
+    }
+
+    #[test]
+    fn a_dictation_that_heard_nothing_says_so() {
+        assert_eq!(finished("", None, None).notice(), "Dictation heard nothing");
+    }
+
+    #[test]
+    fn a_dictation_that_typed_says_what_it_typed() {
+        assert_eq!(
+            finished("こんにちは", None, None).notice(),
+            "Typed こんにちは"
+        );
     }
 
     #[test]

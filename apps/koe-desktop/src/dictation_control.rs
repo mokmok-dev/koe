@@ -173,12 +173,7 @@ impl DictationControl {
             return self.run(action);
         }
         match &self.dictation {
-            Dictation::Done(done) => Some(match (&done.failure, &done.warning) {
-                (Some(failure), _) => failure.to_string(),
-                (None, Some(warning)) => warning.clone(),
-                (None, None) if done.text.is_empty() => "Dictation heard nothing".to_owned(),
-                (None, None) => format!("Typed {}", done.text),
-            }),
+            Dictation::Done(done) => Some(done.notice()),
             Dictation::Idle | Dictation::Listening { .. } | Dictation::Stopping { .. } => None,
         }
     }
