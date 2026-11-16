@@ -8,6 +8,7 @@ use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use global_hotkey::hotkey::HotKey;
+use koe_capture::DeviceId;
 use koe_transcribe::Model;
 
 use crate::dictation::{self, Dictation, DictationContext, DictationEvent, DictationOutcome};
@@ -130,6 +131,7 @@ impl DictationControl {
             meeting_active,
             model,
             language,
+            microphone: self.settings.microphone.clone(),
         };
         let action = self.dictation.toggle(context, Instant::now())?;
         let refused = matches!(&action, dictation::DictationAction::Refuse(_));
@@ -160,6 +162,7 @@ impl DictationControl {
                 failure: Some(DesktopError::Thread(
                     "the dictation thread ended without reporting".to_owned(),
                 )),
+                warning: None,
             }),
         };
         self.session = None;
@@ -170,12 +173,7 @@ impl DictationControl {
             return self.run(action);
         }
         match &self.dictation {
-            Dictation::Done(done) if done.failed() => Some(
-                done.failure
-                    .as_ref()
-                    .map_or_else(|| "Dictation heard nothing".to_owned(), ToString::to_string),
-            ),
-            Dictation::Done(done) => Some(format!("Typed {}", done.text)),
+            Dictation::Done(done) => Some(done.notice()),
             Dictation::Idle | Dictation::Listening { .. } | Dictation::Stopping { .. } => None,
         }
     }
@@ -262,6 +260,25 @@ impl DictationControl {
         Ok(changed)
     }
 
+    /// Persists the microphone a take and a dictation capture from; `None`
+    /// follows the platform default.
+    ///
+    /// # Errors
+    ///
+    /// Returns the save error when the settings file cannot be written; the
+    /// previous device is still the one this control holds.
+    pub fn apply_microphone(&mut self, microphone: Option<DeviceId>) -> Result<bool, DesktopError> {
+        if microphone == self.settings.microphone {
+            return Ok(false);
+        }
+        let previous = std::mem::replace(&mut self.settings.microphone, microphone);
+        if let Err(error) = self.settings.save(&self.settings_path) {
+            self.settings.microphone = previous;
+            return Err(error);
+        }
+        Ok(true)
+    }
+
     /// Clears the finished dictation's result.
     pub fn dismiss(&mut self) {
         let _ = self
@@ -296,6 +313,7 @@ impl DictationControl {
                         let outcome = Box::new(DictationOutcome {
                             text: String::new(),
                             failure: Some(error),
+                            warning: None,
                         });
                         if let Some(action) = self
                             .dictation
@@ -436,6 +454,42 @@ mod tests {
         let (loaded, _) = DictationSettings::load(&root.path().join(settings::SETTINGS_FILE));
         assert_eq!(loaded.model, Some(PathBuf::from("tiny.gguf")));
         assert_eq!(loaded.language, Some("ja".to_owned()));
+    }
+
+    #[test]
+    fn the_microphone_persists_when_it_changes() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join(settings::SETTINGS_FILE);
+        let mut control = control(root.path());
+        let chosen = DeviceId::new("hw:1,0").unwrap();
+
+        assert!(control.apply_microphone(Some(chosen.clone())).unwrap());
+        assert_eq!(control.settings.microphone, Some(chosen.clone()));
+        let (loaded, warning) = DictationSettings::load(&path);
+        assert_eq!(warning, None);
+        assert_eq!(loaded.microphone, Some(chosen.clone()));
+        assert!(!control.apply_microphone(Some(chosen)).unwrap());
+
+        assert!(control.apply_microphone(None).unwrap());
+        assert_eq!(control.settings.microphone, None);
+        let (loaded, _) = DictationSettings::load(&path);
+        assert_eq!(loaded.microphone, None);
+    }
+
+    #[test]
+    fn a_failed_save_keeps_the_microphone_the_control_held() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join(settings::SETTINGS_FILE);
+        let mut control = control(root.path());
+        let chosen = DeviceId::new("hw:1,0").unwrap();
+        assert!(control.apply_microphone(Some(chosen.clone())).unwrap());
+
+        // A directory where the file belongs makes the write fail.
+        std::fs::remove_file(&path).unwrap();
+        std::fs::create_dir(&path).unwrap();
+
+        assert!(control.apply_microphone(None).is_err());
+        assert_eq!(control.settings.microphone, Some(chosen));
     }
 
     #[test]

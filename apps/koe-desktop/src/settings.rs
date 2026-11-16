@@ -7,6 +7,7 @@ use std::process::Command;
 use std::time::SystemTime;
 
 use global_hotkey::hotkey::HotKey;
+use koe_capture::DeviceId;
 use koe_record::Format;
 use koe_session_store::{Error as StoreError, Meeting, RECORDING_FILE, Store};
 use koe_transcribe::Model;
@@ -125,6 +126,9 @@ pub struct DictationSettings {
     pub model: Option<PathBuf>,
     /// The BCP 47 language a dictation requests, for example `ja`.
     pub language: Option<String>,
+    /// The microphone both a meeting take and a dictation capture from.
+    /// `None` follows the platform's default input.
+    pub microphone: Option<DeviceId>,
 }
 
 impl Default for DictationSettings {
@@ -133,6 +137,7 @@ impl Default for DictationSettings {
             hotkey: hotkey::default_hotkey(),
             model: None,
             language: None,
+            microphone: None,
         }
     }
 }
@@ -161,6 +166,7 @@ impl DictationSettings {
         let mut hotkey = None;
         let mut model = None;
         let mut language = None;
+        let mut microphone = None;
         let mut recognized = false;
         for line in text.lines() {
             let line = line.trim();
@@ -184,12 +190,17 @@ impl DictationSettings {
                     recognized = true;
                     language = value_or_none(value).map(str::to_owned);
                 }
+                "microphone" => {
+                    recognized = true;
+                    microphone = value_or_none(value).and_then(|value| DeviceId::new(value).ok());
+                }
                 _ => {}
             }
         }
         let mut settings = Self {
             model,
             language,
+            microphone,
             ..Self::default()
         };
         let mut warning = None;
@@ -245,6 +256,11 @@ impl DictationSettings {
             text,
             "language = {}",
             self.language.as_deref().unwrap_or_default()
+        );
+        let _ = writeln!(
+            text,
+            "microphone = {}",
+            self.microphone.as_ref().map_or("", DeviceId::as_str)
         );
         let partial = partial_path(path);
         let mut file = fs::File::create(&partial)
@@ -536,6 +552,7 @@ mod tests {
             hotkey: hotkey::parse("Alt+F7").unwrap(),
             model: Some(PathBuf::from("/models/tiny.gguf")),
             language: Some("ja".to_owned()),
+            microphone: Some(DeviceId::new("hw:1,0").unwrap()),
         }
     }
 
@@ -545,6 +562,45 @@ mod tests {
         assert_eq!(settings.hotkey, hotkey::default_hotkey());
         assert_eq!(settings.model, None);
         assert_eq!(settings.language, None);
+        assert_eq!(settings.microphone, None);
+    }
+
+    #[test]
+    fn a_saved_microphone_loads_back_as_the_same_device() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join(SETTINGS_FILE);
+        let settings = DictationSettings {
+            microphone: Some(DeviceId::new("hw:2,0").unwrap()),
+            ..DictationSettings::default()
+        };
+        settings.save(&path).unwrap();
+        let (loaded, warning) = DictationSettings::load(&path);
+        assert_eq!(warning, None);
+        assert_eq!(loaded.microphone, settings.microphone);
+        assert_eq!(
+            loaded.microphone.map(|id| id.to_string()),
+            Some("hw:2,0".to_owned())
+        );
+    }
+
+    #[test]
+    fn an_empty_microphone_value_is_no_choice() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join(SETTINGS_FILE);
+        fs::write(&path, "microphone = \n").unwrap();
+        let (loaded, warning) = DictationSettings::load(&path);
+        assert_eq!(warning, None);
+        assert_eq!(loaded.microphone, None);
+    }
+
+    #[test]
+    fn a_microphone_alone_is_a_recognized_setting() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join(SETTINGS_FILE);
+        fs::write(&path, "microphone = hw:1,0\n").unwrap();
+        let (loaded, warning) = DictationSettings::load(&path);
+        assert_eq!(warning, None);
+        assert_eq!(loaded.microphone, Some(DeviceId::new("hw:1,0").unwrap()));
     }
 
     #[test]
@@ -568,7 +624,8 @@ mod tests {
             "# koe desktop settings\n\
              hotkey = Alt+F7\n\
              model = /models/tiny.gguf\n\
-             language = ja\n"
+             language = ja\n\
+             microphone = hw:1,0\n"
         );
         assert!(
             !root
@@ -692,12 +749,13 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let path = root.path().join(SETTINGS_FILE);
         dictation().save(&path).unwrap();
-        let text = "hotkey = Alt+F7\nmodel = \nlanguage = \n";
+        let text = "hotkey = Alt+F7\nmodel = \nlanguage = \nmicrophone = \n";
         fs::write(&path, text).unwrap();
         let (loaded, _) = DictationSettings::load(&path);
         assert_eq!(loaded.hotkey, dictation().hotkey);
         assert_eq!(loaded.model, None);
         assert_eq!(loaded.language, None);
+        assert_eq!(loaded.microphone, None);
     }
 
     #[test]

@@ -8,6 +8,7 @@
 
 use std::time::{Duration, Instant};
 
+use koe_capture::DeviceId;
 use koe_transcribe::Model;
 
 use crate::error::DesktopError;
@@ -36,6 +37,8 @@ pub struct DictationContext {
     pub model: Option<Model>,
     /// The BCP 47 language a dictation would request, for example `ja`.
     pub language: Option<Box<str>>,
+    /// The microphone a dictation would capture from, or the platform default.
+    pub microphone: Option<DeviceId>,
 }
 
 /// What one dictation transcribes.
@@ -45,6 +48,8 @@ pub struct DictationPlan {
     pub model: Model,
     /// The language the dictation requests, or the engine's choice.
     pub language: Option<Box<str>>,
+    /// The microphone the dictation opens, or the platform default.
+    pub microphone: Option<DeviceId>,
 }
 
 /// What the dictation thread reports when it ends.
@@ -54,6 +59,10 @@ pub struct DictationOutcome {
     pub text: String,
     /// Why the text could not be typed, when it could not.
     pub failure: Option<DesktopError>,
+    /// What the user should know about a dictation that still succeeded, such
+    /// as recording from the default microphone because the saved one was
+    /// gone.
+    pub warning: Option<String>,
 }
 
 /// A finished dictation.
@@ -65,6 +74,8 @@ pub struct DictationDone {
     pub failure: Option<DesktopError>,
     /// Time the dictation ran for.
     pub duration: Duration,
+    /// What the user should know about a dictation that still succeeded.
+    pub warning: Option<String>,
 }
 
 impl DictationDone {
@@ -72,6 +83,22 @@ impl DictationDone {
     #[must_use]
     pub const fn failed(&self) -> bool {
         self.failure.is_some() || self.text.is_empty()
+    }
+
+    /// The sentence to show once the dictation ends.
+    ///
+    /// A failure outranks a warning, because it says why nothing was typed.
+    /// A warning outranks the empty-text sentence: a silent room and a missing
+    /// microphone both end with no text, and the microphone is the one the
+    /// user can act on.
+    #[must_use]
+    pub fn notice(&self) -> String {
+        match (&self.failure, &self.warning, self.text.is_empty()) {
+            (Some(failure), _, _) => failure.to_string(),
+            (None, Some(warning), _) => warning.clone(),
+            (None, None, true) => "Dictation heard nothing".to_owned(),
+            (None, None, false) => format!("Typed {}", self.text),
+        }
     }
 }
 
@@ -181,6 +208,7 @@ impl Dictation {
                     duration: now.saturating_duration_since(started),
                     text: outcome.text,
                     failure: outcome.failure,
+                    warning: outcome.warning,
                 };
                 (Self::Done(Box::new(done)), None)
             }
@@ -238,6 +266,7 @@ fn start(context: DictationContext) -> Result<DictationPlan, &'static str> {
     Ok(DictationPlan {
         model,
         language: context.language,
+        microphone: context.microphone,
     })
 }
 
@@ -258,6 +287,7 @@ mod tests {
             meeting_active,
             model,
             language: Some("ja".into()),
+            microphone: None,
         }
     }
 
@@ -285,6 +315,7 @@ mod tests {
         Box::new(DictationOutcome {
             text: text.to_owned(),
             failure,
+            warning: None,
         })
     }
 
@@ -304,6 +335,31 @@ mod tests {
         assert_eq!(plan.language.as_deref(), Some("ja"));
         assert!(matches!(dictation, Dictation::Listening { .. }));
         assert!(dictation.is_active());
+    }
+
+    #[test]
+    fn a_context_microphone_reaches_the_plan() {
+        let chosen = DeviceId::new("hw:1,0").unwrap();
+        let mut dictation = Dictation::Idle;
+        let Some(DictationAction::Start(plan)) = dictation.toggle(
+            DictationContext {
+                microphone: Some(chosen.clone()),
+                ..configured()
+            },
+            base(),
+        ) else {
+            unreachable!("a configured context starts a dictation");
+        };
+        assert_eq!(plan.microphone, Some(chosen));
+    }
+
+    #[test]
+    fn a_context_without_a_microphone_plans_the_platform_default() {
+        let Some(DictationAction::Start(plan)) = Dictation::Idle.toggle(configured(), base())
+        else {
+            unreachable!("a configured context starts a dictation");
+        };
+        assert_eq!(plan.microphone, None);
     }
 
     #[test]
@@ -412,6 +468,66 @@ mod tests {
         assert!(!done.failed());
         assert_eq!(done.duration, Duration::from_secs(4));
         assert!(!dictation.is_active());
+    }
+
+    #[test]
+    fn a_warning_rides_a_finished_dictation_without_failing_it() {
+        let mut dictation = stopping(base());
+        let warning = "The saved microphone is not connected.".to_owned();
+        dictation.reduce(
+            DictationEvent::Finished(Box::new(DictationOutcome {
+                text: "こんにちは".to_owned(),
+                failure: None,
+                warning: Some(warning.clone()),
+            })),
+            base(),
+        );
+        let Dictation::Done(done) = &dictation else {
+            unreachable!("a finished event makes a done dictation");
+        };
+        assert_eq!(done.warning, Some(warning));
+        assert!(!done.failed(), "a typed dictation is not a failure");
+    }
+
+    fn finished(text: &str, failure: Option<DesktopError>, warning: Option<&str>) -> DictationDone {
+        DictationDone {
+            text: text.to_owned(),
+            failure,
+            duration: Duration::from_secs(1),
+            warning: warning.map(str::to_owned),
+        }
+    }
+
+    #[test]
+    fn a_failure_says_why_nothing_was_typed() {
+        let failure = DesktopError::Dictation("the microphone never opened".to_owned());
+        assert_eq!(
+            finished("", Some(failure), Some("a warning")).notice(),
+            "dictation failed: the microphone never opened"
+        );
+    }
+
+    #[test]
+    fn a_warning_outranks_the_empty_text_sentence() {
+        let warning = "The saved microphone is not connected.";
+        assert_eq!(
+            finished("", None, Some(warning)).notice(),
+            warning,
+            "a silent room and a missing microphone both end with no text"
+        );
+    }
+
+    #[test]
+    fn a_dictation_that_heard_nothing_says_so() {
+        assert_eq!(finished("", None, None).notice(), "Dictation heard nothing");
+    }
+
+    #[test]
+    fn a_dictation_that_typed_says_what_it_typed() {
+        assert_eq!(
+            finished("こんにちは", None, None).notice(),
+            "Typed こんにちは"
+        );
     }
 
     #[test]

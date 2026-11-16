@@ -12,7 +12,7 @@ use std::sync::{Arc, Mutex, PoisonError};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime};
 
-use koe_capture::{Source, StreamSpec};
+use koe_capture::{DeviceId, Source, StreamSpec};
 use koe_record::{Channels, Recorder, RecordingSpec, Summary};
 use koe_session_store::Transcripts;
 use koe_transcribe::{AudioSpec, Event, LiveSession, Model, Options, Transcriber, Transcript};
@@ -41,6 +41,9 @@ pub struct SessionPlan {
     pub sources: Sources,
     /// The speech-to-text to run beside the recorder, when one is configured.
     pub transcription: Option<TranscriptionPlan>,
+    /// The microphone a take opens, or the platform default when `None`.
+    /// System audio always opens its own default.
+    pub microphone: Option<DeviceId>,
 }
 
 /// The speech-to-text a take runs beside its recorder.
@@ -78,6 +81,7 @@ impl SessionPlan {
             streams,
             sources,
             transcription: None,
+            microphone: None,
         })
     }
 }
@@ -227,6 +231,9 @@ fn run(
         for (source, spec) in &plan.streams {
             let source = *source;
             let spec = *spec;
+            // Only the microphone honours the saved device; system audio has
+            // one default the platform reports.
+            let requested = requested_device(source, plan.microphone.as_ref());
             let sender = sender.clone();
             let stop = Arc::clone(stop);
             let paused = Arc::clone(paused);
@@ -241,6 +248,7 @@ fn run(
                     &paused,
                     recorder,
                     ready.as_ref(),
+                    requested,
                 )
             }));
         }
@@ -298,6 +306,26 @@ fn no_transcript_notice(exits: &[SourceExit]) -> Option<&'static str> {
     let transcribed = exits.iter().any(|exit| exit.transcript.is_some());
     let spoke = exits.iter().any(|exit| exit.spoke);
     (awaiting && !transcribed && !spoke).then_some(NO_TRANSCRIPT)
+}
+
+/// The device a source asks the platform to open.
+///
+/// The saved microphone is for the microphone alone: system audio names no id,
+/// so a saved microphone never moves the other source.
+const fn requested_device(source: Source, microphone: Option<&DeviceId>) -> Option<&DeviceId> {
+    match source {
+        Source::Microphone => microphone,
+        Source::SystemAudio => None,
+    }
+}
+
+/// Shown when a saved microphone is gone and the default records instead.
+///
+/// Both capture paths say the same sentence, and it names the device that was
+/// actually opened so the user knows what they are hearing.
+#[must_use]
+pub(crate) fn fallback_notice(name: &str) -> String {
+    format!("The saved microphone is not connected; recording from {name} instead.")
 }
 
 /// Starts the model load without holding up the capture streams.
@@ -371,7 +399,8 @@ fn spawn_transcription(
 
 #[allow(
     clippy::too_many_lines,
-    reason = "one loop owns the recorder and the transcription of one source; splitting it would scatter the state each block updates"
+    clippy::too_many_arguments,
+    reason = "one loop owns the recorder, the transcription and the chosen device of one source; splitting it would scatter the state each block updates"
 )]
 fn pump(
     source: Source,
@@ -381,6 +410,7 @@ fn pump(
     paused: &AtomicBool,
     recorder: &Mutex<Recorder>,
     ready: Option<&Receiver<Result<LiveSession, String>>>,
+    requested: Option<&DeviceId>,
 ) -> SourceExit {
     let mut waiting = ready.is_some();
     let mut live = None;
@@ -391,8 +421,13 @@ fn pump(
     let mut behind = false;
     let mut paused_since = None;
     let mut paused_total = Duration::ZERO;
-    let mut stream = match koe_capture::open(&spec) {
-        Ok(stream) => {
+    let mut stream = match koe_capture::open_requested(&spec, requested) {
+        Ok((stream, fell_back)) => {
+            if fell_back {
+                let _ = sender.send(EngineEvent::Warning(fallback_notice(
+                    stream.device().name(),
+                )));
+            }
             let _ = sender.send(EngineEvent::Opened(source));
             Some(stream)
         }
@@ -765,6 +800,32 @@ mod tests {
         let transcription = plan.transcription.unwrap();
         assert_eq!(transcription.model, Model::gguf("tiny.gguf"));
         assert_eq!(transcription.language.as_deref(), Some("ja"));
+    }
+
+    #[test]
+    fn a_meeting_plan_starts_on_the_platform_microphone() {
+        let plan = SessionPlan::meeting(PathBuf::from("take.ogg"), Sources::MEETING).unwrap();
+        assert_eq!(plan.microphone, None);
+    }
+
+    #[test]
+    fn the_fallback_sentence_names_the_device_it_opened() {
+        let message = fallback_notice("Built-in Microphone");
+        assert_eq!(
+            message,
+            "The saved microphone is not connected; recording from Built-in Microphone instead."
+        );
+    }
+
+    #[test]
+    fn only_the_microphone_asks_for_the_saved_device() {
+        let chosen = DeviceId::new("hw:2,0").unwrap();
+        assert_eq!(
+            requested_device(Source::Microphone, Some(&chosen)),
+            Some(&chosen)
+        );
+        assert_eq!(requested_device(Source::SystemAudio, Some(&chosen)), None);
+        assert_eq!(requested_device(Source::Microphone, None), None);
     }
 
     #[derive(Default)]
