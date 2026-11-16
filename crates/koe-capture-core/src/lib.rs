@@ -24,7 +24,7 @@ mod stream;
 
 pub use config::{MAX_CHANNELS, MAX_SAMPLE_RATE, MIN_SAMPLE_RATE, StreamSpec};
 pub use convert::{SampleFormat, decode};
-pub use device::{DeviceId, DeviceInfo, Source, select};
+pub use device::{DeviceId, DeviceInfo, Resolution, Source, select, select_or_default};
 pub use error::Error;
 pub use queue::FrameQueue;
 pub use stream::{CaptureStream, RawStream};

@@ -182,6 +182,48 @@ pub fn select<'a>(
     }
 }
 
+/// What a request for a specific capture device resolved to.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Resolution {
+    /// The device the request named.
+    Requested,
+    /// The request named no device, so the source's default is used.
+    Default,
+    /// The request named a device the platform does not report for this
+    /// source, so the source's default is used instead.
+    Missing,
+}
+
+/// Picks the device a capture request should open, falling back to the
+/// source's default.
+///
+/// A saved device is often unplugged, and a take that refuses to record
+/// because of one is worse than a take that records from the default, so an
+/// id that is gone, or that now names the other source, resolves to the
+/// default and says so through [`Resolution::Missing`]. The id is not an
+/// error here; [`select`] is the strict form.
+///
+/// # Errors
+///
+/// Returns [`Error::NoDevice`] when no device provides the source.
+pub fn select_or_default<'a>(
+    devices: &'a [DeviceInfo],
+    source: Source,
+    requested: Option<&DeviceId>,
+) -> Result<(&'a DeviceInfo, Resolution), Error> {
+    let Some(requested) = requested else {
+        return select(devices, source, None).map(|device| (device, Resolution::Default));
+    };
+
+    match select(devices, source, Some(requested)) {
+        Ok(device) => Ok((device, Resolution::Requested)),
+        Err(Error::DeviceNotFound(_) | Error::WrongSource { .. }) => {
+            select(devices, source, None).map(|device| (device, Resolution::Missing))
+        }
+        Err(error) => Err(error),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(
@@ -305,5 +347,80 @@ mod tests {
     fn empty_list_has_no_default() {
         let error = select(&[], Source::SystemAudio, None).unwrap_err();
         assert_eq!(error, Error::NoDevice(Source::SystemAudio));
+    }
+
+    #[test]
+    fn no_request_resolves_to_the_default_device() {
+        let devices = [
+            device("first", Source::Microphone, false),
+            device("chosen", Source::Microphone, true),
+        ];
+        let (selected, resolution) = select_or_default(&devices, Source::Microphone, None).unwrap();
+        assert_eq!(selected.id().as_str(), "chosen");
+        assert_eq!(resolution, Resolution::Default);
+    }
+
+    #[test]
+    fn present_id_resolves_to_that_device_even_when_not_default() {
+        let devices = [
+            device("default", Source::Microphone, true),
+            device("chosen", Source::Microphone, false),
+        ];
+        let chosen = DeviceId::new("chosen").unwrap();
+        let (selected, resolution) =
+            select_or_default(&devices, Source::Microphone, Some(&chosen)).unwrap();
+        assert_eq!(selected.id().as_str(), "chosen");
+        assert_eq!(resolution, Resolution::Requested);
+    }
+
+    #[test]
+    fn gone_id_resolves_to_the_default() {
+        let devices = [device("present", Source::Microphone, true)];
+        let chosen = DeviceId::new("absent").unwrap();
+        let (selected, resolution) =
+            select_or_default(&devices, Source::Microphone, Some(&chosen)).unwrap();
+        assert_eq!(selected.id().as_str(), "present");
+        assert_eq!(resolution, Resolution::Missing);
+    }
+
+    #[test]
+    fn id_for_the_other_source_resolves_to_the_default() {
+        let devices = [
+            device("mic", Source::Microphone, true),
+            device("speakers", Source::SystemAudio, false),
+        ];
+        let chosen = DeviceId::new("speakers").unwrap();
+        let (selected, resolution) =
+            select_or_default(&devices, Source::Microphone, Some(&chosen)).unwrap();
+        assert_eq!(selected.id().as_str(), "mic");
+        assert_eq!(resolution, Resolution::Missing);
+    }
+
+    #[test]
+    fn source_without_devices_is_reported_for_a_gone_id() {
+        let devices = [device("system", Source::SystemAudio, true)];
+        let chosen = DeviceId::new("absent").unwrap();
+        let error = select_or_default(&devices, Source::Microphone, Some(&chosen)).unwrap_err();
+        assert_eq!(error, Error::NoDevice(Source::Microphone));
+    }
+
+    #[test]
+    fn source_without_devices_is_reported_for_no_request() {
+        let devices = [device("system", Source::SystemAudio, true)];
+        let error = select_or_default(&devices, Source::Microphone, None).unwrap_err();
+        assert_eq!(error, Error::NoDevice(Source::Microphone));
+    }
+
+    #[test]
+    fn missing_id_falls_back_to_the_first_device_when_no_default_is_marked() {
+        let devices = [
+            device("first", Source::Microphone, false),
+            device("second", Source::Microphone, false),
+        ];
+        let chosen = DeviceId::new("absent").unwrap();
+        let (selected, resolution) =
+            select_or_default(&devices, Source::Microphone, Some(&chosen)).unwrap();
+        assert_eq!(selected.id().as_str(), "first");
+        assert_eq!(resolution, Resolution::Missing);
     }
 }
