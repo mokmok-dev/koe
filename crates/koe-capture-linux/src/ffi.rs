@@ -5,6 +5,7 @@
 use std::ffi::{CStr, c_char, c_int, c_void};
 use std::mem::take;
 use std::ptr::{null, null_mut, with_exposed_provenance_mut};
+use std::rc::Rc;
 use std::thread;
 use std::time::Instant;
 
@@ -143,7 +144,21 @@ const fn pointer(operation: Operation) -> *mut c_void {
     with_exposed_provenance_mut(operation.0)
 }
 
-struct Mainloop(*mut c_void);
+struct MainloopHandle(*mut c_void);
+
+impl Drop for MainloopHandle {
+    fn drop(&mut self) {
+        unsafe { pa_mainloop_free(self.0) };
+    }
+}
+
+/// Shared handle to the poll loop.
+///
+/// A `pa_context` points back into the mainloop it was created from, so every
+/// context holds a reference of its own instead of relying on the owner's
+/// field order to free it second.
+#[derive(Clone)]
+struct Mainloop(Rc<MainloopHandle>);
 
 impl Mainloop {
     fn new() -> Result<Self, Error> {
@@ -154,12 +169,12 @@ impl Mainloop {
                 code: 0,
             })
         } else {
-            Ok(Self(mainloop))
+            Ok(Self(Rc::new(MainloopHandle(mainloop))))
         }
     }
 
     fn api(&self) -> Result<*mut c_void, Error> {
-        let api = unsafe { pa_mainloop_get_api(self.0) };
+        let api = unsafe { pa_mainloop_get_api(self.0.0) };
         if api.is_null() {
             Err(Error::Backend {
                 operation: "pa_mainloop_get_api",
@@ -171,7 +186,7 @@ impl Mainloop {
     }
 
     fn iterate(&self) -> Result<(), Error> {
-        let status = unsafe { pa_mainloop_iterate(self.0, 0, null_mut()) };
+        let status = unsafe { pa_mainloop_iterate(self.0.0, 0, null_mut()) };
         if status < 0 {
             Err(backend("pa_mainloop_iterate", status))
         } else {
@@ -180,16 +195,16 @@ impl Mainloop {
     }
 }
 
-impl Drop for Mainloop {
-    fn drop(&mut self) {
-        unsafe { pa_mainloop_free(self.0) };
-    }
+struct Context {
+    handle: *mut c_void,
+    /// Holds the loop open for as long as the context exists; `handle` is only
+    /// valid while that loop is alive.
+    _mainloop: Mainloop,
 }
 
-struct Context(*mut c_void);
-
 impl Context {
-    fn new(api: *mut c_void) -> Result<Self, Error> {
+    fn new(mainloop: &Mainloop) -> Result<Self, Error> {
+        let api = mainloop.api()?;
         let name = c"koe-capture";
         let context = unsafe { pa_context_new(api, name.as_ptr()) };
         if context.is_null() {
@@ -198,12 +213,15 @@ impl Context {
                 code: 0,
             })
         } else {
-            Ok(Self(context))
+            Ok(Self {
+                handle: context,
+                _mainloop: mainloop.clone(),
+            })
         }
     }
 
     fn connect(&self) -> Result<(), Error> {
-        let status = unsafe { pa_context_connect(self.0, null(), 0, null()) };
+        let status = unsafe { pa_context_connect(self.handle, null(), 0, null()) };
         if status < 0 {
             Err(backend("pa_context_connect", self.errno()))
         } else {
@@ -212,19 +230,19 @@ impl Context {
     }
 
     fn errno(&self) -> c_int {
-        unsafe { pa_context_errno(self.0) }
+        unsafe { pa_context_errno(self.handle) }
     }
 
     fn state(&self) -> c_int {
-        unsafe { pa_context_get_state(self.0) }
+        unsafe { pa_context_get_state(self.handle) }
     }
 }
 
 impl Drop for Context {
     fn drop(&mut self) {
         unsafe {
-            pa_context_disconnect(self.0);
-            pa_context_unref(self.0);
+            pa_context_disconnect(self.handle);
+            pa_context_unref(self.handle);
         }
     }
 }
@@ -285,6 +303,9 @@ extern "C" fn collect_source(
     });
 }
 
+/// Owns the loop and the context built on it. The context holds a mainloop
+/// reference of its own, so the loop outlives it whatever order these fields
+/// drop in.
 struct PulseHal {
     mainloop: Mainloop,
     context: Context,
@@ -311,7 +332,7 @@ impl Session for PulseHal {
     fn begin_server_query(&mut self) -> Result<Operation, Error> {
         let operation = unsafe {
             pa_context_get_server_info(
-                self.context.0,
+                self.context.handle,
                 Some(collect_server),
                 std::ptr::from_mut(&mut self.collector).cast(),
             )
@@ -333,7 +354,7 @@ impl Session for PulseHal {
     fn begin_source_query(&mut self) -> Result<Operation, Error> {
         let operation = unsafe {
             pa_context_get_source_info_list(
-                self.context.0,
+                self.context.handle,
                 Some(collect_source),
                 std::ptr::from_mut(&mut self.collector).cast(),
             )
@@ -382,8 +403,7 @@ impl Session for PulseHal {
 /// reached.
 pub fn devices() -> Result<Vec<DeviceInfo>, Error> {
     let mainloop = Mainloop::new()?;
-    let api = mainloop.api()?;
-    let context = Context::new(api)?;
+    let context = Context::new(&mainloop)?;
     context.connect()?;
     let mut hal = PulseHal {
         mainloop,
@@ -461,4 +481,40 @@ pub fn open(device: &DeviceInfo, spec: StreamSpec) -> Result<Box<dyn RawStream>,
         simple,
         channels: usize::from(spec.channels()),
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used)]
+
+    use super::*;
+
+    #[test]
+    fn context_holds_a_mainloop_reference_of_its_own() {
+        let mainloop = Mainloop::new().unwrap();
+        let before = Rc::strong_count(&mainloop.0);
+        let context = Context::new(&mainloop).unwrap();
+        assert_eq!(Rc::strong_count(&mainloop.0), before + 1);
+        drop(context);
+        assert_eq!(Rc::strong_count(&mainloop.0), before);
+    }
+
+    #[test]
+    fn dropping_the_owners_mainloop_before_the_context_keeps_the_loop_alive() {
+        let mainloop = Mainloop::new().unwrap();
+        let observed = Rc::downgrade(&mainloop.0);
+        let context = Context::new(&mainloop).unwrap();
+        let hal = PulseHal {
+            mainloop,
+            context,
+            collector: Collector::default(),
+        };
+        let PulseHal {
+            mainloop, context, ..
+        } = hal;
+        drop(mainloop);
+        assert_eq!(observed.strong_count(), 1);
+        drop(context);
+        assert_eq!(observed.strong_count(), 0);
+    }
 }
