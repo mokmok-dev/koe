@@ -372,6 +372,7 @@ mod tests {
             text: "hi".to_owned(),
             failure: None,
             duration: Duration::from_secs(1),
+            warning: None,
         }));
         assert!(HudState::dictation(&done, "hi", now).is_none());
     }

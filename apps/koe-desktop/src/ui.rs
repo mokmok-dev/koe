@@ -18,17 +18,17 @@ use gpui_kit::component::{
     input::{Input, InputEvent, InputState},
     message::{Message, MessageAlignment, MessageContent, MessageHeader},
     scroll::ScrollableElement as _,
-    searchable_list::SearchableVec,
+    searchable_list::{SearchableListItem, SearchableVec},
     select::{Select, SelectEvent, SelectState},
     setting::{SettingField, SettingGroup, SettingItem, SettingPage, Settings},
     sidebar::{Sidebar, SidebarHeader, SidebarMenuItem, SidebarToggleButton},
     status_bar::StatusBar,
     v_flex,
 };
-use koe_capture::Source;
+use koe_capture::{DeviceId, DeviceInfo, Source};
 use koe_record::Format;
 
-use crate::app::{Screen, Shell};
+use crate::app::{Inputs, Screen, Shell};
 use crate::dictation::Dictation;
 use crate::hotkey;
 use crate::hud;
@@ -47,6 +47,100 @@ const BLUE: u32 = 0x0058_A6FF;
 /// settings file stores by [`language::tag_of`].
 type LanguageItems = SearchableVec<SharedString>;
 
+/// One row of the microphone picker: what it reads as, and the device it
+/// picks. `None` is the platform default.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct MicrophoneItem {
+    label: SharedString,
+    device: Option<DeviceId>,
+}
+
+impl SearchableListItem for MicrophoneItem {
+    type Value = Option<DeviceId>;
+
+    fn title(&self) -> SharedString {
+        self.label.clone()
+    }
+
+    fn value(&self) -> &Self::Value {
+        &self.device
+    }
+}
+
+/// The microphone picker's rows, mapped back to the device ids the settings
+/// file stores.
+type MicrophoneItems = SearchableVec<MicrophoneItem>;
+
+/// The picker row that means the platform's default input.
+const DEFAULT_MICROPHONE: &str = "System default";
+
+/// The sentence a saved device that is no longer reported earns.
+const MISSING_MICROPHONE: &str =
+    "The saved microphone is not connected; the system default is used until it returns.";
+
+/// The picker's rows: the platform default, then each listed microphone in
+/// platform order.
+///
+/// Two devices can report the same name, so a repeated name gains its id to
+/// stay distinguishable.
+fn microphone_items(inputs: &Inputs) -> Vec<MicrophoneItem> {
+    let devices = match inputs {
+        Inputs::Listed(devices) => devices.as_slice(),
+        Inputs::Unlisted | Inputs::Listing | Inputs::Failed(_) => &[],
+    };
+    let mut rows = vec![MicrophoneItem {
+        label: DEFAULT_MICROPHONE.into(),
+        device: None,
+    }];
+    rows.extend(devices.iter().map(|device| MicrophoneItem {
+        label: microphone_label(devices, device).into(),
+        device: Some(device.id().clone()),
+    }));
+    rows
+}
+
+/// The label a device goes by in the picker: its name, plus its id when the
+/// platform reports more than one device under that name.
+fn microphone_label(devices: &[DeviceInfo], device: &DeviceInfo) -> String {
+    let shared = devices
+        .iter()
+        .filter(|other| other.name() == device.name())
+        .count()
+        > 1;
+    if shared {
+        format!("{} ({})", device.name(), device.id())
+    } else {
+        device.name().to_owned()
+    }
+}
+
+/// The row the picker selects: the saved device, or the default row when the
+/// save names none or names a device the list does not report.
+fn microphone_row(rows: &[MicrophoneItem], saved: Option<&DeviceId>) -> usize {
+    saved
+        .and_then(|saved| {
+            rows.iter()
+                .position(|row| row.device.as_ref() == Some(saved))
+        })
+        .unwrap_or_default()
+}
+
+/// What the microphone row explains under the picker, when it has something to
+/// say.
+fn microphone_hint(inputs: &Inputs, saved: Option<&DeviceId>) -> Option<String> {
+    match inputs {
+        Inputs::Unlisted => Some("Microphones have not been listed yet.".to_owned()),
+        Inputs::Listing => Some("Listing microphones…".to_owned()),
+        Inputs::Failed(error) => Some(format!("The microphones could not be listed: {error}")),
+        Inputs::Listed(devices) if devices.is_empty() => {
+            Some("No microphone is connected.".to_owned())
+        }
+        Inputs::Listed(devices) => saved
+            .filter(|saved| devices.iter().all(|device| device.id() != *saved))
+            .map(|_| MISSING_MICROPHONE.to_owned()),
+    }
+}
+
 /// Builds a click handler that applies a shell mutation. It is `Clone` so that
 /// setting renderers, which run as `Fn`, can copy it before a control takes one.
 fn click(
@@ -58,12 +152,25 @@ fn click(
     }
 }
 
+/// The entities the settings rows own, and the listing the microphone picker
+/// was built from.
+struct SettingsFields {
+    hotkey: Entity<InputState>,
+    model: Entity<InputState>,
+    language: Entity<SelectState<LanguageItems>>,
+    microphone: Entity<SelectState<MicrophoneItems>>,
+    microphone_rows: (Inputs, Option<DeviceId>),
+}
+
 /// The main window's root view.
 pub struct MainView {
     shell: Entity<Shell>,
     hotkey_input: Entity<InputState>,
     model_input: Entity<InputState>,
     language_select: Entity<SelectState<LanguageItems>>,
+    microphone_select: Entity<SelectState<MicrophoneItems>>,
+    /// The microphone listing and saved choice the picker was last built for.
+    microphone_rows: (Inputs, Option<DeviceId>),
     /// The meeting thread's scroll position.
     thread_scroll: ScrollHandle,
     /// Utterance count, draft count, and draft text length last scrolled for.
@@ -74,8 +181,13 @@ pub struct MainView {
 impl MainView {
     /// Builds the view, seeds the settings fields, and re-renders on change.
     pub fn new(shell: Entity<Shell>, window: &mut Window, cx: &mut Context<Self>) -> Self {
-        let (hotkey_input, model_input, language_select) =
-            Self::settings_fields(&shell, window, cx);
+        let SettingsFields {
+            hotkey: hotkey_input,
+            model: model_input,
+            language: language_select,
+            microphone: microphone_select,
+            microphone_rows,
+        } = Self::settings_fields(&shell, window, cx);
 
         let mut subscriptions = Vec::new();
         subscriptions.push(cx.subscribe(&hotkey_input, {
@@ -120,6 +232,17 @@ impl MainView {
             }
         }));
 
+        subscriptions.push(cx.subscribe(&microphone_select, {
+            let shell = shell.clone();
+            move |_, _, event: &SelectEvent<MicrophoneItems>, cx| {
+                let SelectEvent::Confirm(Some(microphone)) = event else {
+                    return;
+                };
+                let microphone = microphone.clone();
+                shell.update(cx, |shell, cx| shell.apply_microphone(microphone, cx));
+            }
+        }));
+
         cx.observe(&shell, |_, _, cx| cx.notify()).detach();
 
         Self {
@@ -127,6 +250,8 @@ impl MainView {
             hotkey_input,
             model_input,
             language_select,
+            microphone_select,
+            microphone_rows,
             thread_scroll: ScrollHandle::default(),
             thread_signature: (0, 0, 0),
             _subscriptions: subscriptions,
@@ -138,11 +263,7 @@ impl MainView {
         shell: &Entity<Shell>,
         window: &mut Window,
         cx: &mut Context<Self>,
-    ) -> (
-        Entity<InputState>,
-        Entity<InputState>,
-        Entity<SelectState<LanguageItems>>,
-    ) {
+    ) -> SettingsFields {
         let (hotkey_value, model_value, language_row) = {
             let shell = shell.read(cx);
             let settings = &shell.dictation_control.settings;
@@ -180,7 +301,63 @@ impl MainView {
             state.set_selected_index(language_row.map(IndexPath::new), window, cx);
         });
 
-        (hotkey_input, model_input, language_select)
+        let (listed, saved, rows, selected) = {
+            let shell = shell.read(cx);
+            let saved = shell.dictation_control.settings.microphone.clone();
+            let rows = microphone_items(&shell.inputs);
+            let selected = microphone_row(&rows, saved.as_ref());
+            (shell.inputs.clone(), saved, rows, selected)
+        };
+        let microphone_select = cx.new(|cx| {
+            SelectState::new(
+                MicrophoneItems::new(rows),
+                Some(IndexPath::new(selected)),
+                window,
+                cx,
+            )
+        });
+        microphone_select.update(cx, |state, cx| {
+            state.set_selected_index(Some(IndexPath::new(selected)), window, cx);
+        });
+
+        SettingsFields {
+            hotkey: hotkey_input,
+            model: model_input,
+            language: language_select,
+            microphone: microphone_select,
+            microphone_rows: (listed, saved),
+        }
+    }
+
+    /// Rebuilds the microphone picker's rows when the listing or the saved
+    /// device changed, and keeps the selected row on the saved one.
+    ///
+    /// A running listing keeps the rows it is about to replace, so the refresh
+    /// that follows a choice does not empty the picker while the audio server
+    /// is asked.
+    fn sync_microphone_rows(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let (inputs, saved) = {
+            let shell = self.shell.read(cx);
+            (
+                shell.inputs.clone(),
+                shell.dictation_control.settings.microphone.clone(),
+            )
+        };
+        let built = match (&inputs, &self.microphone_rows) {
+            (Inputs::Listing, previous) => previous.0.clone(),
+            _ => inputs,
+        };
+        let signature = (built.clone(), saved.clone());
+        if self.microphone_rows == signature {
+            return;
+        }
+        self.microphone_rows = signature;
+        let rows = microphone_items(&built);
+        let selected = IndexPath::new(microphone_row(&rows, saved.as_ref()));
+        self.microphone_select.update(cx, |state, cx| {
+            state.set_items(MicrophoneItems::new(rows), window, cx);
+            state.set_selected_index(Some(selected), window, cx);
+        });
     }
 }
 
@@ -408,7 +585,7 @@ impl MainView {
     /// keystroke, and the hotkey must commit only on Enter.
     #[allow(
         clippy::too_many_lines,
-        reason = "the two pages are one declarative tree; splitting off a row would separate it from the page that owns it"
+        reason = "the pages are one declarative tree; splitting off a row would separate it from the page that owns it"
     )]
     fn settings_screen(&self, shell: &Shell, cx: &Context<Self>) -> AnyElement {
         let entity = self.shell.clone();
@@ -512,6 +689,52 @@ impl MainView {
         .layout(Axis::Vertical)
         .keywords(["language", "locale", "speech"]);
 
+        let microphone_hint = microphone_hint(
+            &shell.inputs,
+            shell.dictation_control.settings.microphone.as_ref(),
+        );
+        let microphone_disabled = !can_start || shell.dictation_control.dictation.is_active();
+        let on_refresh = click(entity.clone(), Shell::refresh_inputs);
+        let microphone_item = SettingItem::new(
+            "Microphone",
+            SettingField::render({
+                let select = self.microphone_select.clone();
+                move |options, _, cx| {
+                    v_flex()
+                        .gap_1()
+                        .child(
+                            h_flex()
+                                .items_center()
+                                .gap_2()
+                                .child(
+                                    Select::new(&select)
+                                        .placeholder(DEFAULT_MICROPHONE)
+                                        .accessibility_label("Microphone")
+                                        .w(px(240.0))
+                                        .disabled(options.is_disabled()),
+                                )
+                                .child(
+                                    Button::new("refresh-microphones")
+                                        .label("Refresh")
+                                        .small()
+                                        .disabled(options.is_disabled())
+                                        .on_click(on_refresh.clone()),
+                                ),
+                        )
+                        .children(microphone_hint.clone().map(|message| {
+                            div()
+                                .text_xs()
+                                .text_color(cx.theme().muted_foreground)
+                                .child(message)
+                        }))
+                }
+            }),
+        )
+        .description("Both a meeting take and a dictation listen to this microphone.")
+        .layout(Axis::Vertical)
+        .keywords(["microphone", "input", "device", "audio"])
+        .disabled(microphone_disabled);
+
         let source_item = |source: Source, title: &'static str| {
             SettingItem::new(
                 title,
@@ -601,6 +824,13 @@ impl MainView {
             .sidebar_width(px(180.0))
             .sidebar_size_range(px(150.0)..px(260.0))
             .page(
+                SettingPage::new("Input")
+                    .icon(Icon::new(IconName::Mic))
+                    .description("Which microphone a meeting take and a dictation listen to.")
+                    .resettable(false)
+                    .group(SettingGroup::new().title("Microphone").item(microphone_item)),
+            )
+            .page(
                 SettingPage::new("Dictation")
                     .icon(Icon::new(IconName::Mic))
                     .description("The global binding and the speech model dictation and meeting transcripts use.")
@@ -637,7 +867,8 @@ impl Render for MainView {
         clippy::too_many_lines,
         reason = "the window chrome is one element tree; splitting the title bar, body and footer scatters the layout"
     )]
-    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.sync_microphone_rows(window, cx);
         let entity = self.shell.clone();
         let shell = entity.read(cx);
         let theme = cx.theme();
@@ -1054,7 +1285,24 @@ fn detail(phase: &Phase) -> String {
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::unwrap_used)]
+
     use super::*;
+
+    fn device(id: &str, name: &str, is_default: bool) -> DeviceInfo {
+        DeviceInfo::new(
+            DeviceId::new(id).unwrap(),
+            name,
+            Source::Microphone,
+            is_default,
+            48_000,
+            1,
+        )
+    }
+
+    fn id(value: &str) -> DeviceId {
+        DeviceId::new(value).unwrap()
+    }
 
     #[test]
     fn you_sits_at_the_trailing_edge_and_them_at_the_leading_edge() {
@@ -1062,5 +1310,95 @@ mod tests {
         assert_eq!(utterance_alignment(Speaker::Them), MessageAlignment::Start);
         assert_eq!(bubble_variant(Speaker::You), BubbleVariant::Filled);
         assert_eq!(bubble_variant(Speaker::Them), BubbleVariant::Secondary);
+    }
+
+    #[test]
+    fn the_default_row_comes_first_and_the_devices_keep_platform_order() {
+        let inputs = Inputs::Listed(vec![
+            device("hw:1,0", "Studio Mic", false),
+            device("hw:0,0", "Built-in Microphone", true),
+        ]);
+        let rows = microphone_items(&inputs);
+        assert_eq!(rows[0].label.as_ref(), DEFAULT_MICROPHONE);
+        assert_eq!(rows[0].device, None);
+        assert_eq!(rows[1].label.as_ref(), "Studio Mic");
+        assert_eq!(rows[1].device, Some(id("hw:1,0")));
+        assert_eq!(rows[2].label.as_ref(), "Built-in Microphone");
+    }
+
+    #[test]
+    fn a_repeated_name_gains_the_id_and_a_unique_one_does_not() {
+        let inputs = Inputs::Listed(vec![
+            device("hw:1,0", "USB Audio", false),
+            device("hw:2,0", "USB Audio", false),
+            device("hw:0,0", "Built-in Microphone", true),
+        ]);
+        let rows = microphone_items(&inputs);
+        assert_eq!(rows[1].label.as_ref(), "USB Audio (hw:1,0)");
+        assert_eq!(rows[2].label.as_ref(), "USB Audio (hw:2,0)");
+        assert_eq!(rows[3].label.as_ref(), "Built-in Microphone");
+    }
+
+    #[test]
+    fn the_selected_row_is_the_saved_device_or_the_default() {
+        let inputs = Inputs::Listed(vec![
+            device("hw:1,0", "Studio Mic", false),
+            device("hw:0,0", "Built-in Microphone", true),
+        ]);
+        let rows = microphone_items(&inputs);
+        assert_eq!(microphone_row(&rows, None), 0);
+        assert_eq!(microphone_row(&rows, Some(&id("hw:1,0"))), 1);
+        assert_eq!(microphone_row(&rows, Some(&id("hw:9,0"))), 0);
+    }
+
+    #[test]
+    fn an_unlisted_listing_has_only_the_default_row() {
+        for inputs in [
+            Inputs::Unlisted,
+            Inputs::Listing,
+            Inputs::Failed("no audio server".to_owned()),
+        ] {
+            let rows = microphone_items(&inputs);
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0].device, None);
+        }
+    }
+
+    #[test]
+    fn the_hint_reports_how_the_listing_stands() {
+        assert_eq!(
+            microphone_hint(&Inputs::Unlisted, None).as_deref(),
+            Some("Microphones have not been listed yet.")
+        );
+        assert_eq!(
+            microphone_hint(&Inputs::Listing, None).as_deref(),
+            Some("Listing microphones…")
+        );
+        let failed = Inputs::Failed("the audio server did not answer".to_owned());
+        assert_eq!(
+            microphone_hint(&failed, None).as_deref(),
+            Some("The microphones could not be listed: the audio server did not answer")
+        );
+        assert_eq!(
+            microphone_hint(&Inputs::Listed(Vec::new()), None).as_deref(),
+            Some("No microphone is connected.")
+        );
+    }
+
+    #[test]
+    fn a_saved_device_the_list_reports_needs_no_hint() {
+        let inputs = Inputs::Listed(vec![device("hw:1,0", "Studio Mic", false)]);
+        assert_eq!(microphone_hint(&inputs, Some(&id("hw:1,0"))), None);
+        assert_eq!(microphone_hint(&inputs, None), None);
+    }
+
+    #[test]
+    fn a_saved_device_the_list_lacks_says_the_default_is_used() {
+        let inputs = Inputs::Listed(vec![device("hw:1,0", "Studio Mic", true)]);
+        assert_eq!(
+            microphone_hint(&inputs, Some(&id("hw:9,0"))).as_deref(),
+            Some(MISSING_MICROPHONE)
+        );
+        assert!(MISSING_MICROPHONE.contains("not connected"));
     }
 }

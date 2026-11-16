@@ -929,6 +929,7 @@ mod tests {
             streams: Vec::new(),
             sources: Sources::EMPTY,
             transcription: None,
+            microphone: None,
         };
         assert!(phase.reduce(Event::Start(plan), base()).is_none());
         assert!(matches!(phase, Phase::Idle));

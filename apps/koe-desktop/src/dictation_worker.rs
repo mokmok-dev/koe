@@ -20,11 +20,11 @@ use std::thread;
 #[cfg(target_os = "linux")]
 use std::time::Duration;
 
-use koe_capture::{Source, StreamSpec};
+use koe_capture::{Resolution, Source, StreamSpec};
 use koe_transcribe::{AudioSpec, Event, LiveSession, LiveText, Options, Transcriber};
 
 use crate::dictation::{DictationOutcome, DictationPlan};
-use crate::engine::SAMPLE_RATE;
+use crate::engine::{SAMPLE_RATE, fallback_notice};
 use crate::error::DesktopError;
 use crate::wake::Wake;
 
@@ -242,8 +242,12 @@ fn capture(
         Ok(audio) => audio,
         Err(error) => return failed(DesktopError::Transcribe(error)),
     };
-    let mut stream = match koe_capture::open(&spec) {
-        Ok(stream) => stream,
+    let (mut stream, warning) = match koe_capture::open_requested(&spec, plan.microphone.as_ref()) {
+        Ok((stream, resolution)) => {
+            let warning = (resolution == Resolution::Missing)
+                .then(|| fallback_notice(stream.device().name()));
+            (stream, warning)
+        }
         Err(error) => return failed(error.into()),
     };
     let options = plan
@@ -273,7 +277,8 @@ fn capture(
         return failed(DesktopError::Thread(error.to_string()));
     }
     let (session, capture_failure) = pump(&mut stream, &ready, stop, transcript);
-    finish(stream, session, capture_failure, cancel, transcript)
+    drop(stream);
+    finish(session, capture_failure, warning, cancel, transcript)
 }
 
 /// Reads the microphone until the take stops or the stream fails, feeding the
@@ -354,19 +359,21 @@ fn pump(
 /// A cancelled take inserts nothing and reports nothing to show. A cancel
 /// that arrives before the inference skips waiting for it; one that arrives
 /// while it runs cannot stop the inference, but the check before the
-/// insertion still discards its result.
+/// insertion still discards its result. `warning` rides along with a take
+/// that still succeeded, so the user learns the saved microphone was gone
+/// without the dictation counting as failed.
 fn finish(
-    stream: koe_capture::CaptureStream,
     session: Option<LiveSession>,
     capture_failure: Option<DesktopError>,
+    warning: Option<String>,
     cancel: &Arc<AtomicBool>,
     transcript: &LiveTranscript,
 ) -> DictationOutcome {
-    drop(stream);
     if cancel.load(Ordering::Acquire) {
         return DictationOutcome {
             text: String::new(),
             failure: None,
+            warning: None,
         };
     }
     let mut text = String::new();
@@ -394,6 +401,7 @@ fn finish(
         return DictationOutcome {
             text: String::new(),
             failure: None,
+            warning: None,
         };
     }
     // The HUD's last TRANSCRIBING frame must show what is inserted, not a
@@ -404,7 +412,11 @@ fn finish(
     {
         failure = Some(error);
     }
-    DictationOutcome { text, failure }
+    DictationOutcome {
+        text,
+        failure,
+        warning,
+    }
 }
 
 /// An outcome that captured nothing and inserted nothing.
@@ -412,6 +424,7 @@ const fn failed(failure: DesktopError) -> DictationOutcome {
     DictationOutcome {
         text: String::new(),
         failure: Some(failure),
+        warning: None,
     }
 }
 
@@ -648,6 +661,43 @@ mod tests {
     #![allow(clippy::unwrap_used, clippy::float_cmp, clippy::cast_precision_loss)]
 
     use super::*;
+
+    #[test]
+    fn a_warning_survives_finish_and_does_not_fail_a_dictation_that_typed() {
+        use std::time::Instant;
+
+        use crate::dictation::{Dictation, DictationEvent};
+
+        let transcript = LiveTranscript::default();
+        let warning = fallback_notice("Built-in Microphone");
+        let outcome = finish(
+            None,
+            None,
+            Some(warning.clone()),
+            &Arc::new(AtomicBool::new(false)),
+            &transcript,
+        );
+        assert_eq!(outcome.warning, Some(warning.clone()));
+
+        let done = |outcome: DictationOutcome| {
+            let mut dictation = Dictation::Listening {
+                started: Instant::now(),
+            };
+            dictation.reduce(DictationEvent::Finished(Box::new(outcome)), Instant::now());
+            let Dictation::Done(done) = dictation else {
+                unreachable!("a finished event makes a done dictation");
+            };
+            *done
+        };
+        assert_eq!(done(outcome).warning, Some(warning.clone()));
+
+        let typed = done(DictationOutcome {
+            text: "hello".to_owned(),
+            failure: None,
+            warning: Some(warning),
+        });
+        assert!(!typed.failed(), "a warning is not a failure");
+    }
 
     #[test]
     fn dictated_text_drops_transcription_padding() {

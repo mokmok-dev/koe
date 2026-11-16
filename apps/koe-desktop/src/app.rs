@@ -12,6 +12,7 @@ use gpui::{
     WindowBounds, WindowDecorations, WindowId, WindowOptions, px, size,
 };
 use gpui_kit::component::{Theme, ThemeMode, TitleBar};
+use koe_capture::{DeviceId, DeviceInfo, Source};
 use koe_session_store::{Error as StoreError, Transcripts};
 
 use crate::dictation;
@@ -82,6 +83,8 @@ pub struct Shell {
     pub(crate) tray_error: Option<String>,
     pub(crate) notice: Option<String>,
     pub(crate) dictation_control: DictationControl,
+    /// The microphones the platform reported, and how that list stands.
+    pub(crate) inputs: Inputs,
     last_tray: Option<TrayState>,
     quitting: bool,
     quit_deadline: Option<Instant>,
@@ -95,6 +98,20 @@ pub struct Shell {
     pending_show: bool,
     pending_quit: bool,
     pending_hud_close: Option<AnyWindowHandle>,
+}
+
+/// The microphones the platform reported, and how that list stands.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub(crate) enum Inputs {
+    /// Never listed.
+    #[default]
+    Unlisted,
+    /// A listing is running on the background executor.
+    Listing,
+    /// The microphones, in platform order.
+    Listed(Vec<DeviceInfo>),
+    /// Listing failed.
+    Failed(String),
 }
 
 /// What the tick loop must run after the shell lease is released.
@@ -135,6 +152,7 @@ impl Shell {
             tray_error: None,
             notice: warning,
             dictation_control,
+            inputs: Inputs::Unlisted,
             last_tray: None,
             quitting: false,
             quit_deadline: None,
@@ -155,6 +173,9 @@ impl Shell {
         let mut changed = false;
         changed |= self.ensure_tray();
         changed |= self.ensure_dictation();
+        if matches!(self.inputs, Inputs::Unlisted) {
+            self.refresh_inputs(cx);
+        }
         let actions = self.tray.as_ref().map(Tray::poll).unwrap_or_default();
         for action in actions {
             if std::env::var_os("KOE_TRAY_DEBUG").is_some() {
@@ -437,6 +458,8 @@ impl Shell {
         } else {
             self.notice = Some(transcript::MODEL_MISSING.to_owned());
         }
+        plan.microphone
+            .clone_from(&self.dictation_control.settings.microphone);
         // `Settings::plan` refuses an empty selection, so a start always arms.
         if let Some(action) = self.phase.reduce(Event::Start(plan), Instant::now()) {
             self.take = Some(take);
@@ -491,7 +514,62 @@ impl Shell {
     /// Switches to the settings screen.
     pub fn show_settings(&mut self, cx: &mut Context<Self>) {
         self.screen = Screen::Settings;
+        self.refresh_inputs(cx);
         cx.notify();
+    }
+
+    /// Lists the microphones the platform reports on the background executor.
+    ///
+    /// The listing opens an audio server connection with its own timeouts, so
+    /// it never runs on the UI thread; the result lands on the next frame.
+    pub fn refresh_inputs(&mut self, cx: &mut Context<Self>) {
+        if matches!(self.inputs, Inputs::Listing) {
+            return;
+        }
+        self.inputs = Inputs::Listing;
+        cx.notify();
+        cx.spawn(async move |shell, cx: &mut AsyncApp| {
+            let listed = cx
+                .background_executor()
+                .spawn(async { koe_capture::devices() })
+                .await;
+            let inputs = match listed {
+                Ok(devices) => Inputs::Listed(
+                    devices
+                        .into_iter()
+                        .filter(|device| device.source() == Source::Microphone)
+                        .collect(),
+                ),
+                Err(error) => Inputs::Failed(error.to_string()),
+            };
+            // Only the listing this result came from is still `Listing`; a
+            // refresh started meanwhile owns the state instead.
+            let _ = shell.update(cx, |shell, cx| {
+                if matches!(shell.inputs, Inputs::Listing) {
+                    shell.inputs = inputs;
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
+    }
+
+    /// Stores the microphone a take and a dictation capture from; `None`
+    /// follows the platform default.
+    pub fn apply_microphone(&mut self, microphone: Option<DeviceId>, cx: &mut Context<Self>) {
+        if let Some(message) = self.save_microphone(microphone) {
+            self.notice = Some(message);
+        }
+        self.refresh_inputs(cx);
+        cx.notify();
+    }
+
+    /// Persists the microphone, returning the notice a failed save earns.
+    fn save_microphone(&mut self, microphone: Option<DeviceId>) -> Option<String> {
+        self.dictation_control
+            .apply_microphone(microphone)
+            .err()
+            .map(|error| error.to_string())
     }
 
     /// Switches to the meeting screen.
@@ -581,6 +659,7 @@ impl Shell {
             TrayAction::Show => self.show_window(),
             TrayAction::ShowSettings => {
                 self.screen = Screen::Settings;
+                self.refresh_inputs(cx);
                 self.show_window();
             }
             TrayAction::OpenFolder => self.open_folder(cx),
@@ -891,6 +970,29 @@ mod tests {
             started: Instant::now(),
         };
         shell
+    }
+
+    #[test]
+    fn applying_a_microphone_stores_it_in_the_controls_settings() {
+        let root = tempfile::tempdir().unwrap();
+        let mut shell = Shell::new();
+        let (control, warning) =
+            DictationControl::load_at(&root.path().join(settings::SETTINGS_FILE));
+        assert_eq!(warning, None);
+        shell.dictation_control = control;
+
+        let chosen = DeviceId::new("hw:1,0").unwrap();
+        assert_eq!(shell.save_microphone(Some(chosen.clone())), None);
+        assert_eq!(
+            shell.dictation_control.settings.microphone,
+            Some(chosen.clone())
+        );
+        let (loaded, _) =
+            settings::DictationSettings::load(&root.path().join(settings::SETTINGS_FILE));
+        assert_eq!(loaded.microphone, Some(chosen));
+
+        assert_eq!(shell.save_microphone(None), None);
+        assert_eq!(shell.dictation_control.settings.microphone, None);
     }
 
     #[test]

@@ -131,6 +131,7 @@ impl DictationControl {
             meeting_active,
             model,
             language,
+            microphone: self.settings.microphone.clone(),
         };
         let action = self.dictation.toggle(context, Instant::now())?;
         let refused = matches!(&action, dictation::DictationAction::Refuse(_));
@@ -161,6 +162,7 @@ impl DictationControl {
                 failure: Some(DesktopError::Thread(
                     "the dictation thread ended without reporting".to_owned(),
                 )),
+                warning: None,
             }),
         };
         self.session = None;
@@ -171,12 +173,12 @@ impl DictationControl {
             return self.run(action);
         }
         match &self.dictation {
-            Dictation::Done(done) if done.failed() => Some(
-                done.failure
-                    .as_ref()
-                    .map_or_else(|| "Dictation heard nothing".to_owned(), ToString::to_string),
-            ),
-            Dictation::Done(done) => Some(format!("Typed {}", done.text)),
+            Dictation::Done(done) => Some(match (&done.failure, &done.warning) {
+                (Some(failure), _) => failure.to_string(),
+                (None, Some(warning)) => warning.clone(),
+                (None, None) if done.text.is_empty() => "Dictation heard nothing".to_owned(),
+                (None, None) => format!("Typed {}", done.text),
+            }),
             Dictation::Idle | Dictation::Listening { .. } | Dictation::Stopping { .. } => None,
         }
     }
@@ -312,6 +314,7 @@ impl DictationControl {
                         let outcome = Box::new(DictationOutcome {
                             text: String::new(),
                             failure: Some(error),
+                            warning: None,
                         });
                         if let Some(action) = self
                             .dictation
@@ -466,7 +469,6 @@ mod tests {
         let (loaded, warning) = DictationSettings::load(&path);
         assert_eq!(warning, None);
         assert_eq!(loaded.microphone, Some(chosen.clone()));
-        // Applying the same device again changes nothing.
         assert!(!control.apply_microphone(Some(chosen)).unwrap());
 
         assert!(control.apply_microphone(None).unwrap());
